@@ -332,16 +332,144 @@ MI 记录路由（gdbwire 回调内的 win 分支）：
 
 ## 8. 合成 GDB 窗口
 
-（M3/M4 填写）
+### 8.1 显示层：scroller_win.cpp（哑终端行模型）
+
+Linux 的 GDB 窗口是 vterminal（libvterm 终端模拟 + console pty 字节流）。
+vterm 依赖 100% 藏在 scroller.cpp 内、interface.cpp 只调 `scr_*` API——
+所以 Windows 侧新写 `cgdb/scroller_win.cpp` 用同一 API 实现一个「哑终端」：
+
+| 概念 | 实现 |
+|---|---|
+| 行模型 | `std::deque<std::string> lines`（已提交行，受 scrollback 上限约束）+ `cur`（正在编辑/输出的当前行）+ `cur_col`（光标列） |
+| scr_add 字节语义 | `\n` 提交行；`\r` 列归零；`\b` 列左移；TAB 展开到 8 列停；可打印/UTF-8 字节在光标处覆写并前进；行满按宽度折行（永不切开 UTF-8 序列——续字节允许溢出）；BEL/其他控制字节忽略 |
+| 滚动模式 | `delta` = 从底部回看的行数；up/down/home/end/left/right/beginning/end_of_row 全实现；状态覆盖层 `[delta/max]` 用 HLG_SCROLL_MODE_STATUS |
+| 搜索 | `hl_regex_search`（POSIX regex，mingw 的 TRE 实现）逐行匹配，wrapscan 遵循 cgdbrc；命中行滚动进视野、HLG_INCSEARCH 高亮（pre/match/post 三段渲染） |
+| 光标 | 非滚动模式 = 当前行 + cur_col（焦点时显示）；滚动模式 = 滚动光标 |
+| scr_move | 换窗时重取宽高；已提交行保持旧折行（vterm 的 reflow 语义弱化为 v1 可接受） |
+| ctrl-L | `scr_push_screen_to_scrollback` = 提交当前行（v1 简化） |
+
+**为什么不需要完整 vterm**：MI 模式下 gdb 输出是纯文本（无 readline 的
+光标转义序列——它根本没有 readline 在跑）；编辑器回显只依赖 CR/BS/覆写
+三种原语。哑终端模型完全够用，这正是 Linux 侧 `~` 记录 + readline 回显
+字节流的最小公共子集。
+
+### 8.2 输入层：tgdb 内嵌行编辑器（tgdb.cpp #ifdef 段）
+
+- 字节流驱动（Linux 上写进 console pty 的同一字节流）：可打印插入、
+  BS/DEL、`\r` 提交、ESC 序列（`ESC[A/B/C/D/H/F`、`ESC[0X`、`ESC OX`
+  三种变体 → 历史/左右/Home/End）、ESC b/f/d/`\b` 词操作、
+  Ctrl-A/E/B/F/K/U/W/D/L；
+- 回显协议：全行重画 = `"\r" + "(gdb) " + line + 尾部擦除 + \b×n 回退`，
+  追加字符走单字节快路径；
+- 提交 → `TGDB_REQUEST_CONSOLE_COMMAND` → `-interpreter-exec console
+  "..."`（MI 转义 `"`、`\`）→ 响应走 §7 的记录路由；
+- 输出与编辑交错：非提示状态直接追加；提示状态下有半行输入时
+  `"\n" + 输出 + 重画`（readline 风格）；
+- prompt 回调合成 `"(gdb) "`（gdbwire 会把字面量提示符从流里消费掉，
+  显示层必须自己补）；
+- inferior 运行期间（未在提示符且管道已连接）：用户键入原样转发进
+  inferior 管道并本地回显（Linux pty 的同款行为）；
+- 命令历史 100 条，方向键翻阅。
 
 ## 9. 输入链路
 
-（M4 填写）
+```
+键按下 → ConPTY 输入管道 → conhost 转成 INPUT_RECORD
+→ 控制台输入句柄信号化 → 主循环 WaitForMultipleObjects 唤醒
+→ kui（terminal_keys 层 100ms 转义序列超时 + normal_keys 层映射超时）
+→ io_getchar → io_data_ready(0,ms)（控制台句柄等待 + 按键记录门禁）
+→ ReadFile 1 字节（VT 输入模式下读回原始转义序列字节流）
+→ CGDB_KEY_* / 原始字节 → if_input → 各窗口
+```
+
+- **kui 的转义序列匹配不需要任何改动**：VT 输入模式给出的就是
+  xterm 风格序列，kui 的 47 条硬编码绑定（`ESC[A` 等）原样命中；
+- **按键记录门禁（M5 期间发现的第 4 个致命陷阱）**：控制台句柄在
+  *任何* 输入记录到达时都会信号化（含 FOCUS_EVENT、MENU_EVENT 等非
+  按键记录），而 `ReadFile` 只对 key-down 记录产生数据——否则永久
+  阻塞，把 kui 的超时契约整个挂死（表现为 cgdb 收完启动输出后第一次
+  按键即冻结）。`io_data_ready`/`io_getchar` 现在用 `PeekConsoleInput`
+  检查队头：key-down → ReadFile 安全；非按键记录 → `ReadConsoleInput`
+  消费掉再查；
+- ^C：VT 输入模式下不再是事件而是原始 0x03 字节 → kui →
+  CGDB_KEY_CTRL_C → `user_input` 里拦截 → `tgdb_signal_notification` →
+  CTRL_BREAK（§7.2）；
+- ESC 键：kui 的 ttimeout（100ms）超时后孤 ESC 解析为 CGDB_KEY_ESC →
+  焦点切源码窗。E2E 中 ESC 后需 ≥1.1s（100ms 序列超时 + 1s 映射超时）
+  再发 `:` 才不被吞进序列匹配。
 
 ## 10. 测试报告
 
-（M5 填写）
+### 10.1 MI driver（M2 验收，`.tmp/mi_driver.cpp`，ConPTY 内运行）
+
+- `basic` **7/7**：b main 输出显示、停在 main（源码位置回调）、断点
+  回调、inferior 输出显示、MI 流纯净、TGDB_QUIT 干净退出、gdb 进程退出；
+- `interrupt` **4/4**：^C 后 gdb 存活、继续应答 `print 7*6`、干净退出、
+  进程退出。
+
+### 10.2 E2E 场景矩阵（M5 验收，`.tmp/e2e_cgdb.py`，ConPTY 40x110）
+
+**23/23 全部通过**（2026-10-18 22:55，Windows 10 19045，gcc 15.2.0
+静态链接，gdb 17.1 i686）：
+
+| 场景 | 检查项 |
+|---|---|
+| 主流程 | gdb 提示符出现、源码窗显示代码、行号渲染、状态条、`b main` 输出、源码窗断点标记、`run` 后 inferior 输出（经命名管道）进 GDB 窗、停回提示符、`next` 单步、方向键历史召回、ESC+`:q` 干净退出（exit 0） |
+| resize | 130 列扩张无崩溃、会话存活、缩回 100 列正常、干净退出 |
+| CRLF+CJK | CRLF 源文件正常显示、CJK 注释（你好世界）正确渲染、干净退出 |
+| ^C 中断 | m0_sleep 运行中 ^C 产生 *stopped、gdb 继续应答命令、干净退出 |
+| 源码窗按键 | ESC 切焦点、j 移动、空格切换断点（Breakpoint 1 请求发出）、干净退出 |
+
+真彩语法高亮在 VT 流中实测可见（`38;2;r;g;b`、`91m` 亮色关键字、
+框线 `│` U+2502、行号列）。
+
+### 10.3 单元 driver（M1）
+
+- `tokenizer_driver`：c/rust/go/ada/d/asm 六语言喂真实源文件全部跑通；
+- `cgdbutil_driver`：ANSI 色卡输出正常。
+
+### 10.4 Linux 回归（M6）
+
+WSL2 Ubuntu-24.04 全量重编 + `make check`：**198/198 全部通过**——
+Windows 移植对 Linux 侧零破坏（所有改动都在 `#ifdef _WIN32` 内）。
 
 ## 11. 已知限制与后续工作
 
-（M6 填写）
+按影响排序：
+
+1. **^C 后源码定位**：`*stopped` 落在 gdb 的 DbgBreakPoint 注入线程
+   （`ntdll!DbgBreakPoint`，无符号无行号），源码窗不会立即跳回用户
+   线程。后续可在 ^C 后自动 `-thread-select` 回原线程。
+2. **readline 功能缺失**：GDB 窗口行编辑器无 Tab 补全、Ctrl-R 历史搜
+   索（`:命令`行的补全不受影响，本来就不走 readline）。后续可用
+   `-interpreter-exec console "complete ..."` 实现补全。
+3. **32 位 gdb 只能调 32 位程序**：主线工具链是 mingw32。若要调 64 位
+   程序：换 mingw64 工具链重编 cgdb（PDCurses 需另行获取——mingw64
+   发行版未附带），或运行时 `-d` 指向 64 位 gdb（cgdb 本身跨位数）。
+4. **CJK 键入**：VT 输入模式的字节流按控制台输入码页转换，非 UTF-8
+   码页下 CJK 输入会乱（显示不受影响——PDCurses 走宽字符 API）。
+   E2E 已验证 ASCII 键入全通；CJK 键入留待后续（设 CP_UTF8 或切
+   ReadConsoleInputW 路线）。
+5. **多实例**：inferior 管道名含 cgdb pid，天然可并存；但同一控制台
+   多个 cgdb 实例的 ^C 会互相干扰（CTRL_BREAK 按进程组隔离，已验证
+   不串扰，控制台事件共享）。
+6. **`new-ui` 上游修复后的回切**：传输层已隔离在
+   tgdb.cpp 的 #ifdef 段内，若上游 gdb 修好 new-ui，MI-over-pipes
+   与双通道可共存选择。
+7. **inferior 交互式全屏程序**：inferior 的 tty 是管道不是终端，全屏
+   交互（vim 类）不可用；行交互（scanf/printf）正常。ConPTY 劣势终
+   端是后续增强方向。
+8. **`rline` 键序列 oracle**：Windows 侧是 stub——硬编码绑定已覆盖
+   Home/End/词操作，若用户自定义了 readline 绑定则不感知。
+
+### 交付物清单
+
+| 项 | 位置 |
+|---|---|
+| 构建 | `win32/Makefile`（+ `win32/config.h`、`win32/cgdb_custom_config.h`、`win32/generated/`、`win32/regen-lexers.sh`） |
+| 平台层 | `lib/util/console_win.*`、`lib/util/process_win.*`、io/terminal/sys_win/fs_util/sys_util 的 win 分支 |
+| tgdb 传输 | tgdb.cpp/tgdb.h 的 win 分支（含行编辑器） |
+| UI | `cgdb/scroller_win.cpp`、interface.cpp/cgdb.cpp 的 win 分支 |
+| 文档 | 本文件 + `doc/porting-feasibility.md`（可行性）+ `doc/reference.md`（架构） |
+| 测试 | `.tmp/mi_driver.cpp`（MI 验收）、`.tmp/e2e_cgdb.py`（E2E 23 项） |
+| 产物 | `.tmp/win-build/cgdb.exe`（6.6MB 全静态，仅依赖系统 DLL） |

@@ -248,7 +248,14 @@ int win_inferior_tty_create(struct win_inferior_tty *tty,
 {
     struct inf_ctx *ctx;
 
-    memset(tty, 0, sizeof(*tty));
+    /* win_inferior_tty carries a std::string, so zero the POD fields
+     * explicitly instead of memset. */
+    tty->name[0] = '\0';
+    tty->h_pipe = NULL;
+    tty->h_event = NULL;
+    tty->h_thread = NULL;
+    tty->running = 0;
+    tty->buffer.clear();
 
     ctx = new struct inf_ctx();
     InitializeCriticalSection(&ctx->lock);
@@ -404,5 +411,10 @@ void win_inferior_tty_destroy(struct win_inferior_tty *tty)
     DeleteCriticalSection(&ctx->lock);
     delete ctx;
 
-    memset(tty, 0, sizeof(*tty));
+    tty->name[0] = '\0';
+    tty->h_pipe = NULL;
+    tty->h_event = NULL;
+    tty->h_thread = NULL;
+    tty->running = 0;
+    tty->buffer.clear();
 }

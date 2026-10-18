@@ -153,7 +153,9 @@ int io_rw_byte(int source, int dest)
 
 ssize_t io_read(int fd, void *buf, size_t count)
 {
+#ifndef _WIN32
     ssize_t amountRead;
+#endif
 
 #ifdef _WIN32
     /* ReadFile on the raw handle: the CRT read() can block forever on
@@ -203,7 +205,9 @@ ssize_t io_read(int fd, void *buf, size_t count)
 
 ssize_t io_writen(int fd, const void *vptr, size_t n)
 {
+#ifndef _WIN32
     ssize_t nwritten;
+#endif
     size_t nleft = n;
     const char *ptr = (const char *) vptr;
 
@@ -360,8 +364,10 @@ int io_data_ready(int fd, int ms)
 int io_getchar(int fd, unsigned int ms, int *key)
 {
     char c;
+#ifndef _WIN32
     int ret;
     int flag = 0;
+#endif
     int val;
 
     if (!key)
