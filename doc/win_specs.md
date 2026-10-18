@@ -330,6 +330,30 @@ MI 记录路由（gdbwire 回调内的 win 分支）：
 - `interrupt`：**4/4** —— ^C 后 gdb 存活、继续应答 `print 7*6`（$1=42）、
   干净退出、进程退出。
 
+### 7.5 启动失败的用户体验（后续补修，commit 「Fix silent crash...」）
+
+移植版首发时有一个恶性 bug：**不带 `-d` 运行且 gdb 不在 PATH 时，
+cgdb 直接访问违例崩溃**。表象正是用户报告的「卡几秒、什么都不显示、
+退出」——崩溃进程要等 Windows Error Reporting 处理几秒才静默消失。
+根因是 Linux 的 `invoke_debugger` 有 `path ? path : "gdb"` 的默认值
+兜底（fork_util.cpp），Windows 分支漏掉了，`debugger_path=NULL` 一路
+传到 `quote_arg(NULL)` 构造 `std::string(NULL)`。
+
+修复（三层）：
+
+1. `tgdb_start_gdb`（win 分支）补 `debugger ? debugger : "gdb"` 兜底；
+2. `quote_arg` 加 NULL 防御；
+3. **错误可见化**：`win_spawn_debugger` 失败时把人话消息存进
+   `win_spawn_last_error()`（"cgdb: debugger \"gdb\" not found. Put
+   gdb.exe on PATH or pass: cgdb -d <path-to-gdb.exe>"，ERROR_FILE_
+   NOT_FOUND/PATH_NOT_FOUND 特判；其他错误带 CreateProcess 错误码），
+   `cgdb_cleanup_and_exit` 在 endwin 之后打印——之前真正的失败原因
+   只进 clog 日志文件，用户只看到「Search the logs」提示（Linux 侧
+   同样只写日志，但至少不崩）。
+
+实测：gdb 缺失时 0.5 秒干净退出（exit -1）+ 屏幕上直接给出原因和
+解决办法；`-d` 指向不存在路径同样；正常路径不受影响。
+
 ## 8. 合成 GDB 窗口
 
 ### 8.1 显示层：scroller_win.cpp（哑终端行模型）

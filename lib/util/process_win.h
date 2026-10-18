@@ -39,6 +39,12 @@ struct win_process {
  */
 int win_spawn_debugger(char *const argv[], struct win_process *wp);
 
+/* Human-readable description of the last win_spawn_debugger failure
+ * (empty string when the last call succeeded or none was made).
+ * cgdb_cleanup_and_exit prints this after endwin so the user sees the
+ * actual reason (e.g. "gdb not found") instead of only the log hint. */
+const char *win_spawn_last_error(void);
+
 /* Send a CTRL_BREAK_EVENT to the debugger's process group: interrupts a
  * running inferior. Returns 0 on success, -1 on failure. */
 int win_interrupt_debugger(const struct win_process *wp);

@@ -14,16 +14,22 @@
 
 #include "cgdb_clog.h"
 
-/* Quote one argument for a CreateProcessW command line. */
+/* Quote one argument for a CreateProcessW command line. NULL-safe:
+ * the caller may pass an unset debugger path before the default
+ * substitution happens. */
 static std::string quote_arg(const char *arg)
 {
     std::string out = "\"";
-    for (const char *p = arg; *p; ++p) {
-        if (*p == '\"')
-            out += "\\\"";
-        else
-            out += *p;
+
+    if (arg) {
+        for (const char *p = arg; *p; ++p) {
+            if (*p == '\"')
+                out += "\\\"";
+            else
+                out += *p;
+        }
     }
+
     out += "\"";
     return out;
 }
@@ -39,6 +45,31 @@ static std::wstring to_wide(const std::string &s)
     return w;
 }
 
+/* Human-readable description of the last win_spawn_debugger failure;
+ * empty when the last call succeeded (or none was made). Printed by
+ * cgdb_cleanup_and_exit after endwin so the user actually sees it. */
+static char g_spawn_error[512] = "";
+
+const char *win_spawn_last_error(void)
+{
+    return g_spawn_error;
+}
+
+/* Fill g_spawn_error; 'what' is the debugger path for spawn failures. */
+static void win_spawn_set_error(const char *what, DWORD err)
+{
+    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+        snprintf(g_spawn_error, sizeof(g_spawn_error),
+                 "cgdb: debugger \"%s\" not found. Put gdb.exe on PATH "
+                 "or pass: cgdb -d <path-to-gdb.exe>", what ? what : "gdb");
+    } else {
+        snprintf(g_spawn_error, sizeof(g_spawn_error),
+                 "cgdb: failed to start the debugger \"%s\" "
+                 "(CreateProcess error %lu)",
+                 what ? what : "?", (unsigned long) err);
+    }
+}
+
 int win_spawn_debugger(char *const argv[], struct win_process *wp)
 {
     SECURITY_ATTRIBUTES sa;
@@ -49,6 +80,8 @@ int win_spawn_debugger(char *const argv[], struct win_process *wp)
     std::string cmdline;
     BOOL ok;
     int fd;
+
+    g_spawn_error[0] = '\0';
 
     memset(wp, 0, sizeof(*wp));
     memset(&si, 0, sizeof(si));
@@ -62,6 +95,9 @@ int win_spawn_debugger(char *const argv[], struct win_process *wp)
             !CreatePipe(&out_read, &out_write, &sa, 0)) {
         clog_error(CLOG_CGDB, "CreatePipe failed: %lu",
                    (unsigned long) GetLastError());
+        snprintf(g_spawn_error, sizeof(g_spawn_error),
+                 "cgdb: CreatePipe failed: %lu",
+                 (unsigned long) GetLastError());
         return -1;
     }
 
@@ -87,8 +123,11 @@ int win_spawn_debugger(char *const argv[], struct win_process *wp)
     ok = CreateProcessW(NULL, &to_wide(cmdline)[0], NULL, NULL, TRUE,
                         CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
     if (!ok) {
+        DWORD err = GetLastError();
+
         clog_error(CLOG_CGDB, "CreateProcessW(%s) failed: %lu",
-                   cmdline.c_str(), (unsigned long) GetLastError());
+                   cmdline.c_str(), (unsigned long) err);
+        win_spawn_set_error(argv[0], err);
         CloseHandle(in_read);
         CloseHandle(in_write);
         CloseHandle(out_read);

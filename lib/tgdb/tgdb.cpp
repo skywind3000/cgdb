@@ -1296,10 +1296,16 @@ int tgdb_start_gdb(struct tgdb *tgdb,
      * own process group (CTRL_BREAK interrupt path); its stdio is the
      * pipe pair. */
     char **gdb_argv;
+    const char *debugger_or_default;
     int i;
 
+    /* Same default as Linux invoke_debugger: no -d option means "gdb"
+     * from PATH (otherwise the NULL path would crash deep in the
+     * spawn path - observed as a silent access violation). */
+    debugger_or_default = debugger ? debugger : "gdb";
+
     gdb_argv = (char **) cgdb_malloc(sizeof(char *) * (argc + 2));
-    gdb_argv[0] = (char *) debugger;
+    gdb_argv[0] = (char *) debugger_or_default;
     for (i = 0; i < argc; i++)
         gdb_argv[i + 1] = argv[i];
     gdb_argv[argc + 1] = NULL;

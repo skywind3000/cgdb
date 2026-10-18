@@ -90,6 +90,7 @@
 #else
 #include <windows.h>
 #include "console_win.h"
+#include "process_win.h"
 #endif
 
 /* --------- */
@@ -1075,6 +1076,18 @@ void cgdb_cleanup_and_exit(int val)
     if (new_ui_unsupported) {
         fprintf(stderr, "cgdb requires gdb 7.12 or later\n");
     }
+
+#ifdef _WIN32
+    /* The concrete reason the debugger could not be started (e.g. gdb
+     * not found), recorded by win_spawn_debugger. Printed after endwin
+     * so it stays visible on the console. */
+    {
+        const char *spawn_error = win_spawn_last_error();
+
+        if (spawn_error[0])
+            fprintf(stderr, "%s\n", spawn_error);
+    }
+#endif
 
     exit(val);
 }
