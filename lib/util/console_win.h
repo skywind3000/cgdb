@@ -32,4 +32,14 @@ int win_console_restore(void);
  * return 0. */
 int win_console_size_changed(int *rows, int *cols);
 
+/* Create the stop event and install the console ctrl handler that
+ * signals it on close/logoff/shutdown. The main loop waits on the
+ * handle from win_stop_event_handle() and exits cleanly when it is
+ * signaled. Returns 0 on success, -1 on failure. */
+int win_console_event_setup(void);
+
+/* The waitable stop event handle (NULL before win_console_event_setup
+ * or on failure). */
+void *win_stop_event_handle(void);
+
 #endif /* __CONSOLE_WIN_H__ */

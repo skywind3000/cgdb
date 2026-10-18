@@ -66,6 +66,30 @@ static HANDLE io_fd_handle(int fd)
         return GetStdHandle(STD_INPUT_HANDLE);
     return (HANDLE) _get_osfhandle(fd);
 }
+
+/* The console input handle signals when ANY input record is queued
+ * (focus, buffer-size, menu...), but ReadFile only produces data for
+ * key-down records and blocks otherwise - which would hang kui's
+ * timeout-based reads forever. Peek at the queue: when a key record is
+ * at the head, ReadFile is safe; non-key records are consumed and
+ * discarded here. */
+static int io_win_console_key_pending(HANDLE h)
+{
+    INPUT_RECORD rec;
+    DWORD count = 0;
+
+    for (;;) {
+        if (!PeekConsoleInput(h, &rec, 1, &count) || count == 0)
+            return 0;
+
+        if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown)
+            return 1;
+
+        /* Consume the non-key record so ReadFile cannot stall on it. */
+        if (!ReadConsoleInput(h, &rec, 1, &count) || count == 0)
+            return 0;
+    }
+}
 #endif
 
 static void process_error(void)
@@ -245,19 +269,23 @@ int io_data_ready(int fd, int ms)
 
     if (fd == 0) {
         /* The console input handle waits properly: signaled exactly
-         * when input records are queued (verified on Win10 19045). */
+         * when input records are queued (verified on Win10 19045).
+         * Gate on a real key record though: non-key records (focus
+         * etc.) would otherwise leave ReadFile blocked forever, and
+         * io_getchar's timeout contract broken. */
         DWORD wait_ms = (ms == -1) ? INFINITE :
                 (ms < 0 ? 0 : (DWORD) ms);
         DWORD ret = WaitForSingleObject(h, wait_ms);
 
-        if (ret == WAIT_OBJECT_0)
-            return 1;
         if (ret == WAIT_TIMEOUT)
             return 0;
+        if (ret != WAIT_OBJECT_0) {
+            clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
+                       (unsigned long) GetLastError());
+            return -1;
+        }
 
-        clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
-                   (unsigned long) GetLastError());
-        return -1;
+        return io_win_console_key_pending(h);
     }
 
     /* Anonymous pipe read handles are NOT reliably waitable here:
@@ -356,7 +384,12 @@ int io_getchar(int fd, unsigned int ms, int *key)
         /* ReadFile on the console (in VT-input mode) returns the raw
          * escape-sequence byte stream; ReadFile on a pipe returns raw
          * MI bytes. The CRT read() would run the console input through
-         * codepage translation instead, so ReadFile it is. */
+         * codepage translation instead, so ReadFile it is. Gate the
+         * console on a real key record (see io_win_console_key_pending)
+         * or ReadFile can block despite io_data_ready's verdict. */
+        if (fd == 0 && !io_win_console_key_pending(h))
+            return 0;           /* only non-key records were queued */
+
         if (h == NULL || h == INVALID_HANDLE_VALUE ||
                 !ReadFile(h, &c, 1, &got, NULL) || got == 0) {
             clog_error(CLOG_CGDB, "ReadFile failed: %lu",

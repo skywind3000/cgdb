@@ -81,10 +81,16 @@
 #include "fs_util.h"
 #include "cgdbrc.h"
 #include "io.h"
-#include "fork_util.h"
-#include "terminal.h"
 #include "rline.h"
 #include "usage.h"
+
+#ifndef _WIN32
+#include "fork_util.h"
+#include "terminal.h"
+#else
+#include <windows.h>
+#include "console_win.h"
+#endif
 
 /* --------- */
 /* Constants */
@@ -170,7 +176,9 @@ int resize_pipe[2] = { -1, -1 };
 int signal_pipe[2] = { -1, -1 };
 
 /* Original terminal attributes */
+#ifndef _WIN32
 static struct termios term_attributes;
+#endif
 
 /**
  * Runs a command in the shell.  The shell may be interactive, and CGDB
@@ -193,14 +201,24 @@ int run_shell_command(const char *command)
 
     /* Put the terminal in cooked mode and turn on echo */
     swin_endwin();
+#ifdef _WIN32
+    win_console_restore();
+#else
     tty_set_attributes(STDIN_FILENO, &term_attributes);
+#endif
 
     /* NULL or empty string means invoke user's shell */
     if (!command || !command[0]) {
+#ifdef _WIN32
+        char *shell = getenv("COMSPEC");
+
+        rv = system(shell ? shell : "cmd.exe");
+#else
         /* Check for SHELL environment variable */
         char *shell = getenv("SHELL");
 
         rv = system(shell ? shell : "/bin/sh");
+#endif
     } else {
         /* Execute the command passed in via system() */
         rv = system(command);
@@ -212,7 +230,11 @@ int run_shell_command(const char *command)
     }
 
     /* Turn off echo and put the terminal back into raw mode */
+#ifdef _WIN32
+    win_console_assert_input_mode();
+#else
     tty_cbreak(STDIN_FILENO, &term_attributes);
+#endif
     if_draw();
 
     return rv;
@@ -333,10 +355,21 @@ static int init_home_dir(void)
     char *cgdb_home_envvar = getenv("CGDB_DIR"); 
 
     /* Set the cgdb home directory */
-    if (cgdb_home_envvar != NULL) { 
+    if (cgdb_home_envvar != NULL) {
         cgdb_home_dir = cgdb_home_envvar;
-    } else { 
+    } else {
+#ifdef _WIN32
+        /* No HOME on Windows unless the user came from a POSIX shell. */
+        const char *home = getenv("HOME");
+
+        if (!home)
+            home = getenv("USERPROFILE");
+        if (!home)
+            home = getenv("APPDATA");
+        cgdb_home_dir = fs_util_get_path(home ? home : ".", ".cgdb");
+#else
         cgdb_home_dir = fs_util_get_path(getenv("HOME"), ".cgdb");
+#endif
     }
 
     /* Make sure the toplevel cgdb dir exists */
@@ -436,6 +469,15 @@ static int user_input(void)
         clog_error(CLOG_CGDB, "kui_manager_getkey error");
         return -1;
     }
+
+#ifdef _WIN32
+    /* The console is in raw VT-input mode, so ^C arrives as a key
+     * instead of a SIGINT; route it to the interrupt path here. */
+    if (key == CGDB_KEY_CTRL_C) {
+        tgdb_signal_notification(tgdb, SIGINT);
+        return 0;
+    }
+#endif
 
     val = if_input(key);
 
@@ -787,6 +829,84 @@ static int cgdb_handle_signal_in_main_loop(int fd)
 
 static int main_loop(void)
 {
+#ifdef _WIN32
+    HANDLE console_in = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE stop_event = (HANDLE) win_stop_event_handle();
+    HANDLE wait_handles[3];
+
+    /* Main (infinite) loop:
+     *   Waits on the console input handle (user input), the stop event
+     *   (console close/logoff) and the inferior output event. The MI
+     *   pipe is NOT waitable on Windows (io_data_ready polls it with
+     *   PeekNamedPipe), and resize is polled through the console
+     *   geometry, so the wait carries a short timeout. */
+
+    for (;;) {
+        DWORD count = 0;
+        void *inf_event;
+        DWORD r;
+        int rows, cols;
+
+        wait_handles[count++] = console_in;
+        if (stop_event)
+            wait_handles[count++] = stop_event;
+        inf_event = tgdb_inferior_event_handle(tgdb);
+        if (inf_event)
+            wait_handles[count++] = (HANDLE) inf_event;
+
+        r = WaitForMultipleObjects(count, wait_handles, FALSE, 50);
+        if (r == WAIT_FAILED) {
+            clog_error(CLOG_CGDB, "WaitForMultipleObjects failed: %lu",
+                       (unsigned long) GetLastError());
+            return -1;
+        }
+
+        /* Console close / logoff: exit cleanly. */
+        if (stop_event && r == WAIT_OBJECT_0 + 1)
+            return 0;
+
+        /* User input */
+        if (r == WAIT_OBJECT_0 ||
+                (r == WAIT_TIMEOUT && io_data_ready(0, 0) == 1)) {
+            int val = user_input_loop();
+
+            if (val == -1 && errno == EAGAIN)
+                continue;
+            else if (val == -1)
+                return -1;
+        }
+
+        /* Inferior output (dedicated reader thread event) */
+        if (inf_event &&
+                ((count > 2 && r == WAIT_OBJECT_0 + 2) ||
+                 WaitForSingleObject((HANDLE) inf_event, 0) ==
+                        WAIT_OBJECT_0)) {
+            tgdb_process_inferior(tgdb);
+        }
+
+        /* MI pipe: poll, then process (the comment on ordering in the
+         * Linux loop below applies here too). */
+        if (gdb_mi_fd != -1 && io_data_ready(gdb_mi_fd, 0) == 1) {
+            if (gdb_input(gdb_mi_fd) == -1) {
+                return -1;
+            }
+
+            /* When the file dialog is opened, the user input is
+             * blocked until GDB returns the file list. */
+            if (kui_ctx->cangetkey()) {
+                user_input_loop();
+            }
+        }
+
+        /* Resize polling: the console geometry is the only reliable
+         * notification on Windows. */
+        if (win_console_size_changed(&rows, &cols)) {
+            swin_resizeterm(rows, cols);
+            swin_refresh();
+            if_resize_term();
+        }
+    }
+#else
     fd_set rset;
     int max;
 
@@ -892,6 +1012,7 @@ static int main_loop(void)
         }
 
     }
+#endif /* !_WIN32 */
     return 0;
 }
 
@@ -928,8 +1049,12 @@ void cgdb_cleanup_and_exit(int val)
     /* Shut down debugger */
     tgdb_shutdown(tgdb);
 
+#ifdef _WIN32
+    win_console_restore();
+#else
     if (tty_set_attributes(STDIN_FILENO, &term_attributes) == -1)
         clog_error(CLOG_CGDB, "tty_reset error");
+#endif
 
     /* Close our logfiles */
     tgdb_close_logfiles();
@@ -956,16 +1081,26 @@ void cgdb_cleanup_and_exit(int val)
 
 int init_resize_pipe(void)
 {
+#ifdef _WIN32
+    /* No pipes on Windows: resize is polled and close events come
+     * through the console ctrl handler. */
+    return 0;
+#else
     if (pipe(resize_pipe) == -1) {
         clog_error(CLOG_CGDB, "pipe error");
         return -1;
     }
 
     return 0;
+#endif
 }
 
 int init_signal_pipe(void)
 {
+#ifdef _WIN32
+    /* Create the stop event and install the console ctrl handler. */
+    return win_console_event_setup();
+#else
     int result = pipe(signal_pipe);
 
     if (result == -1) {
@@ -973,6 +1108,7 @@ int init_signal_pipe(void)
     }
 
     return result;
+#endif
 }
 
 int update_kui(cgdbrc_config_option_ptr option)
@@ -1098,7 +1234,11 @@ int main(int argc, char *argv[])
         if (cgdb_supports_debugger_attach_detection()) {
             printf("Waiting for debugger to attach...\n");
             while (cgdb_is_debugger_attached() == 0) {
+#ifdef _WIN32
+                Sleep(1000);
+#else
                 sleep(1);
+#endif
             }
         } else {
             int c;
@@ -1125,10 +1265,19 @@ int main(int argc, char *argv[])
         cgdb_cleanup_and_exit(-1);
     }
 
+#ifdef _WIN32
+    /* Raw VT-input console mode (the rline/kui input path). swin_start
+     * re-asserts this after PDCurses initscr rewrites the mode. */
+    if (win_console_setup() == -1) {
+        clog_error(CLOG_CGDB, "win_console_setup error");
+        cgdb_cleanup_and_exit(-1);
+    }
+#else
     if (tty_cbreak(STDIN_FILENO, &term_attributes) == -1) {
         clog_error(CLOG_CGDB, "tty_cbreak error");
         cgdb_cleanup_and_exit(-1);
     }
+#endif
 
     if (init_kui() == -1) {
         clog_error(CLOG_CGDB, "init_kui error");

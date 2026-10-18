@@ -113,8 +113,16 @@ static int interface_winminwidth = 0;
 static int window_shift;
 
 /* Height and width of the terminal */
+#ifdef _WIN32
+/* No winsize on Windows: the main loop polls the console size and the
+ * values are synced from swin_lines/swin_cols (see if_resize_term). */
+static int screen_rows, screen_cols;
+#define HEIGHT      (screen_rows)
+#define WIDTH       (screen_cols)
+#else
 #define HEIGHT      (screen_size.ws_row)
 #define WIDTH       (screen_size.ws_col)
+#endif
 
 /* Current window split state */
 WIN_SPLIT_TYPE cur_win_split = WIN_SPLIT_EVEN;
@@ -129,7 +137,9 @@ static struct sviewer *src_viewer = NULL;  /* The source viewer window */
 static SWINDOW *status_win = NULL;   /* The status line */
 static SWINDOW *vseparator_win = NULL;   /* Separator gets own window */
 static enum Focus focus = GDB;  /* Which pane is currently focused */
+#ifndef _WIN32
 static struct winsize screen_size;  /* Screen size */
+#endif
 
 struct filedlg *fd;             /* The file dialog structure */
 
@@ -235,10 +245,10 @@ static int get_src_height(void)
 
     switch (cur_split_orientation) {
         case WSO_HORIZONTAL:
-            result = ((screen_size.ws_row + 0.5) / 2) + window_shift;
+            result = ((HEIGHT + 0.5) / 2) + window_shift;
             break;
         case WSO_VERTICAL:
-            result = screen_size.ws_row - get_src_status_height();
+            result = HEIGHT - get_src_status_height();
             break;
     }
 
@@ -251,10 +261,10 @@ static int get_src_width(void)
 
     switch (cur_split_orientation) {
         case WSO_HORIZONTAL:
-            result = screen_size.ws_col;
+            result = WIDTH;
             break;
         case WSO_VERTICAL:
-            result = ((screen_size.ws_col + 0.5) / 2) + window_shift;
+            result = ((WIDTH + 0.5) / 2) + window_shift;
             break;
     }
 
@@ -290,7 +300,7 @@ static int get_sep_col(void)
 
 static int get_sep_height(void)
 {
-    return screen_size.ws_row;
+    return HEIGHT;
 }
 
 static int get_sep_width(void)
@@ -337,14 +347,14 @@ int get_gdb_height(void)
 
     switch (cur_split_orientation) {
         case WSO_HORIZONTAL: {
-            int window_size = ((screen_size.ws_row / 2) - window_shift - 1);
-            int odd_screen_size = (screen_size.ws_row % 2);
+            int window_size = ((HEIGHT / 2) - window_shift - 1);
+            int odd_screen_size = (HEIGHT % 2);
 
             result = window_size + odd_screen_size;
             break;
         }
         case WSO_VERTICAL:
-            result = screen_size.ws_row;
+            result = HEIGHT;
             break;
     }
 
@@ -357,11 +367,11 @@ int get_gdb_width(void)
 
     switch (cur_split_orientation) {
         case WSO_HORIZONTAL:
-            result = screen_size.ws_col;
+            result = WIDTH;
             break;
         case WSO_VERTICAL: {
-            int window_size = ((screen_size.ws_col / 2) - window_shift - 1);
-            int odd_screen_size = (screen_size.ws_col % 2);
+            int window_size = ((WIDTH / 2) - window_shift - 1);
+            int odd_screen_size = (WIDTH % 2);
 
             result = window_size + odd_screen_size;
             break; 
@@ -630,6 +640,13 @@ int if_layout()
  */
 int if_resize_term(void)
 {
+#ifdef _WIN32
+    /* The Windows main loop polls the console size and calls
+     * swin_resizeterm before calling this; sync and re-layout. */
+    screen_rows = swin_lines();
+    screen_cols = swin_cols();
+    return if_layout();
+#else
     if (ioctl(fileno(stdout), TIOCGWINSZ, &screen_size) != -1) {
         if (screen_size.ws_row != swin_lines() ||
                 screen_size.ws_col != swin_cols()) {
@@ -641,6 +658,7 @@ int if_resize_term(void)
     }
 
     return 0;
+#endif
 }
 
 /*
@@ -748,6 +766,7 @@ static void decrease_win_height(int jump)
  * Since it's non trivial to do error handling from the signal handler if an
  * error occurs the program will terminate. Hopefully this doesn't occur.
  */
+#ifndef _WIN32
 static void signal_handler(int signo)
 {
     extern int resize_pipe[2];
@@ -762,6 +781,7 @@ static void signal_handler(int signo)
 
     assert(write(fdpipe, &signo, sizeof(signo)) == sizeof(signo));
 }
+#endif /* !_WIN32 */
 
 static void if_run_command(struct sviewer *sview, const std::string &command)
 {
@@ -1308,6 +1328,7 @@ static void source_input(struct sviewer *sview, int key)
 
 /* Sets up the signal handler for SIGWINCH
  * Returns -1 on error. Or 0 on success */
+#ifndef _WIN32
 static int set_up_signal(void)
 {
     struct sigaction action;
@@ -1343,6 +1364,7 @@ static int set_up_signal(void)
 
     return 0;
 }
+#endif /* !_WIN32 */
 
 /* ----------------- */
 /* Exposed Functions */
@@ -1352,6 +1374,7 @@ static int set_up_signal(void)
 int if_init(void)
 {
     /* Set up the signal handler to catch SIGWINCH */
+#ifndef _WIN32
     if (set_up_signal() == -1)
     {
         clog_error(CLOG_CGDB, "Unable to handle signal: SIGWINCH");
@@ -1362,6 +1385,10 @@ int if_init(void)
         screen_size.ws_row = swin_lines();
         screen_size.ws_col = swin_cols();
     }
+#else
+    screen_rows = swin_lines();
+    screen_cols = swin_cols();
+#endif
 
     /* Create the file dialog object */
     fd = filedlg_new(0, 0, HEIGHT, WIDTH);

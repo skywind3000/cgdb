@@ -107,3 +107,43 @@ int win_console_size_changed(int *rows, int *cols)
     g_size_known = true;
     return 0;
 }
+
+static HANDLE g_stop_event;
+
+static BOOL WINAPI win_ctrl_handler(DWORD evt)
+{
+    switch (evt) {
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            if (g_stop_event)
+                SetEvent(g_stop_event);
+            /* Give the main loop a few seconds to exit cleanly
+             * (endwin, restore modes); the OS terminates the process
+             * when the handler returns from CLOSE anyway. */
+            Sleep(3000);
+            return TRUE;
+        default:
+            /* CTRL_C arrives as raw input (not an event) in cgdb's
+             * mode; CTRL_BREAK is only ever targeted at gdb's process
+             * group. */
+            return FALSE;
+    }
+}
+
+int win_console_event_setup(void)
+{
+    g_stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_stop_event)
+        return -1;
+
+    if (!SetConsoleCtrlHandler(win_ctrl_handler, TRUE))
+        return -1;
+
+    return 0;
+}
+
+void *win_stop_event_handle(void)
+{
+    return g_stop_event;
+}

@@ -1734,13 +1734,7 @@ int tgdb_process(struct tgdb * tgdb, int fd)
     // If ^c has been typed at the prompt, clear the queues
     tgdb_handle_control_c(tgdb);
 
-#ifdef TGDB_WIN_TRACE
-    fprintf(stderr, "@tp: enter fd=%d\n", fd);
-#endif
     size = io_read(fd, buf, n);
-#ifdef TGDB_WIN_TRACE
-    fprintf(stderr, "@tp: io_read=%d\n", (int) size);
-#endif
     if (size < 0) {
         // Error reading from GDB
         clog_error(CLOG_CGDB, "Error reading from gdb's stdout, closing down");
@@ -1758,14 +1752,7 @@ int tgdb_process(struct tgdb * tgdb, int fd)
         {
             std::string msg(buf, size);
             clog_debug(CLOG_GDBMIIO, "%s", msg.c_str());
-#ifdef TGDB_WIN_TRACE
-            fprintf(stderr, "@tp: pushing %d bytes to gdbwire\n",
-                    (int) size);
-#endif
             tgdb_commands_process(tgdb, msg);
-#ifdef TGDB_WIN_TRACE
-            fprintf(stderr, "@tp: gdbwire done\n");
-#endif
         }
 #else
         if (fd == tgdb->debugger_stdout) {
