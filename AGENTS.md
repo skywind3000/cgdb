@@ -12,7 +12,8 @@ CGDB 是 GDB 的轻量级控制台前端，用 ncurses 做上下分屏（上半�
 - 官方源码发布：https://cgdb.me/files/
 
 本仓库是上游的 fork。**长期目标是把只能在 Linux 下运行的 cgdb 移植到 Windows。**
-动手前务必先读下面的「Windows 移植」一节，那里列了已经逐项探测过的现状和真实障碍。
+动手前务必先读下面的「Windows 移植」一节，那里列了已经逐项探测过的现状和真实障碍；
+需要理解代码内部机制（主循环、数据流、各模块原理）时，读 `doc/reference.md`。
 
 ## 临时文件约定
 
@@ -35,7 +36,7 @@ CGDB 是 GDB 的轻量级控制台前端，用 ncurses 做上下分屏（上半�
 | `lib/tokenizer/` | flex 生成的各语言词法分析器，供语法高亮用。8 个 `.lpp`：c / asm / d / fortran / go / rust / ada / cgdbhelp |
 | `lib/rline/` | GNU readline 的封装，把 readline 的按键绑定导出给 kui |
 | `lib/util/` | 平台相关基础设施，**移植工作的主战场**：`pseudo.cpp`(pty)、`terminal.cpp`(termios raw mode)、`io.cpp`(select 封装)、`fork_util.cpp`、`sys_win.cpp`(curses 抽象层)、`fs_util.cpp`、`clog.h`(单头文件日志库) |
-| `doc/cgdb.texi` | 用户手册源文件（texinfo） |
+| `doc/cgdb.texi` | 用户手册源文件（texinfo）；同目录的 `reference.md` 是本仓库自写的源码参考手册 |
 | `testsuite/` | dejagnu 测试，目前只覆盖 kui |
 
 `cgdb/tester.cpp` **没有被任何 Makefile.am 引用，不参与构建**，是历史遗留文件，别照着它改。
@@ -235,6 +236,10 @@ git commit -s
 
 ## 其他有用的文件
 
+- `doc/reference.md` —— **源码参考手册（本仓库自写，Windows 移植底稿）**：架构总图、
+  四条核心数据流、启动/关闭时序、逐模块代码原理（含行号引用）、构建系统与依赖分析、
+  POSIX 依赖风险矩阵、已知代码陷阱清单。做移植设计或改核心代码前先读它，
+  本文（AGENTS.md）只覆盖目录级概览和工具链，深入细节以 reference.md 为准
 - `roadmap.txt` —— 上游作者写的架构反思和待办，解释了为什么 cgdb 至今没有窗口管理器
 - `cgdb/TODO` —— 更细的历史待办和已知 bug 清单
 - `NEWS` —— 完整的版本变更历史
