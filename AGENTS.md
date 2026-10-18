@@ -38,7 +38,8 @@ CGDB 是 GDB 的轻量级控制台前端，用 ncurses 做上下分屏（上半�
 | `lib/rline/` | GNU readline 的封装，把 readline 的按键绑定导出给 kui |
 | `lib/util/` | 平台相关基础设施，**移植工作的主战场**：`pseudo.cpp`(pty)、`terminal.cpp`(termios raw mode)、`io.cpp`(select 封装)、`fork_util.cpp`、`sys_win.cpp`(curses 抽象层)、`fs_util.cpp`、`clog.h`(单头文件日志库) |
 | `doc/cgdb.texi` | 用户手册源文件（texinfo）；同目录的 `reference.md` 是本仓库自写的源码参考手册 |
-| `testsuite/` | dejagnu 测试，目前只覆盖 kui |
+| `testsuite/` | dejagnu 测试，目前只覆盖 kui；`testsuite/win32/` 是 Windows 版的 ConPTY 端到端套件 |
+| `python/` | **CGDB 的独立 Python 实现**（prompt_toolkit + GDB/MI），不参与 C 构建，自带 pytest 套件。入口 `python/cgdb.py`，说明和踩坑清单见 `python/README.md` |
 
 `cgdb/tester.cpp` **没有被任何 Makefile.am 引用，不参与构建**，是历史遗留文件，别照着它改。
 
@@ -251,6 +252,9 @@ git commit -s
   每一步的决策依据、四个致命管道/控制台陷阱及修复、构建系统、平台层逐文件细节、
   tgdb 传输层改造、合成 GDB 窗口设计、E2E 测试报告（23/23）、已知限制清单。
   在 windows 分支上改代码前必读
+- `doc/python_version.md` —— **Python 版可行性分析（实测背书）**：三条架构路线的取舍、
+  TUI 选型实测对比（prompt_toolkit vs Textual）、模块映射与工作量估算、
+  MI/Pygments/启动延迟的实测数据、硬约束清单。`python/` 目录的设计依据
 - `roadmap.txt` —— 上游作者写的架构反思和待办，解释了为什么 cgdb 至今没有窗口管理器
 - `cgdb/TODO` —— 更细的历史待办和已知 bug 清单
 - `NEWS` —— 完整的版本变更历史
