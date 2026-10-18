@@ -54,6 +54,20 @@
 #include "cgdb_clog.h"
 #include "io.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+
+/* Map an fd to a waitable HANDLE. fd 0 is the console input; every
+ * other fd is a pipe created by process_win via _open_osfhandle. */
+static HANDLE io_fd_handle(int fd)
+{
+    if (fd == 0)
+        return GetStdHandle(STD_INPUT_HANDLE);
+    return (HANDLE) _get_osfhandle(fd);
+}
+#endif
+
 static void process_error(void)
 {
     if (errno == EINTR)
@@ -174,6 +188,33 @@ void io_display_char(FILE * fd, char c)
 
 int io_data_ready(int fd, int ms)
 {
+#ifdef _WIN32
+    HANDLE h = io_fd_handle(fd);
+    DWORD wait_ms;
+    DWORD ret;
+
+    if (h == NULL || h == INVALID_HANDLE_VALUE) {
+        clog_error(CLOG_CGDB, "io_data_ready: bad handle (fd=%d)", fd);
+        return -1;
+    }
+
+    if (ms == -1)
+        wait_ms = INFINITE;
+    else if (ms < 0)
+        wait_ms = 0;
+    else
+        wait_ms = (DWORD) ms;
+
+    ret = WaitForSingleObject(h, wait_ms);
+    if (ret == WAIT_OBJECT_0)
+        return 1;               /* console/pipe has data or hit EOF */
+    if (ret == WAIT_TIMEOUT)
+        return 0;
+
+    clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
+               (unsigned long) GetLastError());
+    return -1;
+#else
     int ret;
 
     for (;;) {
@@ -206,6 +247,7 @@ int io_data_ready(int fd, int ms)
         // ready to read if at least 1 file is available
         return ret > 0;
     }
+#endif
 }
 
 int io_getchar(int fd, unsigned int ms, int *key)
@@ -227,6 +269,26 @@ int io_getchar(int fd, unsigned int ms, int *key)
     if (val == 0)
         return 0;               /* Nothing to read. */
 
+#ifdef _WIN32
+    {
+        HANDLE h = io_fd_handle(fd);
+        DWORD got = 0;
+
+        /* ReadFile on the console (in VT-input mode) returns the raw
+         * escape-sequence byte stream; ReadFile on a pipe returns raw
+         * MI bytes. The CRT read() would run the console input through
+         * codepage translation instead, so ReadFile it is. */
+        if (h == NULL || h == INVALID_HANDLE_VALUE ||
+                !ReadFile(h, &c, 1, &got, NULL) || got == 0) {
+            clog_error(CLOG_CGDB, "ReadFile failed: %lu",
+                       (unsigned long) GetLastError());
+            return -1;
+        }
+
+        *key = (unsigned char) c;
+        return 1;
+    }
+#else
     /* Set nonblocking */
     flag = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flag | O_NONBLOCK);
@@ -257,4 +319,5 @@ int io_getchar(int fd, unsigned int ms, int *key)
 
     *key = c;
     return 1;
+#endif
 }

@@ -62,7 +62,11 @@ int fs_util_create_dir(const std::string &dir)
     } else {
         /* The file does not exist, create it */
         if (errno == ENOENT) {
+#ifdef _WIN32
+            if (mkdir(dir.c_str()) == -1) {
+#else
             if (mkdir(dir.c_str(), 0755) == -1) {
+#endif
                 clog_error(CLOG_CGDB,
                         "directory %s could not be made", dir.c_str());
                 return 0;
@@ -105,7 +109,11 @@ int fs_util_file_exists_in_path(const std::string &filePath)
         return 0;
     }
     /* Check all directories in path*/
+#ifdef _WIN32
+    tok = strtok(local_pathStr, ";");
+#else
     tok = strtok(local_pathStr, ":");
+#endif
     while (tok != NULL)
     {
         testPath = fs_util_get_path(tok, filePath);
@@ -113,7 +121,11 @@ int fs_util_file_exists_in_path(const std::string &filePath)
             result = 0;
             break;
         }
+#ifdef _WIN32
+        tok = strtok(NULL, ";");
+#else
         tok = strtok(NULL, ":");
+#endif
     }
     free(local_pathStr);
     return result;

@@ -298,6 +298,12 @@ struct keyseq_initializer
 {
     keyseq_initializer()
     {
+#ifdef _WIN32
+        /* No termcap/terminfo on Windows. The 47-entry
+         * hard_coded_bindings table (xterm-style VT sequences) covers
+         * everything the VT-input console mode emits. */
+        return;
+#else
         char term_buffer[4080] = { 0 };
         char buffer[4080] = { 0 };
         char *pbuffer = &buffer[0];
@@ -335,6 +341,7 @@ struct keyseq_initializer
                 list.tiname_seq = nullptr;
             }
         }
+#endif
     }
 
     ~keyseq_initializer()

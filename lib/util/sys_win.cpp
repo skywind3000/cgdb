@@ -6,12 +6,30 @@
 #include <curses.h>
 #elif HAVE_NCURSES_CURSES_H
 #include <ncurses/curses.h>
+#elif HAVE_PDCURSES_H
+#include <pdcurses.h>    /* mingw32 root wrapper: PDC_WIDE + PDC_FORCE_UTF8 */
 #endif
 
 #include "cgdb_clog.h"
 #include "sys_util.h"
 #include "sys_win.h"
 
+#ifdef _WIN32
+#include "console_win.h"
+#endif
+
+#ifdef _WIN32
+/* Encoded attribute values (see sys_win.h): the real PDCurses wide
+ * attribute constants are 64-bit and cannot round-trip through the
+ * int-based swin API. swin_expand_attr converts at the boundary. */
+const int SWIN_A_NORMAL = 0;
+const int SWIN_A_STANDOUT = 0x001;
+const int SWIN_A_UNDERLINE = 0x002;
+const int SWIN_A_REVERSE = 0x004;
+const int SWIN_A_BLINK = 0x008;
+const int SWIN_A_DIM = 0x010;
+const int SWIN_A_BOLD = 0x020;
+#else
 const int SWIN_A_NORMAL = A_NORMAL;
 const int SWIN_A_STANDOUT = A_STANDOUT;
 const int SWIN_A_UNDERLINE = A_UNDERLINE;
@@ -19,6 +37,7 @@ const int SWIN_A_REVERSE = A_REVERSE;
 const int SWIN_A_BLINK = A_BLINK;
 const int SWIN_A_DIM = A_DIM;
 const int SWIN_A_BOLD = A_BOLD;
+#endif
 
 const int SWIN_KEY_BACKSPACE = KEY_BACKSPACE;
 
@@ -27,6 +46,40 @@ SWIN_CHTYPE SWIN_SYM_HLINE;
 SWIN_CHTYPE SWIN_SYM_LTEE;
 
 static bool initscr_intialized = false;
+
+#ifdef _WIN32
+/* bits of an encoded attribute */
+#define SWIN_ATTR_CHAR_MASK 0x000000ff
+#define SWIN_ATTR_PAIR_SHIFT 20
+#define SWIN_ATTR_MAX_PAIRS 4095
+
+static chtype swin_expand_attr(int attrs)
+{
+    chtype ch = 0;
+
+    if (attrs & SWIN_A_STANDOUT)
+        ch |= A_STANDOUT;
+    if (attrs & SWIN_A_UNDERLINE)
+        ch |= A_UNDERLINE;
+    if (attrs & SWIN_A_REVERSE)
+        ch |= A_REVERSE;
+    if (attrs & SWIN_A_BLINK)
+        ch |= A_BLINK;
+    if (attrs & SWIN_A_DIM)
+        ch |= A_DIM;
+    if (attrs & SWIN_A_BOLD)
+        ch |= A_BOLD;
+
+    if ((attrs & ~SWIN_ATTR_CHAR_MASK) != 0) {
+        int pair = (attrs >> SWIN_ATTR_PAIR_SHIFT) - 1;
+
+        if (pair >= 0)
+            ch |= COLOR_PAIR(pair);
+    }
+
+    return ch;
+}
+#endif
 
 /**
  * Set the ESCDELAY environment variable.
@@ -40,13 +93,19 @@ static bool initscr_intialized = false;
  */
 static bool swin_set_escdelay(void)
 {
+#ifdef _WIN32
+    /* ESCDELAY is an ncurses concept; PDCurses does not use it and CGDB
+     * does its own escape disambiguation in kui. */
+    return true;
+#else
     static char escdelay[] = "ESCDELAY=0";
     bool success = putenv(escdelay) == 0;
-                
+
     if (!success)
         clog_error(CLOG_CGDB, "putenv(\"%s\") failed", escdelay);
 
     return success;
+#endif
 }
 
 bool swin_start()
@@ -61,6 +120,13 @@ bool swin_start()
             }
 
             swin_refresh();
+
+#ifdef _WIN32
+            /* PDCurses initscr() rewrites the console input mode and
+             * clears the VT-input bit (verified); re-assert it so kui
+             * keeps reading escape sequences. */
+            win_console_assert_input_mode();
+#endif
         }
     }
 
@@ -141,13 +207,23 @@ int swin_use_default_colors()
 
 bool swin_supports_default_color_pairs_extension()
 {
+#ifdef _WIN32
+    /* The ncurses -1-color extension probe does not apply to PDCurses;
+     * report "no" so callers stay inside the standard pair range. */
+    return false;
+#else
     int result = init_pair(65, -1, COLOR_BLACK);
     return result != ERR;
+#endif
 }
 
 int swin_resizeterm(int lines, int columns)
 {
+#ifdef _WIN32
+    return resize_term(lines, columns);
+#else
     return resizeterm(lines, columns);
+#endif
 }
 
 int swin_scrl(int n)
@@ -162,7 +238,14 @@ int swin_keypad(SWINDOW *win, int bf)
 
 char *swin_tigetstr(const char *capname)
 {
+#ifdef _WIN32
+    /* PDCurses has no terminfo; kui_term falls back to its built-in
+     * escape-sequence tables when this returns NULL. */
+    (void) capname;
+    return NULL;
+#else
     return tigetstr((char*)capname);
+#endif
 }
 
 int swin_move(int y, int x)
@@ -177,12 +260,20 @@ int swin_wmove(SWINDOW *win, int y, int x)
 
 int swin_wattron(SWINDOW *win, int attrs)
 {
+#ifdef _WIN32
+    return wattron((WINDOW *)win, swin_expand_attr(attrs));
+#else
     return wattron((WINDOW *)win, attrs);
+#endif
 }
 
 int swin_wattroff(SWINDOW *win, int attrs)
 {
+#ifdef _WIN32
+    return wattroff((WINDOW *)win, swin_expand_attr(attrs));
+#else
     return wattroff((WINDOW *)win, attrs);
+#endif
 }
 
 SWINDOW *swin_newwin(int nlines, int ncols, int begin_y, int begin_x)
@@ -331,7 +422,13 @@ int swin_pair_content(int pair, int *fin, int *bin)
 
 int swin_color_pair(int pair)
 {
+#ifdef _WIN32
+    if (pair < 0 || pair > SWIN_ATTR_MAX_PAIRS)
+        return 0;
+    return (pair + 1) << SWIN_ATTR_PAIR_SHIFT;
+#else
     return COLOR_PAIR(pair);
+#endif
 }
 
 int swin_raw(void)

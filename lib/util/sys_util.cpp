@@ -27,6 +27,9 @@
 #endif /* HAVE_ERRNO_H */
 
 #define CLOG_MAIN
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "sys_util.h"
 
 void *cgdb_calloc(size_t nmemb, size_t size)
@@ -125,7 +128,9 @@ int cgdb_hexstr_to_u64(const char *str, uint64_t *num)
 
 int cgdb_supports_debugger_attach_detection()
 {
-#ifdef HAVE_PROC_SELF_STATUS_FILE
+#ifdef _WIN32
+    return 1;
+#elif defined(HAVE_PROC_SELF_STATUS_FILE)
     return 1;
 #else
     return 0;
@@ -134,6 +139,9 @@ int cgdb_supports_debugger_attach_detection()
 
 int cgdb_is_debugger_attached()
 {
+#ifdef _WIN32
+    return IsDebuggerPresent() ? 1 : 0;
+#else
     int result;
     if (cgdb_supports_debugger_attach_detection()) {
         int debugger_attached = 0;
@@ -165,6 +173,7 @@ int cgdb_is_debugger_attached()
     }
 
     return result;
+#endif
 }
 
 long get_file_size(FILE *file)

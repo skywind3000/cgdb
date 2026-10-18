@@ -170,11 +170,94 @@ VT 流里（自写解析器对 `90-97` 亮色与 `38;2` 的 fg 记录有已知�
 
 ## 5. 构建系统
 
-（M1 填写）
+`win32/Makefile`（GNU make，mingw32-make 4.4.1，**必须从 Git Bash 运行**，因为
+需要 sh 处理 `$(shell)` 和 `mkdir -p`）：
+
+```bash
+export PATH="/d/Dev/mingw32/bin:$PATH"     # 仓库根目录下
+mingw32-make -f win32/Makefile             # → .tmp/win-build/cgdb.exe
+mingw32-make -f win32/Makefile drivers     # 单元 driver 程序
+mingw32-make -f win32/Makefile check       # 自动化 driver 检查
+mingw32-make -f win32/Makefile clean
+```
+
+关键设计：
+
+| 项 | 内容 |
+|---|---|
+| 产物 | `.tmp/win-build/`（遵循 AGENTS.md 临时目录约定），obj 平铺 `.tmp/win-build/obj/` |
+| 链接 | `-static -static-libgcc -static-libstdc++ -lpdcurses_wincon -lwinmm`，零 DLL 依赖 |
+| include | **项目头一律 `-iquote`**（`lib/util/io.h` 会遮蔽 CRT `<io.h>`——mingw 的 `<unistd.h>`/flex 骨架会引入 `<io.h>`，`-I` 指项目目录必炸）；`-I$(MINGW)/include` 只给 pdcurses.h |
+| config | 手写 `win32/config.h` + `win32/cgdb_custom_config.h`（后者提供 `ATTRIBUTE_PRINTF` 宏，作用同 autotools 构建里生成的同名文件） |
+| 定义 | `-DHAVE_CONFIG_H -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0A00`（ConPTY/VT 输入常量） |
+| 版本 | `-DPACKAGE_VERSION` 取自根目录 `VERSION` 文件 |
+| flex | 生成物提交在 `win32/generated/`（9 个），`win32/regen-lexers.sh` 用 WSL flex 重生成 |
+| 排除 | pseudo.cpp / fork_util.cpp / terminal.cpp（→ process_win.cpp + console_win.cpp）；lib/vterm、vterminal.cpp、scroller.cpp（→ scroller_win.cpp）；tester.cpp；readline 链接 |
+
+M1 验证状态（2026-10-18）：lib/util（含 PDCurses swin 后端、process_win、
+console_win）、lib/kui 全部 6 个对象、lib/tokenizer + 8 个 flex 生成物、
+gdbwire.c 全部零警告编译；`tokenizer_driver` 以 c/rust/go/ada/d/asm 六种
+语言喂真实源文件跑通；`cgdbutil_driver` 输出 ANSI 色卡。全静态链接。
 
 ## 6. 平台层实现细节
 
-（M1-M4 填写）
+### 6.1 swin 层（sys_win.cpp，PDCurses 分支）
+
+- include 分支新增 `HAVE_PDCURSES_H → <pdcurses.h>`（根目录包装，
+  PDC_WIDE + PDC_FORCE_UTF8 + `endwin → endwin_u64_4400` 符号映射——该库
+  只有 `endwin` 一个带后缀的符号，其余全部原名）。
+- **属性编码**（见 sys_win.h 注释）：PDCurses 宽字符构建 chtype 64 位、
+  颜色位在 bit 44+，塞不进 int。Windows 侧保持 int API：bit 0-7 存自定义
+  SWIN_A_* 值（0x01=STANDOUT…0x20=BOLD），bit 20+ 存「颜色对+1」；
+  `swin_wattron/wattroff` 在边界处用 `swin_expand_attr` 展开成真 chtype。
+  全代码库只使用 SWIN_A_*（无裸 ncurses A_* 宏），UI 层零改动。
+- `swin_color_pair()`：编码；ncurses 版照旧 `COLOR_PAIR()`。
+- `swin_resizeterm` → `resize_term`（PDCurses 无 resizeterm 包装）。
+- `swin_tigetstr` → NULL（无 terminfo，kui_term 落回硬编码绑定表）。
+- `swin_set_escdelay` → no-op（ncurses 专有）。
+- `swin_supports_default_color_pairs_extension` → false。
+- `swin_start()` 末尾调用 `win_console_assert_input_mode()`：initscr 会
+  清掉 VT 输入位（E4 实测 0x280→0x88，endwin 恢复）。
+- `SWIN_CHTYPE` 在 win 下为 `unsigned long long`（ACS_* 等是 64 位）。
+- COLOR_* 常量加 `#ifndef` 守卫（pdcurses.h 同名重定义警告）。
+
+### 6.2 io 层（io.cpp）
+
+- `io_data_ready(fd, ms)`：fd → HANDLE（fd 0 = 控制台输入句柄，其余
+  `_get_osfhandle`），`WaitForSingleObject`（-1→INFINITE）。控制台输入
+  句柄与管道读端都是合法等待对象（E4 实测）。
+- `io_getchar(fd, ms, key)`：等待后 `ReadFile` 读 1 字节。**必须用
+  ReadFile 而不是 CRT read()**——控制台在 VT 输入模式下 ReadFile 返回
+  原始转义序列字节流，而 CRT read() 会过输入码页转换。
+- `io_read/io_writen` 等不改：gdb 管道 fd 由 `_open_osfhandle` 生成，
+  CRT read/write 原样可用；管道 EOF 由 read()==0 表达。
+
+### 6.3 控制台（console_win.cpp/h，替代 terminal.cpp）
+
+`win_console_setup/restore/assert_input_mode/size_changed`：
+输入 `ENABLE_VIRTUAL_TERMINAL_INPUT|ENABLE_EXTENDED_FLAGS`（顺带关闭
+quick-edit 选择模式），输出加 VT 处理位；原始模式只保存一次，
+`assert_input_mode` 幂等重设；尺寸轮询比较 `srWindow` 与上次值。
+
+### 6.4 进程（process_win.cpp/h，替代 pseudo/fork_util）
+
+`win_spawn_debugger`：`CreatePipe`×2 + `STARTF_USESTDHANDLES`
+（stderr 并入 stdout 管道）+ `CREATE_NEW_PROCESS_GROUP`（共享本控制台，
+使 CTRL_BREAK 可达）；`_open_osfhandle` 把两端转成 CRT fd。
+`win_interrupt_debugger`：`GenerateConsoleCtrlEvent(CTRL_BREAK, pid)`。
+`win_inferior_tty_create`：`\\.\pipe\cgdb_inf_<pid>` 双工命名管道 +
+读线程（ConnectNamedPipe 阻塞等待 gdb 在 inferior 启动时连入；ReadFile
+循环把字节塞进临界区保护的缓冲并 SetEvent；管道断开 err=109 即 EOF）。
+
+### 6.5 其他
+
+- `fs_util.cpp`：`mkdir(path)`（无 mode 参数）+ PATH 分隔符 `;`。
+- `sys_util.cpp`：`cgdb_is_debugger_attached → IsDebuggerPresent`。
+- `kui_term.cpp`：`keyseq_initializer` 在 win 下直接 return（无
+  termcap/tgetent/tgetstr），kui 使用 47 条硬编码 VT 绑定。
+- `rline.cpp`：win stub（rline 只是 readline 按键序列 oracle，'/' 命令
+  行编辑本就是 interface.cpp 手写；硬编码绑定已覆盖所需序列）。
+- `kui` 其余、`gdbwire.c`、`tokenizer` + flex 生成物：零改动编译通过。
 
 ## 7. tgdb 传输层改造
 

@@ -1,8 +1,24 @@
 #ifndef __SYS_WIN_H__
 #define __SYS_WIN_H__
 
-typedef struct SWINDOW SWINDOW;
+#ifdef _WIN32
+/* PDCurses (wide build) uses a 64-bit chtype: the color-pair attribute
+ * bits live above bit 44 and do not fit in an int. The Windows swin
+ * backend therefore keeps its public int-based attribute API but uses
+ * an internal encoding, expanded to real chtype values inside
+ * swin_wattron/swin_wattroff:
+ *   - bits 0..7   : the SWIN_A_* constants (custom values on Windows)
+ *   - bits 20..31 : swin_color_pair(pair) stores (pair + 1), so a raw
+ *                   attribute of 0 still means "no attribute".
+ * Callers must not mix real curses attribute constants or COLOR_PAIR
+ * values in on Windows.
+ */
+typedef unsigned long long SWIN_CHTYPE;
+#else
 typedef unsigned long SWIN_CHTYPE;
+#endif
+
+typedef struct SWINDOW SWINDOW;
 
 /* From the ncurses doupdate() man page:
  *
@@ -34,14 +50,32 @@ enum win_refresh {
 };
 
 
+/* pdcurses.h defines the same constants; guard to avoid redefinition
+ * warnings in translation units that include both. */
+#ifndef COLOR_BLACK
 #define COLOR_BLACK 0
+#endif
+#ifndef COLOR_RED
 #define COLOR_RED 1
+#endif
+#ifndef COLOR_GREEN
 #define COLOR_GREEN 2
+#endif
+#ifndef COLOR_YELLOW
 #define COLOR_YELLOW 3
+#endif
+#ifndef COLOR_BLUE
 #define COLOR_BLUE 4
+#endif
+#ifndef COLOR_MAGENTA
 #define COLOR_MAGENTA 5
+#endif
+#ifndef COLOR_CYAN
 #define COLOR_CYAN 6
+#endif
+#ifndef COLOR_WHITE
 #define COLOR_WHITE 7
+#endif
 
 /* attributes */
 extern const int SWIN_A_NORMAL;

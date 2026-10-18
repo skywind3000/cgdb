@@ -1,12 +1,15 @@
 #include "rline.h"
 #include "sys_util.h"
-#include "fork_util.h"
 
 #if HAVE_CONFIG_H
 #include "config.h"
 #endif /* HAVE_CONFIG_H */
 
 /* includes {{{*/
+
+#ifndef _WIN32
+#include "fork_util.h"
+#endif
 
 #ifdef HAVE_LIBREADLINE
 
@@ -19,6 +22,29 @@
 #endif /* HAVE_LIBREADLINE */
 
 /* }}}*/
+
+#ifdef _WIN32
+
+/* Windows port: rline is only a key-sequence oracle - cgdb asks readline
+ * which byte sequences are bound to Home/End/word-motion so it can
+ * register them with kui. On Windows the console's VT-input mode emits
+ * xterm-style sequences, which kui's hard_coded_bindings table already
+ * covers (ESC[H, ESC[F, ESC b, ESC f, ESC\b, ESC d), so the oracle is
+ * a stub: no readline, no pty. */
+
+int rline_initialize(void)
+{
+    return 0;
+}
+
+int rline_get_keyseq(const char *named_function, std::list<std::string> &keyseq)
+{
+    (void) named_function;
+    (void) keyseq;
+    return 0;
+}
+
+#else /* !_WIN32 */
 
 int rline_initialize(void)
 {
@@ -88,6 +114,8 @@ rline_get_keyseq(const char *named_function, std::list<std::string> &keyseq)
 
     return 0;
 }
+
+#endif /* !_WIN32 */
 
 /*@}*/
 /* }}}*/
