@@ -261,7 +261,74 @@ quick-edit 选择模式），输出加 VT 处理位；原始模式只保存一�
 
 ## 7. tgdb 传输层改造
 
-（M2 填写）
+### 7.1 改动形状
+
+tgdb.cpp 的命令队列、请求映射、gdbwire 回调链**全部保留**；传输层用
+`#ifdef _WIN32` 分支替换（Linux 侧字节级零改动，增量重编译通过）。合成
+控制台（行编辑器等）直接实现在 tgdb.cpp 内（需要访问不透明的
+`struct tgdb`），约 300 行 `#ifdef _WIN32` 包裹段。
+
+改动点（对照 doc/reference.md 的行号索引）：
+
+| 位置 | Windows 行为 |
+|---|---|
+| `tgdb_start_gdb` | `win_spawn_debugger`（管道 + CREATE_NEW_PROCESS_GROUP）+ 创建 inferior 管道 + 入队 `-gdb-set inferior-tty` 请求（TGDB_REQUEST_TTY，win 下命令串用 `-gdb-set inferior-tty`，反斜杠原样过 MI 解析器） |
+| `tgdb_run_request` | DEBUGGER_COMMAND/CONSOLE_COMMAND → `-interpreter-exec console "..."`（MI 转义 `\"`/`\\`）；写端一律 `debugger_stdin`（gdb_mi_ui_fd 在 win 下是读端） |
+| `tgdb_run_or_queue_request` | 用户命令也走队列串行化（响应按 current_request_type 归因，双命令在飞会串味） |
+| `tgdb_process` | 单通道：读到的字节全部进 gdbwire（~ 记录路由显示，见下） |
+| `tgdb_send_char` | → 合成控制台行编辑器（见 §8） |
+| `tgdb_signal_notification` | SIGINT → `win_interrupt_debugger`（CTRL_BREAK）；SIGCHLD 不存在，主循环轮询 `tgdb_debugger_alive` |
+| `tgdb_resize_console` | no-op（管道没有 winsize） |
+| 新增 `TGDB_REQUEST_CONSOLE_COMMAND` | 任意用户命令行（tgdb.h 枚举追加；Linux 侧永不创建） |
+| 新增 API | `tgdb_process_inferior`（排水 inferior 管道）、`tgdb_inferior_event_handle`（等待集用事件句柄）、`tgdb_debugger_alive` |
+
+MI 记录路由（gdbwire 回调内的 win 分支）：
+
+- `~` console 记录（非反汇编捕获期）→ `tgdb_win_output` → console_output_callback；
+- `^error`（DEBUGGER/CONSOLE_COMMAND 上下文）→ 显示 msg（`&` 记录与
+  ^error 文本重复，同 Linux 一样丢弃）；
+- prompt 记录 → `tgdb_console_at_prompt` → 合成回显 `"(gdb) "`。
+
+### 7.2 Windows 两个致命管道陷阱（M2 实测踩出，都已有修复）
+
+1. **匿名管道读句柄上的 WaitForSingleObject 不可靠**：写端存活、管道
+   空时仍返回「已信号化」（Win10 19045 实测；本机之前所有 ConPTY 实验
+   都用 ReadFile 阻塞读或控制台句柄，从未踩到）。后果：主循环假就绪 →
+   ReadFile 真阻塞 → 整个 UI 冻结。
+   **修复**：`io_data_ready` 对管道改用 `PeekNamedPipe` 轮询（10ms 切片，
+   `ERROR_BROEN_PIPE` 视为就绪让 read 拿到 EOF）；控制台输入句柄照旧
+   WaitForSingleObject（E4 验证可靠）。**cgdb 主循环因此不能把 MI 管道
+   句柄放进 WaitForMultipleObjects，而是轮询 `io_data_ready(fd, 0)`**。
+2. **CRT `read()` 在信号化管道上永久阻塞**：同一症状的另一层——
+   `read()` 在「句柄已信号但无数据」时阻塞不返回（E2 场景首发症状）。
+   **修复**：`io_read`/`io_writen` 的 win 分支直接 ReadFile/WriteFile
+   原始句柄（顺带绕开文本模式 CRLF 翻译；`_open_osfhandle` 加
+   `_O_BINARY` 双保险）。`ERROR_BROKEN_PIPE` → 返回 0（EOF，对应
+   Linux 的 EIO→0 映射）。
+3. **命名管道同步句柄的读/写串行化死锁**：inferior 管道读线程常驻
+   ReadFile 时，主线程向同一句柄 WriteFile（forwarding 用户键入）永久
+   阻塞。
+   **修复**：inferior 管道 `FILE_FLAG_OVERLAPPED` + 读线程 GetOverlappedResult
+   阻塞读 + 写端重叠写（2s 超时后 CancelIo 丢弃，防止不读 stdin 的
+   inferior 冻结 UI）。
+
+### 7.3 MI 语义发现（E2/E1 复核）
+
+- 该 GDB 17.1 的 MI 是**异步**的（`-exec-run` 立即回 `^running`+prompt，
+  inferior 运行中可继续处理 MI 命令）——tgdb 的 prompt 驱动队列天然兼容；
+- gdb 退出 → 管道 `ERROR_BROKEN_PIPE` = EOF → `tgdb_process` size==0 →
+  TGDB_QUIT（MI driver 实测）；
+- ^C 中断后 gdb 的 *stopped 落在 `ntdll!DbgBreakPoint` 注入线程（无
+  源码信息）——中断功能本身完好（gdb 存活且继续应答），源码窗口定位
+  润色（自动 thread 1）列为后续工作。
+
+### 7.4 MI driver 验收（.tmp/mi_driver.cpp，ConPTY 内运行）
+
+- `basic`：**7/7** —— b main 输出显示、停在 main（源码位置回调）、断点
+  回调、inferior 输出显示（经命名管道）、MI 流纯净、干净退出
+  （TGDB_QUIT）、gdb 进程退出；
+- `interrupt`：**4/4** —— ^C 后 gdb 存活、继续应答 `print 7*6`（$1=42）、
+  干净退出、进程退出。
 
 ## 8. 合成 GDB 窗口
 

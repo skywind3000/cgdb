@@ -145,11 +145,18 @@
         TGDB_REQUEST_DATA_DISASSEMBLE_MODE_QUERY,
 
         // Run a debugger command through gdb.
-        // 
+        //
         // This is when the caller wants to run a command through gdb,
         // next, step, finish, but without the user typing it at the
         // console. For instance, a cgdb shortcut like F8.
         TGDB_REQUEST_DEBUGGER_COMMAND,
+
+        // Run an arbitrary user-typed console command through gdb.
+        //
+        // Windows only: the synthesized GDB console submits finished
+        // user input lines as this request, which runs them through
+        // -interpreter-exec console on the MI channel.
+        TGDB_REQUEST_CONSOLE_COMMAND,
 
         // Request that a breakpoint be modified.
         //
@@ -447,6 +454,33 @@
    * 0 on sucess, or -1 on error
    */
     int tgdb_process(struct tgdb *tgdb, int fd);
+
+    /**
+     * Process any output the debugged program wrote to its terminal.
+     *
+     * Windows only (no-op elsewhere): drains the inferior's tty pipe
+     * and hands the bytes to the console output callback. The main
+     * loop calls this after tgdb_inferior_event_handle() was signaled.
+     *
+     * @return
+     * The number of bytes processed, or -1 on error.
+     */
+    int tgdb_process_inferior(struct tgdb *tgdb);
+
+    /**
+     * Waitable event handle signaled when the inferior wrote output.
+     *
+     * Windows only: NULL when there is no inferior terminal. The main
+     * loop includes it in its wait set.
+     */
+    void *tgdb_inferior_event_handle(struct tgdb *tgdb);
+
+    /**
+     * Returns 1 while the debugger process runs, 0 once it exited.
+     *
+     * Windows only: always 1 elsewhere (SIGCHLD covers it there).
+     */
+    int tgdb_debugger_alive(struct tgdb *tgdb);
 
     /**
      * Send a character to the gdb console.

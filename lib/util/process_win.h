@@ -67,6 +67,10 @@ struct win_inferior_tty {
 int win_inferior_tty_create(struct win_inferior_tty *tty,
         unsigned long owner_pid);
 
+/* 1 once gdb (on behalf of the inferior) has connected to the pipe,
+ * which happens when the inferior actually starts. */
+int win_inferior_tty_connected(struct win_inferior_tty *tty);
+
 /* Waitable event handle for the main loop (data available). */
 void *win_inferior_tty_event(struct win_inferior_tty *tty);
 

@@ -131,6 +131,32 @@ ssize_t io_read(int fd, void *buf, size_t count)
 {
     ssize_t amountRead;
 
+#ifdef _WIN32
+    /* ReadFile on the raw handle: the CRT read() can block forever on
+     * a pipe whose handle is already signaled (observed with the MI
+     * pipe after gdb goes idle), and text-mode translation would also
+     * corrupt the byte stream. ERROR_BROKEN_PIPE is EOF (the writer
+     * closed its end), matching the Linux EIO-to-EOF mapping. */
+    {
+        HANDLE h = io_fd_handle(fd);
+        DWORD got = 0;
+
+        if (h == NULL || h == INVALID_HANDLE_VALUE) {
+            clog_error(CLOG_CGDB, "io_read: bad handle (fd=%d)", fd);
+            return -1;
+        }
+
+        if (!ReadFile(h, buf, (DWORD) count, &got, NULL)) {
+            if (GetLastError() == ERROR_BROKEN_PIPE)
+                return 0;       /* EOF */
+            clog_error(CLOG_CGDB, "ReadFile failed: %lu",
+                       (unsigned long) GetLastError());
+            return -1;
+        }
+
+        return (ssize_t) got;    /* 0 == EOF */
+    }
+#else
   tgdb_read:
 
     if ((amountRead = read(fd, buf, count)) == -1) {    /* error */
@@ -148,6 +174,7 @@ ssize_t io_read(int fd, void *buf, size_t count)
     }
 
     return amountRead;
+#endif
 }
 
 ssize_t io_writen(int fd, const void *vptr, size_t n)
@@ -156,6 +183,25 @@ ssize_t io_writen(int fd, const void *vptr, size_t n)
     size_t nleft = n;
     const char *ptr = (const char *) vptr;
 
+#ifdef _WIN32
+    /* WriteFile on the raw handle; keeps \n as-is (no text mode). */
+    {
+        HANDLE h = io_fd_handle(fd);
+        const char *p = ptr;
+        DWORD wrote = 0;
+
+        while (nleft > 0) {
+            if (h == NULL || h == INVALID_HANDLE_VALUE ||
+                    !WriteFile(h, p, (DWORD) nleft, &wrote, NULL) ||
+                    wrote == 0)
+                return -1;
+            nleft -= wrote;
+            p += wrote;
+        }
+
+        return (ssize_t) n;
+    }
+#else
     while (nleft > 0) {
         if ((nwritten = write(fd, ptr, nleft)) <= 0) {
             if (errno == EINTR)
@@ -168,6 +214,7 @@ ssize_t io_writen(int fd, const void *vptr, size_t n)
     }
 
     return (n);
+#endif
 }
 
 void io_display_char(FILE * fd, char c)
@@ -190,30 +237,62 @@ int io_data_ready(int fd, int ms)
 {
 #ifdef _WIN32
     HANDLE h = io_fd_handle(fd);
-    DWORD wait_ms;
-    DWORD ret;
 
     if (h == NULL || h == INVALID_HANDLE_VALUE) {
         clog_error(CLOG_CGDB, "io_data_ready: bad handle (fd=%d)", fd);
         return -1;
     }
 
-    if (ms == -1)
-        wait_ms = INFINITE;
-    else if (ms < 0)
-        wait_ms = 0;
-    else
-        wait_ms = (DWORD) ms;
+    if (fd == 0) {
+        /* The console input handle waits properly: signaled exactly
+         * when input records are queued (verified on Win10 19045). */
+        DWORD wait_ms = (ms == -1) ? INFINITE :
+                (ms < 0 ? 0 : (DWORD) ms);
+        DWORD ret = WaitForSingleObject(h, wait_ms);
 
-    ret = WaitForSingleObject(h, wait_ms);
-    if (ret == WAIT_OBJECT_0)
-        return 1;               /* console/pipe has data or hit EOF */
-    if (ret == WAIT_TIMEOUT)
-        return 0;
+        if (ret == WAIT_OBJECT_0)
+            return 1;
+        if (ret == WAIT_TIMEOUT)
+            return 0;
 
-    clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
-               (unsigned long) GetLastError());
-    return -1;
+        clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
+                   (unsigned long) GetLastError());
+        return -1;
+    }
+
+    /* Anonymous pipe read handles are NOT reliably waitable here:
+     * WaitForSingleObject returns "signaled" even while the pipe is
+     * empty and the writer is alive (observed on Win10 19045, and it
+     * made a blocking ReadFile hang the main loop). Poll with
+     * PeekNamedPipe instead; a closed write end shows up as
+     * ERROR_BROKEN_PIPE, which counts as ready so the subsequent read
+     * can observe the EOF. */
+    {
+        ULONGLONG deadline = GetTickCount64() +
+                (ms < 0 ? 0 : (ULONGLONG) ms);
+
+        for (;;) {
+            DWORD avail = 0;
+
+            if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+                if (avail > 0)
+                    return 1;
+            } else if (GetLastError() == ERROR_BROKEN_PIPE) {
+                return 1;      /* EOF: let io_read see it */
+            } else {
+                clog_error(CLOG_CGDB, "PeekNamedPipe failed: %lu",
+                           (unsigned long) GetLastError());
+                return -1;
+            }
+
+            if (ms == 0)
+                return 0;
+            if (ms != -1 && GetTickCount64() >= deadline)
+                return 0;
+
+            Sleep(10);
+        }
+    }
 #else
     int ret;
 
