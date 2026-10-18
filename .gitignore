@@ -48,3 +48,5 @@ lib/tokenizer/rustlexer.cpp
 
 cgdb/command_lexer.cpp
 cgdb_custom_config.h
+
+/.*/*
