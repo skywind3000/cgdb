@@ -143,7 +143,28 @@ pkill -f tgdb_driver; pkill -f "new-ui mi"
 
 ## Windows 移植
 
-**目前 Windows 侧还完全构建不起来。** 下面是逐项探测过的现状，省得重复踩。
+**目前 Windows 侧还构建不起来，但可行性已经实测定案。** 完整分析、实验记录和
+架构方案见 `doc/porting-feasibility.md`（必读），下面只列影响动手决策的硬结论：
+
+- **最低系统基线：Windows 10 1809（build 17763）+**，因为 ConPTY 从 1809 才有。
+  「支持 Windows 10」一律指 1809 及以上。
+- **GDB 的 `new-ui mi` 双通道在原生 Windows GDB 上不可用**（mingw32/64 的
+  GDB 17.1 实测：挂管道或文件都会在下一个事件循环迭代退出）。移植架构改为
+  `gdb --interpreter=mi` 走 stdin/stdout 管道（实测全通，VS Code 同款方案），
+  GDB 窗口由 cgdb 自己的行编辑器合成。tgdb/gdbwire 代码不受影响。
+- **GDB 本体在 ConPTY 里交互完全正常**（readline、`$1 = 42` 全验证）。
+  ConPTY 只用于被调试程序（inferior）的终端；cgdb 自身 UI 渲染到真实控制台。
+- **curses 首选 PDCurses-wincon**（`-lpdcurses_wincon -lwinmm`，头文件必须用
+  根目录 `pdcurses.h` 包装）：真彩 + Unicode 框线 + CJK 实测通过。ncursesw
+  是 8 色备胎（win32 驱动构建，`WriteConsoleOutputW` 码页免疫）。PDCurses-vt
+  别用（字节级输出过控制台码页，CP936 下必错码）。
+- **本机控制台代码页是 CP936**：字节级写控制台必错码（连 ESC 都可能被吞），
+  文本输出要走宽字符 API 或显式 UTF-8 转换，别信 `setlocale("")`。
+- ConPTY 接线配方有坑（`UpdateProcThreadAttribute` 传句柄值、必须
+  `STARTF_USESTDHANDLES`+NULL 三句柄），细节在 feasibility 文档 3.1 节。
+- 32 位 gdb 调不了 64 位程序，主线建议换 `D:\Linux\mingw64` 工具链。
+
+下面是逐项探测过的现状，省得重复踩。
 
 ### 工具链
 
@@ -240,6 +261,10 @@ git commit -s
   四条核心数据流、启动/关闭时序、逐模块代码原理（含行号引用）、构建系统与依赖分析、
   POSIX 依赖风险矩阵、已知代码陷阱清单。做移植设计或改核心代码前先读它，
   本文（AGENTS.md）只覆盖目录级概览和工具链，深入细节以 reference.md 为准
+- `doc/porting-feasibility.md` —— **Windows 移植可行性报告（本仓库自写，实测背书）**：
+  系统基线（Win10 1809+）、GDB new-ui 不可用的实测证据、MI-over-pipes 替代架构、
+  curses 三后端能力矩阵、ConPTY 接线配方、自写 swin 后端兜底分析、阶段计划。
+  动手移植前必读
 - `roadmap.txt` —— 上游作者写的架构反思和待办，解释了为什么 cgdb 至今没有窗口管理器
 - `cgdb/TODO` —— 更细的历史待办和已知 bug 清单
 - `NEWS` —— 完整的版本变更历史

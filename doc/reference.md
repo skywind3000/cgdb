@@ -922,6 +922,8 @@ cgdb/Makefile.am 的 DEFS 带 `-DPKGDATADIR`（logo/help 文本运行时定位�
 ## 附：与本文档相关的其他文档
 
 - `AGENTS.md`（仓库根）：工具链、构建命令、Windows 侧探测结论、代码风格
+- `doc/porting-feasibility.md`：Windows 移植可行性报告——系统基线（Win10 1809+）、
+  GDB new-ui 实测结论与 MI-over-pipes 架构方案、curses 后端选型、ConPTY 接线配方
 - `roadmap.txt`：上游作者的架构反思（为什么没有窗口管理器）
 - `cgdb/TODO`：历史待办和已知 bug
 - `lib/kui/README.md`、`lib/kui/notes.txt`：kui 设计决策
