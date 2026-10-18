@@ -415,6 +415,19 @@ vterm 依赖 100% 藏在 scroller.cpp 内、interface.cpp 只调 `scr_*` API—�
   按键即冻结）。`io_data_ready`/`io_getchar` 现在用 `PeekConsoleInput`
   检查队头：key-down → ReadFile 安全；非按键记录 → `ReadConsoleInput`
   消费掉再查；
+- **KEY_UP 幽灵信号（首发后用户实测发现的第 5 个致命陷阱，即「按
+  `:` 就崩」bug）**：Windows 控制台对每个按键生成 KEY_DOWN + KEY_UP
+  两条记录，KEY_UP 不产生 VT 字节但会把句柄信号化。首发版 `io_data_ready`
+  把非按键记录排掉后返回 0——而 kui 的 `kuictx::findkey` 在 **map_set
+  为 NULL（状态条焦点，按 `:` 之后）** 时把「findchar 返回 0」直接当
+  -1 错误返回（上游潜伏 bug，Linux 上 select 语义「可读=有数据」使其
+  不可达）。于是按 `:` → 状态条清空 map_set → `:` 的 KEY_UP 几十毫秒
+  后到达 → 幽灵唤醒 → 伪 -1 → `user_input_loop failed` → 静默退出。
+  **修复**：`io_data_ready` 的控制台路径改为循环等待——排掉非按键记录
+  后继续等到真的有 key-down 或超时（恢复 Linux select 契约）；主循环
+  的用户输入门禁统一走 `io_data_ready(0, 0)`（不再信任裸 wait 结果，
+  顺带在门禁处排掉游离 KEY_UP）。注意 `ms==0` 时必须先轮询一次再判
+  deadline（首发修复版曾把 0 超时快捷成「永不就绪」的 bug）；
 - ^C：VT 输入模式下不再是事件而是原始 0x03 字节 → kui →
   CGDB_KEY_CTRL_C → `user_input` 里拦截 → `tgdb_signal_notification` →
   CTRL_BREAK（§7.2）；
@@ -446,6 +459,31 @@ vterm 依赖 100% 藏在 scroller.cpp 内、interface.cpp 只调 `scr_*` API—�
 
 真彩语法高亮在 VT 流中实测可见（`38;2;r;g;b`、`91m` 亮色关键字、
 框线 `│` U+2502、行号列）。
+
+### 10.2b testsuite/win32 全覆盖测试套件（后续补建，已入库）
+
+首发后用户按 `:` 即崩（见 §9 KEY_UP 陷阱），暴露出 E2E 覆盖不足——
+于是建了正式的全覆盖套件 `testsuite/win32/`（入库，含 README）：
+
+```bash
+export PATH="/d/Dev/mingw32/bin:$PATH"     # gcc 编译测试 inferior
+python testsuite/win32/run_tests.py        # 仓库根目录，约 3 分钟
+```
+
+**96/96 全部通过**（2026-10-19）。覆盖矩阵：
+
+| 模块 | 覆盖 |
+|---|---|
+| cases_cli | `--version`/`--help`、`-d` 指向不存在路径（错误可见化回归）、PATH 无 gdb |
+| cases_session | 启动画面、ESC/i 焦点切换（行为级验证）、**状态条 `:` 后静置（KEY_UP 崩溃回归用例）**、状态条退格/未知命令/ESC 取消、连发按键 |
+| cases_debug | b main + run + 停止、inferior 输出、typed next / F10 / cont、空格切换断点、`u` until、^C 中断后应答、无调试信息程序 |
+| cases_nav | G/gg/Ctrl-D/Ctrl-U/j/k、`/` 搜索、GDB 窗行编辑（退格/Ctrl-U/Ctrl-A/E/F）、方向键历史、PageUp 滚动模式 |
+| cases_windows | `+`/`-` 分屏（状态条行位置变化断言）、极限缩小、ConPTY resize 扩/缩、12x40 与 6x20 极小终端 |
+| cases_files | CRLF+CJK 源文件显示与调试、窄终端行宽 |
+| cases_commands | `:set`（syntax/winminheight/空值）、未知命令、`:help`、`:q`（空闲后/调试后/inferior 运行中） |
+
+按键全部走 `keys()`（带间隔逐字节发送）——每个按键都产生真实的
+KEY_DOWN/KEY_UP 记录对，正是踩出状态条 bug 的时序路径。
 
 ### 10.3 单元 driver（M1）
 
@@ -483,7 +521,11 @@ Windows 移植对 Linux 侧零破坏（所有改动都在 `#ifdef _WIN32` 内）
 7. **inferior 交互式全屏程序**：inferior 的 tty 是管道不是终端，全屏
    交互（vim 类）不可用；行交互（scanf/printf）正常。ConPTY 劣势终
    端是后续增强方向。
-8. **`rline` 键序列 oracle**：Windows 侧是 stub——硬编码绑定已覆盖
+8. **`Unknown command` 消息不可见**（上游行为，非移植差异）：`:` 敲
+   未知命令时 `if_run_command` 画的错误消息会被随后的 `if_draw()` 在
+   doupdate 之前覆盖（Linux 上 pty 实测同样不可见）。会话无损，命令
+   继续可用。
+9. **`rline` 键序列 oracle**：Windows 侧是 stub——硬编码绑定已覆盖
    Home/End/词操作，若用户自定义了 readline 绑定则不感知。
 
 ### 交付物清单
@@ -495,5 +537,5 @@ Windows 移植对 Linux 侧零破坏（所有改动都在 `#ifdef _WIN32` 内）
 | tgdb 传输 | tgdb.cpp/tgdb.h 的 win 分支（含行编辑器） |
 | UI | `cgdb/scroller_win.cpp`、interface.cpp/cgdb.cpp 的 win 分支 |
 | 文档 | 本文件 + `doc/porting-feasibility.md`（可行性）+ `doc/reference.md`（架构） |
-| 测试 | `.tmp/mi_driver.cpp`（MI 验收）、`.tmp/e2e_cgdb.py`（E2E 23 项） |
+| 测试 | `testsuite/win32/`（**96 项全覆盖套件，入库**）+ `.tmp/mi_driver.cpp`（MI 验收）+ `.tmp/e2e_cgdb.py`（E2E 23 项） |
 | 产物 | `.tmp/win-build/cgdb.exe`（6.6MB 全静态，仅依赖系统 DLL） |

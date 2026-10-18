@@ -50,3 +50,6 @@ cgdb/command_lexer.cpp
 cgdb_custom_config.h
 
 /.*/*
+
+# python bytecode (testsuite/win32)
+__pycache__/

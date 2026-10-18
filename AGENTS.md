@@ -174,6 +174,16 @@ F5/F8/F10、ESC 切窗口、`:q` 退出；^C 中断 inferior。
 E2E 测试：`.tmp/e2e_cgdb.py`（ConPTY 里跑真 cgdb + VT 屏幕解析断言，23 项）；
 MI 传输验收：`.tmp/mi_driver.cpp`（basic 7/7 + interrupt 4/4）。
 
+**全覆盖测试套件（改完 Windows 侧代码后必跑，约 3 分钟）**：
+
+```bash
+python testsuite/win32/run_tests.py     # 96 项，CLI/焦点/状态条/调试/导航/resize/文件/:命令/退出
+```
+
+覆盖说明：按键用逐字节带间隔发送（真实打字节奏，每个键都产生
+KEY_DOWN/KEY_UP 记录对——`testsuite/win32/README.md` 有完整矩阵）。
+其中「状态条 `:` 后静置」是 KEY_UP 幽灵信号崩溃的回归用例。
+
 ### 关键实现事实（改代码前必知）
 
 - **所有 Windows 差异都收在 `#ifdef _WIN32` 里**，Linux 构建零改动
@@ -184,8 +194,12 @@ MI 传输验收：`.tmp/mi_driver.cpp`（basic 7/7 + interrupt 4/4）。
   io 层一律 PeekNamedPipe 轮询；主循环不能把 MI 管道放进等待集。
 - **CRT read() 在信号化空管道上会永久阻塞**：io_read/io_writen 走 ReadFile/
   WriteFile 原始句柄；`ERROR_BROKEN_PIPE` 即 EOF。
-- **控制台句柄会被非按键记录（焦点事件等）信号化**，ReadFile 却只认按键：
-  读之前用 PeekConsoleInput 门禁并排掉非按键记录，否则 kui 超时契约被挂死。
+- **控制台句柄会被非按键记录（焦点事件、KEY_UP 等）信号化**，ReadFile 却只认
+  key-down 记录：读之前用 PeekConsoleInput 门禁并排掉非按键记录，否则 kui
+  超时契约被挂死。**io_data_ready 必须循环等到真有 key-down 或超时**（首发版
+  排完记录就返回 0，被 kui 的 findkey 当成 -1，按 ':' 进状态条后松键即
+  静默退出——KEY_UP 记录是每键必有的）。主循环的用户输入门禁统一走
+  io_data_ready(0,0)，别信裸 WaitForMultipleObjects 结果。
 - **同步命名管道上读线程常驻 ReadFile 时，主线程 WriteFile 同句柄会死锁**：
   inferior 管道全部重叠 I/O。
 - **构建必须用 `-iquote` 引项目头**：`-I lib/util` 会让 CRT 的 `<io.h>`

@@ -272,24 +272,53 @@ int io_data_ready(int fd, int ms)
     }
 
     if (fd == 0) {
-        /* The console input handle waits properly: signaled exactly
-         * when input records are queued (verified on Win10 19045).
-         * Gate on a real key record though: non-key records (focus
-         * etc.) would otherwise leave ReadFile blocked forever, and
-         * io_getchar's timeout contract broken. */
-        DWORD wait_ms = (ms == -1) ? INFINITE :
-                (ms < 0 ? 0 : (DWORD) ms);
-        DWORD ret = WaitForSingleObject(h, wait_ms);
+        /* The console input handle signals when ANY input record is
+         * queued - including key-up records, which never produce VT
+         * bytes for ReadFile. Keep waiting (consuming the non-key
+         * records along the way) until a key-down record is actually
+         * queued or the timeout expires: that restores the Linux
+         * select() contract "readable == real data exists", which the
+         * kui relies on (a spurious 0 return while a key was expected
+         * surfaces as a spurious -1 error in kuictx::findkey when no
+         * map set is active, i.e. in status-bar focus, and kills the
+         * main loop right after the user types ':'). */
+        ULONGLONG deadline = GetTickCount64() +
+                (ms < 0 ? 0 : (ULONGLONG) ms);
+        int first = 1;
 
-        if (ret == WAIT_TIMEOUT)
-            return 0;
-        if (ret != WAIT_OBJECT_0) {
-            clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
-                       (unsigned long) GetLastError());
-            return -1;
+        for (;;) {
+            DWORD wait_ms;
+            DWORD ret;
+
+            if (ms == -1) {
+                wait_ms = INFINITE;
+            } else {
+                ULONGLONG now = GetTickCount64();
+                ULONGLONG remaining = deadline > now ?
+                        (deadline - now) : 0;
+
+                /* ms == 0 must still poll the queue once (the caller
+                 * uses it as a "is data ready right now" check); the
+                 * deadline only ends the loop from the second pass
+                 * on, after the strays were consumed. */
+                if (!first && remaining == 0)
+                    return 0;
+                wait_ms = (DWORD) remaining;
+            }
+            first = 0;
+
+            ret = WaitForSingleObject(h, wait_ms);
+            if (ret == WAIT_TIMEOUT)
+                return 0;
+            if (ret != WAIT_OBJECT_0) {
+                clog_error(CLOG_CGDB, "WaitForSingleObject failed: %lu",
+                           (unsigned long) GetLastError());
+                return -1;
+            }
+
+            if (io_win_console_key_pending(h))
+                return 1;
         }
-
-        return io_win_console_key_pending(h);
     }
 
     /* Anonymous pipe read handles are NOT reliably waitable here:

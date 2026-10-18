@@ -866,9 +866,11 @@ static int main_loop(void)
         if (stop_event && r == WAIT_OBJECT_0 + 1)
             return 0;
 
-        /* User input */
-        if (r == WAIT_OBJECT_0 ||
-                (r == WAIT_TIMEOUT && io_data_ready(0, 0) == 1)) {
+        /* User input: the console handle also signals on key-up
+         * records that carry no data, so gate on io_data_ready
+         * (which waits for a real key record) instead of trusting
+         * the raw wait result. */
+        if (io_data_ready(0, 0) == 1) {
             int val = user_input_loop();
 
             if (val == -1 && errno == EAGAIN)
