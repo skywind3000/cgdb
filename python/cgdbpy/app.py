@@ -13,7 +13,7 @@ and a `:` / `/` command line that replaces the status line while active.
     +------------------------------------------+
 
 Two deliberate deviations from the C version, both recorded in
-doc/python_version.md:
+doc/python_specs.md (§3.9 and §16.1):
 
   * The console is split into a scrollback region plus a pinned edit line
     instead of one scrolling terminal. prompt_toolkit's Buffer then provides

@@ -300,7 +300,7 @@ def test_splitter_accepts_str():
 
 
 def test_splitter_large_payload():
-    # 593 KiB / 15094 lines was the measured bulk case (python_version.md §5.2)
+    # 593 KiB / 15094 lines was the measured bulk case (python_specs.md §13.3)
     s = mi.LineSplitter()
     chunk = b'~"line of output text padding padding padding\\n"\n' * 500
     total = 0

@@ -15,7 +15,7 @@ Implements the grammar from the GDB manual ("GDB/MI output syntax"):
 
 This is the Python counterpart of gdbwire.c (8193 lines of vendored C). It is
 deliberately small: MI is line oriented and the whole parser is a few hundred
-lines. See doc/python_version.md §3.1 for why we do not use pygdbmi.
+lines. See doc/python_specs.md §15.4 for why we do not use pygdbmi.
 """
 
 RESULT = "result"

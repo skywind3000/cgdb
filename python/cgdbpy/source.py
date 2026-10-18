@@ -3,7 +3,7 @@
 Python counterpart of cgdb/sources.cpp + lib/tokenizer.
 
 Highlighting strategy is forced by a measurement, not by taste
-(doc/python_version.md §6.1): lexing only the visible window is WRONG for
+(doc/python_specs.md §3.6): lexing only the visible window is WRONG for
 C/C++, because a window that starts inside a `/* ... */` block or a raw string
 gets coloured as code. On lib/tgdb/tgdb.cpp, 6 of 11 sampled 40-line windows
 diverged from the full-file lex, two of them on 35-36 lines out of 40.

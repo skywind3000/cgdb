@@ -1,6 +1,6 @@
 """Source buffer, highlighting and breakpoint table tests.
 
-The highlighting tests encode the finding from doc/python_version.md §6.1:
+The highlighting tests encode the finding from doc/python_specs.md §3.6:
 lexing only the visible window produces WRONG colours for C/C++, because a
 window can start inside a multi-line comment or raw string. The cache-everything
 strategy used here is asserted against a full-file lex as the reference.
@@ -278,7 +278,7 @@ def test_cached_highlighting_matches_a_full_file_lex():
 def test_windowed_lexing_is_demonstrably_wrong():
     """Proves the naive alternative is not acceptable.
 
-    This is the measurement behind doc/python_version.md §6.1: on
+    This is the measurement behind doc/python_specs.md §3.6: on
     lib/tgdb/tgdb.cpp, 6 of 11 sampled 40-line windows disagree with the
     full-file lex. If this ever stops reproducing, the justification for the
     caching strategy needs re-examining.

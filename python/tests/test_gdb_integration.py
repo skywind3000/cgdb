@@ -245,7 +245,7 @@ def test_break_info_on_a_fresh_session(session):
 
 @needs_gdb
 def test_token_pairing(session):
-    """Every response must carry the token we sent (python_version.md §3.1.1)."""
+    """Every response must carry the token we sent (python_specs.md §13.2)."""
     for i in range(20):
         r = session.call("-break-info")
         assert r.token is not None

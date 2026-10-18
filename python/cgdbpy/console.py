@@ -16,7 +16,7 @@ module implements exactly the byte semantics recorded there:
     BEL etc  ignored
 
 The interactive line editor itself is NOT here: prompt_toolkit's Buffer gives
-history, word motion and kill commands for free (doc/python_version.md §6.3),
+history, word motion and kill commands for free (doc/python_specs.md §3.9),
 so this module only models what gets *displayed*.
 """
 

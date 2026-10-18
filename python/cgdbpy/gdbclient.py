@@ -9,7 +9,7 @@ Two rules learned the hard way by the C port and honoured here:
 
   * Pair responses by MI **token**, never by waiting for the `(gdb)` prompt.
     Prompt-waiting measured 15.9 ms/command vs 117 us with tokens
-    (doc/python_version.md §3.1.1).
+    (doc/python_specs.md §13.2).
   * The reader thread must never block the caller. Requests are queued and a
     single command is in flight at a time, matching tgdb's
     `is_gdb_ready_for_next_command`.
