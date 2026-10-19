@@ -1,0 +1,9 @@
+# Runtime dependencies of python/cgdb.py.
+#
+# Install:   pip install -r python/requirements.txt
+# Run:       python python/cgdb.py -- -q <program>
+#
+# Everything else is the standard library; gdb itself is a separate,
+# external program (pass -d <path-to-gdb.exe> if it is not on PATH).
+prompt_toolkit>=3.0.29,<3.1   # UI: layout, keys, line editing (tested 3.0.52)
+pygments>=2.13                # source highlighting (tested 2.20.0)

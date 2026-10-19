@@ -10,8 +10,8 @@
 ## 运行
 
 ```bash
-# 依赖（本机已装）
-pip install prompt_toolkit pygments
+# 依赖（本机已装）：prompt_toolkit + pygments
+pip install -r python/requirements.txt
 
 # 最简用法：-- 之后原样传给 gdb
 python python/cgdb.py -- -q ./myprogram
