@@ -70,6 +70,26 @@ class VTScreen:
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
         self.r = self.c = 0
         self.buf = b""
+        # The hardware cursor's visibility. prompt_toolkit hides it while
+        # redrawing and re-shows it only when the focused control wants a
+        # cursor; cgdb's source pane keeps it hidden (the cursor bar is
+        # the indicator), so this flag is the honest focus signal. The
+        # show comes through as ESC[?25h; ConPTY relays the hide with the
+        # private prefix dropped, as ESC[25l -- both spellings accepted.
+        self.cursor_visible = True
+        # Background colour of each cell: None (default) or an RGB tuple.
+        # Tracks SGR 48;2;r;g;b as chars are painted; the selected-line
+        # cursor bar is the only thing painted in its own blue-grey, so
+        # finding that row locates the selected line even while the
+        # hardware cursor is hidden.
+        self.bg_grid = [[None] * self.cols for _ in range(self.rows)]
+        self.cur_bg = None
+        # Bold flag of each cell: the source pane's vertical bar is bold
+        # only while that pane has focus (class:vline-focus), which makes
+        # "a bold bar cell" the focus signal that survives repaints and
+        # resizes -- the hardware-cursor visibility relay does not.
+        self.bold_grid = [[False] * self.cols for _ in range(self.rows)]
+        self.cur_bold = False
 
     def feed(self, data):
         self.buf += data
@@ -118,6 +138,8 @@ class VTScreen:
         for i, c in enumerate(ch):
             if self.c + i < self.cols:
                 self.grid[self.r][self.c + i] = c
+                self.bg_grid[self.r][self.c + i] = self.cur_bg
+                self.bold_grid[self.r][self.c + i] = self.cur_bold
         self.c += max(1, len(ch))
 
     def nl(self):
@@ -126,6 +148,10 @@ class VTScreen:
             self.r = self.rows - 1
             self.grid.pop(0)
             self.grid.append([" "] * self.cols)
+            self.bg_grid.pop(0)
+            self.bg_grid.append([None] * self.cols)
+            self.bold_grid.pop(0)
+            self.bold_grid.append([False] * self.cols)
 
     def _esc(self):
         b = self.buf
@@ -165,6 +191,11 @@ class VTScreen:
         cleaned = "".join(ch for ch in params if ch.isdigit() or ch == ";")
         ps = [int(x) if x else 0 for x in cleaned.split(";")] if cleaned else []
         private = bool(params) and not params[0].isdigit()
+        if final in ("h", "l") and 25 in ps:
+            # cursor visibility: ESC[?25h shows; the hide reaches this side
+            # as ESC[25l (ConPTY drops the '?')
+            self.cursor_visible = (final == "h")
+            return
         if private:
             # mode set/reset and friends do not move the cursor or paint cells
             return
@@ -183,21 +214,60 @@ class VTScreen:
             mode = ps[0] if ps else 0
             if mode == 2 or mode == 3:
                 self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                self.bg_grid = [[None] * self.cols
+                                for _ in range(self.rows)]
+                self.bold_grid = [[False] * self.cols
+                                  for _ in range(self.rows)]
             elif mode == 0:
                 for cc in range(self.c, self.cols):
                     self.grid[self.r][cc] = " "
+                    self.bg_grid[self.r][cc] = self.cur_bg
+                    self.bold_grid[self.r][cc] = self.cur_bold
                 for rr in range(self.r + 1, self.rows):
                     self.grid[rr] = [" "] * self.cols
+                    self.bg_grid[rr] = [self.cur_bg] * self.cols
+                    self.bold_grid[rr] = [self.cur_bold] * self.cols
         elif final == "K":
             mode = ps[0] if ps else 0
             if mode == 0:
                 for cc in range(self.c, self.cols):
                     self.grid[self.r][cc] = " "
+                    self.bg_grid[self.r][cc] = self.cur_bg
+                    self.bold_grid[self.r][cc] = self.cur_bold
             elif mode == 1:
                 for cc in range(0, self.c + 1):
                     self.grid[self.r][cc] = " "
+                    self.bg_grid[self.r][cc] = self.cur_bg
+                    self.bold_grid[self.r][cc] = self.cur_bold
             else:
                 self.grid[self.r] = [" "] * self.cols
+                self.bg_grid[self.r] = [self.cur_bg] * self.cols
+                self.bold_grid[self.r] = [self.cur_bold] * self.cols
+        elif final == "m":
+            # SGR: only the background matters here. 0 resets, 49 defaults,
+            # 48;2;r;g;b truecolor (what the app emits), 48;5;n indexed
+            # (recorded as-is; unused by the assertions).
+            q = ps if ps else [0]
+            i = 0
+            while i < len(q):
+                v = q[i]
+                if v == 0:
+                    self.cur_bg = None
+                    self.cur_bold = False
+                elif v == 49:
+                    self.cur_bg = None
+                elif v == 1:
+                    self.cur_bold = True
+                elif v == 22 or v == 21:
+                    self.cur_bold = False
+                elif v == 48 and i + 1 < len(q):
+                    if q[i + 1] == 2 and i + 4 < len(q):
+                        self.cur_bg = (q[i + 2], q[i + 3], q[i + 4])
+                        i += 4
+                    elif q[i + 1] == 5 and i + 2 < len(q):
+                        self.cur_bg = ("idx", q[i + 2])
+                        i += 2
+                i += 1
         elif final == "X":
             # ECH: erase `n` characters at the cursor, cursor does not move.
             # prompt_toolkit emits this instead of writing spaces when a row
@@ -207,18 +277,28 @@ class VTScreen:
             n = ps[0] if ps and ps[0] else 1
             for cc in range(self.c, min(self.cols, self.c + n)):
                 self.grid[self.r][cc] = " "
+                self.bg_grid[self.r][cc] = self.cur_bg
+                self.bold_grid[self.r][cc] = self.cur_bold
         elif final == "L":
             n = ps[0] if ps else 1
             for _ in range(n):
                 if self.r < self.rows:
                     self.grid.pop()
                     self.grid.insert(self.r, [" "] * self.cols)
+                    self.bg_grid.pop()
+                    self.bg_grid.insert(self.r, [None] * self.cols)
+                    self.bold_grid.pop()
+                    self.bold_grid.insert(self.r, [False] * self.cols)
         elif final == "M":
             n = ps[0] if ps else 1
             for _ in range(n):
                 if self.r < self.rows:
                     del self.grid[self.r]
                     self.grid.append([" "] * self.cols)
+                    del self.bg_grid[self.r]
+                    self.bg_grid.append([None] * self.cols)
+                    del self.bold_grid[self.r]
+                    self.bold_grid.append([False] * self.cols)
 
     def text(self):
         return "\n".join("".join(row).rstrip() for row in self.grid)

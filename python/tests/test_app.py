@@ -2050,3 +2050,15 @@ def test_selected_line_keeps_token_foreground_and_bar_background(app):
     attrs = app.style.get_attrs_for_style_str(kw[0][0])
     assert attrs.color in ("ff79c6", "8be9fd")   # the keyword keeps its colour
     assert attrs.bgcolor == "2e4a62"             # and the bar background
+
+
+def test_source_cursor_hides_only_in_source_focus(app):
+    """The cursor bar is the only indicator in the source window; the
+    hardware cursor shows on every other surface (user preference -- C
+    keeps curs_set(1) in the source pane too)."""
+    app.set_focus(FOCUS_SOURCE)
+    assert app.source_window.always_hide_cursor()
+    app.set_focus(FOCUS_GDB)
+    assert not app.source_window.always_hide_cursor()
+    app.set_focus(FOCUS_COMMAND)
+    assert not app.source_window.always_hide_cursor()

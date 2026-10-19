@@ -203,12 +203,30 @@ class Cgdb:
                 out.append((i, line))
         return out
 
+    # the cursor bar's background (#2e4a62), and the executing-line
+    # highlight's (#50fa7b) for when the selected line IS the stopped line
+    BAR_BG = (46, 74, 98)
+    EXEC_BG = (80, 250, 123)
+
     def cursor_line(self):
-        """The source line under the terminal cursor (the selected line):
-        the number on the gutter row the cursor sits on, or None."""
-        line = self.screen.line(self.screen.r)
-        m = re.match(r"\s*(\d+)│", line)
-        return int(m.group(1)) if m else None
+        """The selected source line, located by the cursor bar's colour.
+
+        The hardware cursor is hidden while the source window has focus
+        (and its position is not relayed anyway), so the bar painted in
+        the selected line's own background is the locator: the first
+        gutter row above the status bar carrying it. Falls back to the
+        executing-line highlight when the selected line is also the
+        stopped line -- the exec style wins the row there.
+        """
+        status = self.status_row()
+        top = status if status is not None else self.screen.rows
+        for bg in (self.BAR_BG, self.EXEC_BG):
+            for r in range(top):
+                if any(c == bg for c in self.screen.bg_grid[r]):
+                    m = re.match(r"\s*(\d+)│", self.screen.line(r))
+                    if m:
+                        return int(m.group(1))
+        return None
 
     def status_row(self):
         """Row index of the status bar -- the row between the two panes.
@@ -251,27 +269,42 @@ class Cgdb:
         self.settle(0.3)
 
     def focus(self):
-        """Which window the terminal cursor is in: CGDB / GDB / CMD or ''.
+        """Which window has focus: CGDB / GDB / CMD or ''.
 
-        The status bar carries no focus marker in C (the `*` is dead code,
-        erased by if_display_message's repaint -- verified against the
-        official cgdb), so the *cursor position* is the only honest
-        signal. In vertical split the status bar and the edit prompt share
-        the last row, so the column tells them apart: past the "(gdb)"
-        prompt is the GDB window, left of it is the command line.
+        Two signals, in priority order:
+
+        * The source pane's vertical bar is drawn BOLD only while that
+          pane has focus (class:vline-focus). Every repaint carries it,
+          resizes included, and it is the only reliable signal -- the
+          hardware cursor is hidden in the source window (the cursor bar
+          is the indicator) and ConPTY's relay of the hide is flaky.
+        * Otherwise the visible cursor's position: on the edit prompt row
+          the GDB window, on the status row the `:` command line.
         """
-        r = self.screen.r
         status = self.status_row()
         if status is None:
             return ""
+        # locate the bar column from any numbered gutter row
+        vcol = None
+        for r in range(status):
+            m = re.match(r"\s*\d+│", self.screen.line(r))
+            if m:
+                vcol = m.end() - 1
+                break
+        if vcol is not None:
+            for r in range(status):
+                if self.screen.grid[r][vcol] == "│" \
+                        and self.screen.bold_grid[r][vcol]:
+                    return "CGDB"
+        if not self.screen.cursor_visible:
+            return ""          # hidden with no bold bar: intermediate
+        r = self.screen.r
         line = self.screen.line(r)
         prompt = line.find("(gdb)")
         if prompt >= 0 and self.screen.c >= prompt:
             return "GDB"
         if r == status:
             return "CMD"
-        if r < status:
-            return "CGDB"
         # anything else -- the console in scroll mode -- reports unknown
         return ""
 

@@ -355,6 +355,21 @@ class CgdbApp:
                         columns=columns)
 
         win.get_size = full_width_get_size
+        # Vt100_Output.hide_cursor skips the ?25l write when it believes
+        # the cursor is already hidden -- but a terminal resize can make
+        # ConPTY restore the cursor behind our back, and the app would
+        # never re-hide it. Force every hide to actually go out; the
+        # renderer issues one at the start of each frame, so the state
+        # is re-asserted on every repaint.
+        vt = out.vt100_output
+        if hasattr(vt, "_cursor_visible"):
+            _orig_hide = vt.hide_cursor
+
+            def _always_hiding_hide_cursor():
+                vt._cursor_visible = None
+                return _orig_hide()
+
+            vt.hide_cursor = _always_hiding_hide_cursor
         return out
 
     def _build_ui(self):
@@ -374,6 +389,15 @@ class CgdbApp:
                                                     focusable=True)
 
         self.source_window = Window(self.source_control, wrap_lines=False,
+                                    # Only the cursor bar shows while this
+                                    # pane is focused: the hardware cursor
+                                    # next to the bar reads as a second
+                                    # cursor (user preference; C keeps
+                                    # curs_set(1) there). The filter is
+                                    # evaluated per render, so ESC/i toggle
+                                    # it with the focus.
+                                    always_hide_cursor=Condition(
+                                        lambda: self.focus == FOCUS_SOURCE),
                                     height=D(weight=1, preferred=0.6))
         # Window(style=...) is prepended to every cell of the window including
         # the blank ones past the end of the text, which is what paints the bar

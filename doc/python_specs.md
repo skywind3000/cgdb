@@ -964,12 +964,18 @@ filedlg/命令行→清空，`cgdb.cpp:427-432`），`normal :map` 不再泄漏�
   `executinglinedisplay`/`selectedlinedisplay`/`arrowstyle`（弃用别名，
   不接受 `block`）全部接线。
 - 文件尾 `~` 行；mark 画在竖线列（HLG_MARK，白粗）。
-- 源码窗有焦点时终端光标显示在选中行行尾（ptk `get_cursor_position`，
-  光标格由渲染时写入的尾随空格提供——ptk 只能把光标放到已写入的格上）。
-  ⚠️ 实测陷阱：**不能用 `always_hide_cursor` 隐藏它再指望位置**——渲染器
-  仍会把隐藏光标 move 到正确格（`renderer._cursor_pos` 正确），但 ConPTY
-  不把隐藏光标的定位镜像进 VT 流，屏幕上/e2e 解析里光标停在最后一帧
-  差分绘制的单元。e2e 的焦点检测正是依赖这条流。
+- 源码窗**有焦点时隐藏系统光标**（`always_hide_cursor` 为
+  `Condition(focus==source)`，每帧求值）：光标条就是位置指示器，系统光标
+  与光标条并排会被读成"两个光标"（用户偏好；C 在源码窗保留
+  `curs_set(1)`）。GDB 编辑行/命令行/滚筒光标照常显示。
+  ⚠️ 实测陷阱两条：**ConPTY 不把隐藏光标的定位镜像进 VT 流**（渲染器内部
+  `renderer._cursor_pos` 正确，流里光标停在最后绘制的单元）——e2e 因此
+  改用两个不依赖光标的信号：**竖线列加粗**（`class:vline-focus`，焦点
+  判定，重绘/resize 都携带）与**光标条背景色**（选中行定位，
+  `48;2;46;74;98`）；ConPTY 对 `?25l` 的转播也不稳定（真实控制台没有
+  这层中继，不受影响）。另：ptk 的 vt100 层认为已隐藏时会跳过
+  `?25l` 重写，resize 后 ConPTY 恢复光标就永远不再隐藏——已用
+  强制每次都写的 `hide_cursor` 包装处理（`_console_output`）。
 
 **配置系统**
 - `set no<opt>` 剥前缀清布尔（仅布尔，`set notabstop` 报错）；
