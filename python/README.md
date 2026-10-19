@@ -52,26 +52,50 @@ python python/cgdb.py --source src/main.c -- -q prog.exe
 | 空格 | 在光标行切换断点 |
 | `t` | 临时断点（tbreak） |
 | `j` `k` `G` `gg` `Ctrl-D` `Ctrl-U` `Ctrl-F` `Ctrl-B` | 源码窗移动 |
+| `h` `l` | 源码窗横向滚动 |
+| `<数字>j` / `<数字>k` / `<数字>G` | 行号计数（`5j` 移 5 行，`12G` 跳第 12 行） |
+| `u` | 执行到光标行（until） |
+| `o` | 文件选择对话框（gdb 源文件列表，`/` 搜索、Enter 打开） |
 | `m<x>` / `'<x>` | 设置 / 跳转到标记 |
 | `/` `?` `n` `N` | 向下 / 向上搜索、重复 |
-| `+` `-` | 增减源码窗高度 |
+| `Ctrl-W` | 横向 / 纵向分屏切换 |
+| `=` `-` | 分割线移动一行（横向）或一列（纵向） |
+| `+` `_` | 跳到上 / 下一个 1/4 分割刻度（`src_full` … `gdb_full`） |
 | `:` | 命令行 |
 | GDB 窗内 `PageUp`/`PageDown` | 进入滚动模式翻历史输出 |
+| GDB 滚动模式内 `j k Ctrl-D Ctrl-U Ctrl-F Ctrl-B gg G F11 F12`，`q i Enter` 退出 | 滚动 GDB 窗历史（`gg` 需按两次） |
+| GDB 滚动模式内 `h l 0 $` | GDB 窗横向平移 |
+| GDB 滚动模式内 `/` `?` `n` `N` | 在 GDB 窗输出里搜索 |
 
 GDB 窗内是普通的行编辑：方向键翻历史、`Ctrl-A/E/U/K/W` 等 readline 键位都由
 prompt_toolkit 的 Buffer 提供，不需要自己实现。
 
 ### `:` 命令
 
+命令集对齐 C 版的 `commands[]` 表（`cgdb/cgdbrc.cpp:98-141`）和 NUMBER 语法
+（`command_parse_string`）：
+
 | 命令 | 说明 |
 |---|---|
 | `:set <opt>[=<value>]` | 读写配置项，`:set all` 列出全部 |
-| `:open <file>[:line]` | 打开源文件 |
-| `:map <lhs> <rhs>` / `:unmap <lhs>` | 增删按键映射（`:imap` / `:iunmap` 同理） |
-| `:clear` | 清空 GDB 窗 |
+| `:12` / `:+3` / `:-3` | 跳到第 12 行 / 向下滚动 3 行 / 向上滚动 3 行 |
+| `:run` `:r` / `:start` | 运行程序 / `start`（在 main 断住） |
+| `:continue` `:c` | 继续执行 |
+| `:next` `:n` / `:nexti` | 单步（语句 / 指令） |
+| `:step` `:s` / `:stepi` | 步入（语句 / 指令） |
+| `:finish` `:f` | 跑完当前函数 |
+| `:until` `:u` | 执行到当前行 |
+| `:up` / `:down` | 调用栈帧上移 / 下移 |
+| `:kill` `:k` | 终止被调试程序 |
+| `:insert` / `:focus cgdb\|gdb` | 切换窗口焦点 |
+| `:edit` `:e` | 重新加载当前源文件（保留光标） |
+| `:noh` / `:bang` | 接受但为空操作（对齐 C 的桩；`:noh` 待 hlsearch 实装后生效） |
+| `:map <lhs> <rhs>` / `:unmap` / `:imap` / `:iunmap`（缩写 `:im` `:iu` `:unm`） | 增删按键映射 |
+| `:open <file>[:line]` | 打开源文件（本版扩展；C 版对应物是 `o` 键的文件对话框） |
+| `:clear` | 清空 GDB 窗（本版扩展） |
 | `:help` | 按键速查 |
-| `:q` | 退出 |
-| 其他 | 原样当作 gdb 命令执行 |
+| `:q` / `:quit` | 退出 |
+| 其他 | 报 "unknown command"（与 C 版的 `Unknown command:` 一致） |
 
 配置项名称、缩写、类型和默认值全部照抄 `cgdb/cgdbrc.cpp`，
 `tests/test_cgdbrc.py` 会**直接从 C 源码里正则抓出选项表来比对**，防止漂移。
@@ -89,6 +113,7 @@ python/
     kui.py                 vim 式按键映射引擎（对应 lib/kui）
     keycodes.py            键值常量与 <...> 记法表（对应 kui_term.cpp）
     console.py             GDB 窗行模型（对应 scroller_win.cpp）
+    filedlg.py             `o` 文件选择对话框（对应 filedlg.cpp）
     source.py              源码缓冲、Pygments 高亮缓存、断点表
     highlight.py           Pygments token -> prompt_toolkit 样式
     cgdbrc.py              :set 配置项（对应 cgdbrc.cpp）
@@ -260,8 +285,17 @@ CGDBPY_MILOG=E:\path\mi.txt      # 每一行收发到的 MI 记录（带时间�
 | 启动 | ~8.5 ms | ~8.5 ms | ~260 ms |
 | 分发 | 单文件 | 6.6 MB 全静态单文件 | 需要解释器或打包 |
 
-**尚未实现**（C 版有）：文件选择对话框（`o` 键，目前提示用 `:open`）、
-反汇编窗口、`:set syntax` 的语言强制、多源码缓冲切换、鼠标。
+**尚未实现**（C 版有）：反汇编窗口、多源码缓冲切换、鼠标、
+`:logo`、`:highlight`、搜索命中的持久高亮（hlsearch 渲染；
+递进跳转已有）。
+
+**已实现**（曾经缺失、2026-10 补齐）：`o` 文件选择对话框（全屏、
+vim 键位、`/` 搜索）、源码窗 `h`/`l` 横向滚动、GDB 窗滚动模式的
+`0`/`$`/`h`/`l` 与控制台内搜索（`/` `?` `n` `N`）、`/` 输入时的
+递进跳转、`:syntax`/`:set syntax` 强制 lexer、`:shell`、
+`Ctrl-W` 横竖分屏、`=`/`-`/`+`/`_` 分割调整、数字计数（`5j`/`12G`）、
+源码窗 `u`、GDB 窗 `Enter` 退出滚动、`:数字` 跳行、全部 `:`
+调试命令。
 
 ## 已知限制
 

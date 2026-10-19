@@ -612,10 +612,25 @@ ptk 从**顶部**开始显示 formatted text；在顶部补空行会把真实内
 |---|---|
 | 功能键 F1/F5/F6/F7/F8/F10 的语义 | `interface.cpp:1511-1537` |
 | ESC = cgdbmodekey = 切回源码窗；已在源码窗时无操作 | `interface.cpp:1546-1585` |
+| **启动焦点 = GDB 窗**（一进来就能敲 gdb 命令；源码窗才是 vim 式按键） | `interface.cpp:139` |
+| **GDB 窗内 `:` 和 `/` 是普通字符，归 gdb**；进了源码窗才是 cgdb 的命令键 | `interface.cpp:996-1000` |
+| **`:` / `/` 命令行画在中间状态栏行**（顶替状态栏那一行，不是屏幕底部） | `interface.cpp:459-472` |
+| **gdb 退出（EOF）→ cgdb 跟着退出**；启动期就死则留在屏幕上展示报错 | `cgdb.cpp:760-772` |
+| **`Ctrl-W`（源码窗）切换横向 / 纵向分屏**；纵向时源码+状态栏在左列、`\|` 分隔线一列、GDB 窗全高在右列，状态栏是左列最底行 | `interface.cpp:17-31, 1498-1509` |
+| **`=` / `-` 逐行（横向）逐列（纵向）移动分割线；`+` / `_` 在 1/4 刻度间跳**；`window_shift` 两方向共用、切换时原值保留 | `interface.cpp:672-752, 1263-1281` |
+| **窗口尺寸是每帧从实时终端尺寸推导的**（ptk Dimension callable），resize 由 ptk 的 0.5s 尺寸轮询触发重绘 | `interface.cpp` 的 HEIGHT/WIDTH 活值 + if_resize_term |
+| **`:` 命令集 = C 的 commands[] + NUMBER 语法**：`:N`/`:+N`/`:-N` 跳行滚动、全部调试命令（`:r` `:start` `:c` `:n` `:nexti` `:s` `:stepi` `:f` `:u` `:up` `:down` `:k`）、`:insert` `:focus` `:e`；未知命令同样报错。`:open` `:clear` 为本版扩展 | `cgdbrc.cpp:98-141, 1058-1073` |
+| **源码窗数字计数**：`5j`、`12G`（G_line_number 累积，非数字即清零） | `interface.cpp:1312-1317` |
+| **源码窗 `u` = until 到光标行** | `interface.cpp:1304-1311` |
+| **GDB 窗滚动模式键**：`Ctrl-U/D` 半页、`gg`（单 `g` 不动）、`F11/F12`、`q/i/Enter` 退出并停在底部 | `interface.cpp:908-975` |
+| **GDB 窗内 `Ctrl-L` 归 readline，cgdb 不接管**（只有源码窗里才是重绘） | `interface.cpp:983-997` |
+| **源码窗 `h`/`l` 横向滚动**；GDB 滚动模式 `h`/`l`/`0`/`$` 横向平移 | `interface.cpp:1243-1247, 955-962` |
+| **GDB 滚动模式 `n`/`N`/`/`/`?` 控制台内搜索**（正反向、定位到可视区顶部） | `interface.cpp:968-980` |
+| **`/` 输入时逐字符递进跳转**（部分正则编译失败则原地不动） | `status_bar_regex_input` |
+| **`:syntax`/`:set syntax` 强制 lexer；`:shell` 挂起 UI 起子 shell** | `cgdbrc.cpp command_parse_syntax / command_do_shell` |
 | `i` → GDB 窗，`s` → GDB 窗 + 滚动模式 | `interface.cpp:1443-1452` |
 | 空格 = 切换断点，`t` = 临时断点 | `interface.cpp:1291-1300` |
-| `+` `-` `_` 调整窗高，受 `winminheight` 约束 | `interface.cpp:1271-1281` |
-| `o` = 文件对话框（**本版未实现**，提示用 `:open`） | `interface.cpp:1282` |
+| `o` = 文件对话框：**已实现**（`cgdbpy/filedlg.py`），全屏接管（if_draw 的 FILE_DLG 分支），j/k/翻页/h/l/`/`搜索/gg/数字+G，Enter 打开、q/ESC 取消；列表来自 `-file-list-exec-source-files` | `filedlg.cpp:584-673` |
 | GDB 窗滚动语义、`[delta/max]` 状态覆盖层 | `win_specs.md` §8.1 |
 | 合成行编辑器的键位表 | `win_specs.md` §8.2 |
 | MI 命令映射表 | `reference.md` §5.2 |
@@ -649,7 +664,10 @@ ptk 从**顶部**开始显示 formatted text；在顶部补空行会把真实内
 | `cgdbmodekey` | — | string | `esc` | 支持 `esc` / `tab` / `ctrl-g` |
 | `timeoutlen` | `tm` | int | 1000 | kui 映射超时（ms） |
 | `ttimeoutlen` | `ttm` | int | 100 | ⚠️ **直接决定 ESC 延迟**，见 §7.3 |
-| `winminheight` | `wmh` | int | 0 | `+`/`-` 调整的下限 |
+| `winminheight` | `wmh` | int | 0 | `=`/`-` 调整的下限（横向分屏） |
+| `winminwidth` | `wmw` | int | 0 | `=`/`-` 调整的下限（纵向分屏） |
+| `winsplit` | `winsplit` | string | `even` | 1/4 分割刻度，`src_big`/`src_full`/`gdb_big`/`gdb_full`（`top_*`/`bottom_*` 为兼容旧写法） |
+| `winsplitorientation` | `wso` | string | `horizontal` | `horizontal` / `vertical`，即 Ctrl-W 切换的那个状态 |
 | `syntax` | `syn` | string | 空 | ⚠️ **已存储但尚未用于强制 lexer** |
 | `disasm` | `dis` | bool | off | ⚠️ **未实现**（无反汇编窗） |
 
@@ -760,6 +778,30 @@ C 版一致。E2E 测试因此断言 `marked >= cursor_line`，不是相等。
 | `FormattedTextControl` 默认不可聚焦 | `focusable=True`，否则 `Layout.focus()` 静默失败 |
 | `App.refresh()` 不可 await（这是 Textual 的，不是 ptk） | — |
 
+### 7.10 ptk 在 Windows 上少报一列，右边缘永远画不到
+
+`Win32Output.get_size()` 把可见宽度算成 `srWindow.Right - srWindow.Left`
+—— `srWindow` 是 **0 基闭区间**，这个差值比真实列数少 1，再被
+`min(dwSize.X - 1, ...)` 封顶。布局于是按 N-1 列排，渲染器从不画最后一列，
+**分隔栏/状态条、选中行都在右边缘缺一格**（C 版整行都画，见
+`interface.cpp:446-451`）。实测 120 列控制台里状态栏背景只到第 118 列。
+
+修法：`app.py:_console_output()` 在 `Windows10_Output` 上把
+`win32_output.get_size` 换成 `Right - Left + 1`。全屏 `Application` 的渲染
+全程关着 autowrap（首帧 `[?7l`，退出才恢复），写最后一列不会滚屏，安全。
+**验证必须到控制台属性层**（`ReadConsoleOutputW` 逐列看属性），VT 抓包
+会被 ConPTY 的再序列化骗过。回归测试：
+`test_app.py::test_console_output_reports_the_true_width`。
+
+### 7.11 PYTHONHOME 会毒害 gdb 内嵌的 Python
+
+vendor gdb（mingw32 的 17.1）自带内嵌 CPython，启动时用 `PYTHONHOME`
+定位它的 stdlib。cgdb.py 的用户恰好是配了 PYTHONHOME 的人群，指到无关
+解释器时 gdb 启动即报 `Python initialization failed` 且后续命令全错。
+修法：`gdbclient.py:_child_env()` 起子进程前剔除 `PYTHONHOME`（gdb 自己
+的前缀决定它的 stdlib，这个变量对它永远不可能是对的）。
+回归测试：`e2e/test_e2e.py::test_pythonhome_in_our_env_does_not_break_gdb`。
+
 ---
 
 ## 8. 未实现项与接入点
@@ -807,15 +849,16 @@ C 版因为手写了行编辑器，补全要自己实现整套 UI（`win_specs.m
 
 ⚠️ 重新 lex 是 28 µs/行，大文件必须走 `highlight_async`。
 
-### 8.4 文件选择对话框（`o` 键）
+### 8.4 文件选择对话框（`o` 键）—— ✅ 已实现
 
-C 版是 `cgdb/filedlg.cpp`。目前 `source_key` 里 `o` 只给一条提示。
-
-**接入点**：`app.py:source_key` 的 `if key == ord("o")` 分支。
-数据源用 `-file-list-exec-source-files`（`reference.md` §5.2 的 INFO_SOURCES），
-返回 `files=[{file=...,fullname=...}]`。
-UI 可以复用 `FOCUS_COMMAND` + `cmd_buffer` 的补全机制，
-或新建一个 `FOCUS_FILEDLG` 加一个 `ConditionalContainer`。
+按 §8.4 原接入点实现：`cgdbpy/filedlg.py`（模型+搜索）+ `app.py` 的
+`FOCUS_FILEDLG`。对话框激活时 `_build_root` 直接返回全屏的
+`filedlg_window`（等价 if_draw 的 FILE_DLG 分支——不是覆盖层），
+`set_focus` 检测跨越对话框边界时重建布局树。数据源
+`-file-list-exec-source-files`，键位逐条照 `filedlg_recv_char`
+（含 `gg`、数字+G；**裸 `G` 无动作**是照抄 C 的行为）。
+一处偏差：C 在对话框内用 capture_regex 在状态栏逐字符捕获，
+这里复用 `:` 命令行输入 `/` 模式（与 GDB 窗搜索同构）。
 
 ### 8.5 反汇编窗
 
@@ -839,6 +882,36 @@ C 版 `sources.cpp` 管理多个 buffer 并可切换。本版 `self.src` 是单�
 打开后需要给两个窗格加 `Window(..., ...)` 的鼠标处理，
 并处理与 ptk 默认鼠标绑定（焦点切换、Buffer 光标定位）的冲突。
 **优先级低**：C 版也没有。
+
+### 8.8 横向滚动与控制台内搜索（2026-10 审计，同日补齐）
+
+逐键对照 C 版后确认的缺口及落实情况：
+
+- ✅ **源码窗 `h`/`l`**（`source_hscroll`）：`SourceView.left` +
+  `_source_text` 的逐 token 列偏移（gutter 不动，只滚正文）。
+- ✅ **GDB 窗滚动模式的 `h`/`l`/`0`/`$`**：`app.console_left`，
+  `_console_text` 按列切片，退出滚动模式即复位。
+- ✅ **GDB 窗滚动模式的 `n`/`N`/`/`/`?`**：`ConsoleModel.search`
+  （正反向、无回绕）+ `_goto_console_row` 把命中行定到可视区顶部。
+  C 用 gdb_input_regex_input 在滚筒内逐字符捕获，这里复用状态栏
+  命令行（与源码 `/` 同构）。
+- ✅ **`/` 输入时的递进跳转**：`cmd_buffer.on_text_changed` 钩子，
+  每敲一个字符就 `search_in`（部分正则编译失败时原地不动）。
+- ✅ **`:shell`/`:sh`**：`run_in_terminal(spawn)` —— ptk 的
+  `in_terminal` 会 `input.detach()` + `cooked_mode()`，让子 shell
+  独占控制台再整屏重绘；仅事件循环运行时可用（头部报错降级为
+  状态栏消息）。⚠️ `run_in_terminal(func)` 返回 Future、**不是**
+  上下文管理器，用错只得到一条 TypeError。
+- ✅ **`:syntax` / `:set syntax=<lang>`**：`SourceFile.force_lexer`
+  （Pygments 别名；`off`→TextLexer、空/`unknown`→自动探测），
+  对当前文件重 lex、之后打开的文件也生效。
+- ✅ **`o` 文件对话框**：见 §8.4。
+- ❌ 仍缺：**`:logo`**（整屏 logo，纯装饰）、**`:highlight`**
+  （约 50 个配色组的运行时覆盖体系）、**hlsearch 持久高亮**
+  （递进跳转已有，见 §8.2）、**多源码缓冲**（§8.6）、反汇编
+  （§8.5）、鼠标（§8.7）。
+
+其余键位/命令已逐项对齐（§5 表）。
 
 ### 8.8 inferior 全屏程序
 
