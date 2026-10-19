@@ -13,7 +13,13 @@
 # 依赖（本机已装）：prompt_toolkit + pygments
 pip install -r python/requirements.txt
 
-# 最简用法：-- 之后原样传给 gdb
+# 最简用法：和原版一样，直接跟要调试的程序（不需要 --）
+python python/cgdb.py ./myprogram
+
+# cgdb 选项之后、第一个非 cgdb 参数起全部原样传给 gdb（同原版 getopt 语义）
+python python/cgdb.py -q ./myprogram
+
+# 显式用 -- 分隔也行
 python python/cgdb.py -- -q ./myprogram
 
 # 指定 gdb（Windows 上通常需要）

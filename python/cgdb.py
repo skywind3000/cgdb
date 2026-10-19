@@ -3,7 +3,7 @@
 
 Usage matches the C version:
 
-    cgdb.py [cgdb options] [--] [gdb options]
+    cgdb.py [cgdb options] [gdb options]
 
 CGDB options:
     --version        print version information and exit
@@ -13,9 +13,11 @@ CGDB options:
     --no-color       force monochrome output
     --source FILE    open FILE in the source pane at startup
 
-Everything after `--` is passed straight to gdb, e.g.
-
-    cgdb.py -- -q ./myprogram
+cgdb's options are parsed from the front only: the first argument that
+is not a cgdb option ends the scan, and everything from there on is
+passed straight to gdb. So `cgdb.py my_program`, `cgdb.py -q
+my_program` and `cgdb.py -- -q my_program` all work, exactly like the
+original cgdb.
 """
 
 import os
@@ -28,16 +30,20 @@ if HERE not in sys.path:
 VERSION = "0.1.0"
 
 USAGE = """CGDB (Python) Usage:
-   cgdb.py [cgdb options] [--] [gdb options]
+   cgdb.py [cgdb options] [gdb options]
 
 CGDB Options:
    --version      Print version information and then exit.
    --help         Print help (this message) and then exit.
    -d DEBUGGER    Set debugger to use.
-   -w             Wait for a debugger to attach before starting.
+   -w             Wait for debugger to attach before starting.
    --no-color     Disable syntax highlighting and colours.
    --source FILE  Open FILE in the source pane at startup.
    --             Marks the end of CGDB's options.
+
+Everything from the first argument that is not a CGDB option onwards is
+passed to gdb verbatim, so `cgdb.py my_program` and `cgdb.py -q
+my_program` work like in cgdb itself.
 
 Keys:
    ESC            switch to the source window
@@ -56,6 +62,16 @@ Keys:
 
 
 def parse_args(argv):
+    """Parse cgdb's own options, mirroring parse_long_options (cgdb.cpp).
+
+    getopt-style semantics: cgdb's options are parsed from the front and
+    the FIRST argument that is not one of them ends the scan -- from
+    there on everything belongs to gdb verbatim (an unknown `-x` option
+    included, which is why `cgdb -q my_program` works in the original).
+    A leading `--` in that remainder is stripped, as the C version does.
+    The one deviation: GNU getopt reorders a trailing `prog -w` to pick
+    up -w after a non-option; this scan does not permute.
+    """
     opts = {"gdb": None, "wait": False, "color": None, "source": None,
             "gdb_args": []}
     i = 0
@@ -91,9 +107,10 @@ def parse_args(argv):
         elif a.startswith("--source="):
             opts["source"] = a.split("=", 1)[1]
         else:
-            sys.stderr.write("cgdb: unknown option %s\n" % a)
-            sys.stderr.write(USAGE)
-            raise SystemExit(1)
+            # not one of cgdb's options: the original hands the rest to
+            # gdb (getopt stops at the first non-option / unknown option)
+            opts["gdb_args"] = list(argv[i:])
+            break
         i += 1
     return opts
 

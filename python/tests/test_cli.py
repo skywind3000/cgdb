@@ -108,3 +108,39 @@ def test_a_double_dash_argument_survives():
     """A path argument starting with `-` must not be parsed as an option."""
     opts = cgdb.parse_args(["--", "--weird-flag"])
     assert opts["gdb_args"] == ["--weird-flag"]
+
+
+# ---------------------------------------------------------------------------
+# cgdb's options stop at the first non-cgdb argument (parse_long_options)
+# ---------------------------------------------------------------------------
+def test_bare_program_name_goes_straight_to_gdb():
+    """`cgdb my_program` works in the original: the first argument that
+    is not a cgdb option ends the scan and the rest belongs to gdb."""
+    opts = cgdb.parse_args(["my_program"])
+    assert opts["gdb_args"] == ["my_program"]
+    assert opts["gdb"] is None
+
+
+def test_unknown_option_is_forwarded_to_gdb():
+    """`cgdb -q my_program` also works in the original: getopt returns
+    '?' for gdb's -q and cgdb hands the remainder over verbatim."""
+    opts = cgdb.parse_args(["-q", "my_program"])
+    assert opts["gdb_args"] == ["-q", "my_program"]
+
+
+def test_options_after_the_program_stay_with_gdb():
+    opts = cgdb.parse_args(["my_program", "-q", "--args"])
+    assert opts["gdb_args"] == ["my_program", "-q", "--args"]
+
+
+def test_cgdb_options_then_program():
+    opts = cgdb.parse_args(["-d", "gdb", "-w", "my_program"])
+    assert opts["gdb"] == "gdb"
+    assert opts["wait"] is True
+    assert opts["gdb_args"] == ["my_program"]
+
+
+def test_no_arguments_at_all():
+    opts = cgdb.parse_args([])
+    assert opts["gdb_args"] == []
+    assert opts["gdb"] is None
