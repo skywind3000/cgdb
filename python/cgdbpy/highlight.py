@@ -106,6 +106,10 @@ COLOR_STYLE = {
     "console": "",
     "console.prompt": "bold #50fa7b",
     "search-match": "bg:#ffb86c #282a36",
+    "filedlg": "",
+    "filedlg.label": "bold",
+    "filedlg.selected": "bg:#44475a #f8f8f2",
+    "filedlg.filler": "#6272a4",
     "border": "#6272a4",
 }
 
@@ -120,6 +124,8 @@ MONO_STYLE.update({
     "status.focus": "bold reverse",
     "command": "bold",
     "search-match": "reverse",
+    "filedlg.label": "bold",
+    "filedlg.selected": "reverse",
 })
 
 

@@ -12,6 +12,7 @@ import pytest
 from cgdbpy.cgdbrc import (BOOL, INT, STRING, Config, ConfigError,
                            LINE_DISPLAY_BLOCK, LINE_DISPLAY_LONG_ARROW,
                            LINE_DISPLAY_SHORT_ARROW, WIN_SPLIT_EVEN,
+                           WIN_SPLIT_SRC_BIG, WIN_SPLIT_TOP_BIG,
                            WSO_HORIZONTAL)
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -159,8 +160,11 @@ def test_set_bool_rejects_garbage():
 
 def test_set_string_choice_validated():
     c = Config()
-    c.set("winsplit", "top")
-    assert c.get("winsplit") == "top"
+    c.set("winsplit", "src_big")
+    assert c.get("winsplit") == WIN_SPLIT_SRC_BIG
+    # the deprecated spelling C still accepts (cgdbrc.cpp:488-501)
+    c.set("winsplit", "top_big")
+    assert c.get("winsplit") == WIN_SPLIT_TOP_BIG
     with pytest.raises(ConfigError):
         c.set("winsplit", "diagonal")
 
@@ -269,13 +273,13 @@ def test_describe_int_and_string():
 def test_load_file(tmp_path):
     p = tmp_path / ".cgdbrc"
     p.write_text("# a comment\n\nset tabstop=4\nset hlsearch\n"
-                 "set winsplit=top\n", encoding="utf-8")
+                 "set winsplit=src_big\n", encoding="utf-8")
     c = Config()
     errors = c.load_file(str(p))
     assert errors == []
     assert c.get("tabstop") == 4
     assert c.get("hls") == 1
-    assert c.get("winsplit") == "top"
+    assert c.get("winsplit") == WIN_SPLIT_SRC_BIG
 
 
 def test_load_file_collects_errors_without_aborting(tmp_path):

@@ -18,7 +18,8 @@ import re
 import threading
 
 from pygments import lex
-from pygments.lexers import get_lexer_for_filename, guess_lexer, TextLexer
+from pygments.lexers import (get_lexer_by_name, get_lexer_for_filename,
+                             guess_lexer, TextLexer)
 from pygments.token import Token
 from pygments.util import ClassNotFound
 
@@ -86,6 +87,16 @@ class SourceFile:
         return self._lex_state
 
     def lexer(self):
+        forced = getattr(self, "_forced_lexer", None)
+        if forced is not None:
+            # :syntax <name> -- force a lexer ("" means plain text, "off")
+            if forced in ("", "off"):
+                return TextLexer()
+            try:
+                return get_lexer_by_name(forced, stripnl=False,
+                                         stripall=False, ensurenl=False)
+            except Exception:
+                pass              # unknown name: fall through to detection
         try:
             return get_lexer_for_filename(self.path, stripnl=False,
                                           stripall=False, ensurenl=False)
@@ -95,6 +106,24 @@ class SourceFile:
             return guess_lexer(self.text[:4096])
         except (ClassNotFound, Exception):
             return TextLexer()
+
+    def force_lexer(self, name):
+        """Override the lexer (``:syntax``), then re-highlight.
+
+        `name` is a Pygments lexer alias; "" or "off" disables colour;
+        None returns to filename/content detection. Raises ValueError for
+        an alias Pygments does not know.
+        """
+        if name not in (None, "", "off"):
+            try:
+                get_lexer_by_name(name)
+            except Exception:
+                raise ValueError("unknown language: %s" % name)
+        self._forced_lexer = name
+        with self._lock:
+            self._tokens = None
+            self._lex_state = "none"
+        self.ensure_highlighted()
 
     def highlight_sync(self):
         """Lex the whole file now and cache per-line tokens."""
@@ -297,6 +326,7 @@ class SourceView:
     def __init__(self, height=20):
         self.height = max(1, height)
         self.top = 0
+        self.left = 0          # horizontal scroll of the text columns
         self.cursor = 0          # 0-based line index
         self.marks = {}          # 'a'..'z' -> line index
         self.last_line_col = 0
@@ -306,6 +336,11 @@ class SourceView:
 
     def resize(self, height):
         self.height = max(1, height)
+
+    def hscroll(self, delta):
+        """source_hscroll: shift the visible text columns, floors at 0."""
+        self.left = max(0, self.left + delta)
+        return self.left
 
     def ensure_visible(self, n=None):
         """Scroll minimally so the cursor line is on screen."""

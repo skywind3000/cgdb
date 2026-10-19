@@ -15,12 +15,18 @@ LINE_DISPLAY_LONG_ARROW = "longarrow"
 LINE_DISPLAY_HIGHLIGHT = "highlight"
 LINE_DISPLAY_BLOCK = "block"
 
-# win_split_val
-WIN_SPLIT_TOP = "top"
-WIN_SPLIT_BOTTOM = "bottom"
-WIN_SPLIT_LEFT = "left"
-WIN_SPLIT_RIGHT = "right"
+# win_split_val -- the values command_set_winsplit() (cgdbrc.cpp:483-511)
+# accepts. The top_*/bottom_* spellings are deprecated aliases that C still
+# accepts, so they are kept here too.
+WIN_SPLIT_SRC_BIG = "src_big"
+WIN_SPLIT_SRC_FULL = "src_full"
+WIN_SPLIT_GDB_BIG = "gdb_big"
+WIN_SPLIT_GDB_FULL = "gdb_full"
 WIN_SPLIT_EVEN = "even"
+WIN_SPLIT_TOP_BIG = "top_big"
+WIN_SPLIT_TOP_FULL = "top_full"
+WIN_SPLIT_BOTTOM_BIG = "bottom_big"
+WIN_SPLIT_BOTTOM_FULL = "bottom_full"
 
 # win_split_orientation_val
 WSO_HORIZONTAL = "horizontal"
@@ -72,8 +78,9 @@ _SPEC = [
     ("winminheight", "wmh", INT, 0, None),
     ("winminwidth", "wmw", INT, 0, None),
     ("winsplit", "winsplit", STRING, WIN_SPLIT_EVEN,
-     (WIN_SPLIT_TOP, WIN_SPLIT_BOTTOM, WIN_SPLIT_LEFT, WIN_SPLIT_RIGHT,
-      WIN_SPLIT_EVEN)),
+     (WIN_SPLIT_EVEN, WIN_SPLIT_SRC_BIG, WIN_SPLIT_SRC_FULL,
+      WIN_SPLIT_GDB_BIG, WIN_SPLIT_GDB_FULL, WIN_SPLIT_TOP_BIG,
+      WIN_SPLIT_TOP_FULL, WIN_SPLIT_BOTTOM_BIG, WIN_SPLIT_BOTTOM_FULL)),
     ("winsplitorientation", "wso", STRING, WSO_HORIZONTAL,
      (WSO_HORIZONTAL, WSO_VERTICAL)),
     ("wrapscan", "ws", BOOL, 1, None),

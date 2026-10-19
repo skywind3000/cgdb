@@ -199,6 +199,26 @@ class ConsoleModel:
         total = len(self.lines) + 1
         return max(0, total - height)
 
+    def search(self, rx, start_row, forward=True):
+        """scr_search_next: index of the next row matching `rx`, or None.
+
+        Rows are numbered like visible_lines(): 0 is the top committed
+        line and len(lines) is the current (uncommitted) row.
+        `start_row` is the previous hit (None starts from the far end).
+        """
+        rows = list(self.lines) + ["".join(self.cur)]
+        n = len(rows)
+        if forward:
+            first = (start_row + 1) if start_row is not None else 0
+            rng = range(first, n)
+        else:
+            first = (start_row - 1) if start_row is not None else n - 1
+            rng = range(first, -1, -1)
+        for i in rng:
+            if rx.search(rows[i]):
+                return i
+        return None
+
     def clear(self):
         self.lines.clear()
         self.cur = []

@@ -12,12 +12,13 @@ import tempfile
 import pytest
 
 from cgdbpy import keycodes as kc
-from cgdbpy.app import (FOCUS_COMMAND, FOCUS_GDB, FOCUS_SOURCE, CgdbApp,
-                        translate_key)
-from cgdbpy.cgdbrc import Config
+from cgdbpy.app import (FOCUS_COMMAND, FOCUS_FILEDLG, FOCUS_GDB,
+                        FOCUS_SOURCE, CgdbApp, translate_key)
+from cgdbpy.cgdbrc import Config, WSO_HORIZONTAL, WSO_VERTICAL
 from cgdbpy.gdbclient import GdbError
 from cgdbpy import mi
 
+from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.output import DummyOutput
 
 
@@ -413,10 +414,12 @@ def test_lone_g_does_not_jump(app):
 
 
 def test_ctrl_d_and_ctrl_u_page_by_half(app):
-    app.view.height = 10
+    """Half a page is half the PANE height (source_vscroll(sview,
+    get_src_height() / 2)), not view.height: the source pane is 20 rows on
+    the 40-row dummy output, so half a page moves 10 lines."""
     app.view.cursor = 30
     app.dispatch(kc.CTRL_D)
-    assert app.view.cursor == 35
+    assert app.view.cursor == 40
     app.dispatch(kc.CTRL_U)
     assert app.view.cursor == 30
 
@@ -662,6 +665,264 @@ def test_open_command_with_a_line(app, srcfile):
     assert app.view.cursor == 5
 
 
+def test_colon_number_jumps_and_scrolls(app, srcfile):
+    """`:123` goes to a line, `:+N` / `:-N` scroll by N lines
+    (command_parse_string's NUMBER case, cgdbrc.cpp:1058-1073)."""
+    app.view.cursor = 0
+    app.execute_command(":12")
+    assert app.view.cursor == 11
+    app.execute_command(":+3")
+    assert app.view.cursor == 14
+    app.execute_command(":-4")
+    assert app.view.cursor == 10
+
+
+def test_colon_tgdb_commands_reach_gdb(app):
+    """The debugger `:` commands from commands[] (cgdbrc.cpp:120-140):
+    the -exec-* ones go as MI, the console-only ones (start/up/down/kill)
+    ride -interpreter-exec, exactly like tgdb routes them."""
+    import time
+    g = app._fake["gdb"]
+    for line in (":continue", ":c", ":n", ":nexti", ":s", ":stepi",
+                 ":finish", ":f", ":r", ":u"):
+        app.execute_command(line)
+    time.sleep(0.4)
+    cmds = " ".join(g.commands)
+    assert "-exec-continue" in cmds
+    assert "-exec-next" in cmds
+    assert "-exec-next-instruction" in cmds
+    assert "-exec-step" in cmds
+    assert "-exec-step-instruction" in cmds
+    assert "-exec-finish" in cmds
+    assert "-exec-run" in cmds
+    assert "-exec-until" in cmds
+
+
+def test_colon_console_only_tgdb_commands(app):
+    import time
+    g = app._fake["gdb"]
+    for line in (":start", ":up", ":down", ":kill", ":k"):
+        app.execute_command(line)
+    time.sleep(0.4)
+    cmds = " ".join(g.commands)
+    assert '-interpreter-exec console "start"' in cmds
+    assert '-interpreter-exec console "up"' in cmds
+    assert '-interpreter-exec console "down"' in cmds
+    assert '-interpreter-exec console "kill"' in cmds
+
+
+def test_colon_insert_and_focus(app):
+    """:insert focuses the GDB window; :focus takes cgdb or gdb
+    (command_focus_gdb / command_do_focus)."""
+    app.execute_command(":insert")
+    assert app.focus == FOCUS_GDB
+    app.execute_command(":focus cgdb")
+    assert app.focus == FOCUS_SOURCE
+    app.execute_command(":focus gdb")
+    assert app.focus == FOCUS_GDB
+    app.execute_command(":focus sideways")
+    assert "usage" in app.message
+
+
+def test_colon_edit_reloads_the_file(app, srcfile):
+    """:e re-reads the file (command_source_reload) and keeps the cursor."""
+    with open(srcfile, "a", encoding="utf-8") as f:
+        f.write("int appended_line(void) { return 1; }\n")
+    app.view.cursor = 5
+    app.execute_command(":e")
+    assert "appended_line" in "\n".join(
+        app.src.line(i) for i in range(len(app.src)))
+    assert app.view.cursor == 5
+
+
+def test_colon_accepted_stubs(app):
+    """:noh and :bang are accepted silently -- C stubs bang the same way,
+    and noh will matter once hlsearch rendering exists."""
+    app.message = "leftover"
+    app.execute_command(":noh")
+    app.execute_command(":bang")
+    assert app.message == "leftover"
+
+
+def test_syntax_command_forces_and_reports(app, srcfile):
+    """` :syntax <lang>` forces the lexer, bare `:syntax` reports
+    (command_parse_syntax); off / unknown map to plain / auto."""
+    app.execute_command(":syntax c")
+    assert app.src._forced_lexer == "c"
+    app.execute_command(":syntax")
+    assert "c" in app.message
+    app.execute_command(":syntax off")
+    assert app.src._forced_lexer == "off"
+    app.execute_command(":syntax unknown")
+    assert app.src._forced_lexer is None
+    app.execute_command(":syntax definitely-not-a-language")
+    assert "unknown language" in app.message
+
+
+def test_set_syntax_option_reaches_current_and_new_files(app, srcfile):
+    """:set syntax=<lang> re-lexes the file on screen and applies to files
+    opened afterwards (if_highlight_sviewer on both paths)."""
+    app.execute_command(":set syntax=c")
+    assert app.src._forced_lexer == "c"
+    app.open_file(srcfile)              # reopen: the option still applies
+    assert app.src._forced_lexer == "c"
+    app.execute_command(":set syntax=unknown")
+    assert app.src._forced_lexer is None
+
+
+def test_shell_command_degrades_to_a_message_when_headless(app):
+    """run_in_terminal needs a running event loop; headless (tests, or a
+    crashed UI) :sh reports instead of raising."""
+    app.execute_command(":sh")
+    assert "shell unavailable" in app.message
+
+
+# ---------------------------------------------------------------------------
+# file dialog (o)
+# ---------------------------------------------------------------------------
+def test_o_opens_the_file_dialog_with_gdb_list(app):
+    """`o` requests -file-list-exec-source-files and the dialog takes over
+    the screen (if_show_filedlg)."""
+    import time
+    g = app._fake["gdb"]
+    g.responses["-file-list-exec-source-files"] = {"files": [
+        {"file": "main.c", "fullname": "/src/main.c"},
+        {"file": "util.c", "fullname": "/src/util.c"},
+    ]}
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+    assert any(c.startswith("-file-list-exec-source")
+               for c in g.commands)
+    assert app.focus == FOCUS_FILEDLG
+    assert app._filedlg_active
+    assert app.root is app.filedlg_window
+    assert [f[0] for f in app.filedlg.files] == ["main.c", "util.c"]
+
+
+def test_file_dialog_navigation_and_open(app, srcfile):
+    import time
+    g = app._fake["gdb"]
+    g.responses["-file-list-exec-source-files"] = {"files": [
+        {"file": "alpha.c", "fullname": srcfile},
+        {"file": "beta.c", "fullname": "/nope/beta.c"},
+    ]}
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+
+    app.dispatch(ord("j"))
+    assert app.filedlg.sel == 1
+    app.dispatch(ord("k"))
+    assert app.filedlg.sel == 0
+    app.dispatch(ord("5"))
+    app.dispatch(ord("G"))
+    assert app.filedlg.sel == 1
+    app.dispatch(ord("g"))
+    app.dispatch(ord("g"))
+    assert app.filedlg.sel == 0
+
+    # Enter opens the selected file and closes the dialog
+    app.dispatch(kc.CTRL_M)
+    assert app.focus == FOCUS_SOURCE
+    assert not app._filedlg_active
+    assert app.src is not None
+    assert os.path.basename(app.src.path) == os.path.basename(srcfile)
+
+
+def test_file_dialog_q_and_esc_cancel(app):
+    import time
+    g = app._fake["gdb"]
+    g.responses["-file-list-exec-source-files"] = {"files": [
+        {"file": "a.c", "fullname": "/a.c"}]}
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+    app.dispatch(ord("q"))
+    assert app.focus == FOCUS_SOURCE
+    assert not app._filedlg_active
+
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+    app.dispatch(kc.ESC)                 # the cgdb mode key cancels too
+    assert app.focus == FOCUS_SOURCE
+    assert not app._filedlg_active
+
+
+def test_file_dialog_search(app):
+    import time
+    g = app._fake["gdb"]
+    g.responses["-file-list-exec-source-files"] = {"files": [
+        {"file": "one.c", "fullname": "/one.c"},
+        {"file": "two.c", "fullname": "/two.c"},
+        {"file": "three.c", "fullname": "/three.c"},
+    ]}
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+    app._search_target = "filedlg"
+    app.execute_command("/t")
+    assert app.filedlg.sel == 1          # "two.c"
+    app.dispatch(ord("n"))
+    assert app.filedlg.sel == 2          # "three.c"
+    app.dispatch(ord("N"))
+    assert app.filedlg.sel == 1
+
+
+def test_file_dialog_text_renders_list_and_fillers(app):
+    import time
+    g = app._fake["gdb"]
+    g.responses["-file-list-exec-source-files"] = {"files": [
+        {"file": "a.c", "fullname": "/a.c"}]}
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+    text = "".join(t for _, t in app._filedlg_text())
+    assert "Select a file or press q to cancel" in text
+    assert "a.c" in text
+    assert text.count("~") >= 5          # vim-style filler rows
+    app.dispatch(ord("q"))
+
+
+def test_o_without_gdb_running(app):
+    app.gdb = None
+    app.dispatch(ord("o"))
+    assert "not running" in app.message
+
+
+def test_map_command_abbreviations(app):
+    """im/iu/unm are the C abbreviations for the map commands."""
+    app.execute_command(":im a b")
+    assert "a" in app.imap_set
+    app.execute_command(":iu a")
+    assert "a" not in app.imap_set
+    app.execute_command(":unm a")
+
+
+def test_source_u_runs_until_cursor_line(app):
+    """'u' in the source window runs until the cursor line
+    (interface.cpp:1304-1311)."""
+    import time
+    g = app._fake["gdb"]
+    app.view.cursor = 6
+    before = len(g.commands)
+    app.dispatch(ord("u"))
+    time.sleep(0.4)
+    assert "-exec-until 7" in g.commands[before:]
+
+
+def test_digit_counts_in_source_window(app, srcfile):
+    """Digits accumulate as a line number for j/k/G
+    (G_line_number, interface.cpp:1312-1317)."""
+    app.view.cursor = 0
+    app.dispatch(ord("5"))
+    app.dispatch(ord("j"))
+    assert app.view.cursor == 5
+    app.dispatch(ord("j"))          # count cleared by the previous j
+    assert app.view.cursor == 6
+    app.dispatch(ord("1"))
+    app.dispatch(ord("2"))
+    app.dispatch(ord("G"))
+    assert app.view.cursor == 11
+    app.dispatch(ord("G"))          # plain G: last line
+    assert app.view.cursor == len(app.src) - 1
+
+
 @pytest.mark.skipif(os.name != "nt", reason="drive letters are a Windows thing")
 def test_split_file_line_survives_windows_drive_letters(tmp_path):
     """`:` is both the line separator and the drive separator.
@@ -794,6 +1055,94 @@ def test_search_without_a_source_file(app):
     assert "no source" in app.message
 
 
+def test_incremental_search_jumps_while_typing(app, srcfile):
+    """status_bar_regex_input jumps on every character; hooking the
+    command buffer's text_changed gives the same live behaviour."""
+    app.view.cursor = 0
+    app._search_target = "source"
+    app.cmd_buffer.text = "/line42"
+    assert app.view.cursor == app.src.lines.index("int line42 = 42;")
+    # a partial regex that cannot compile yet must not throw or jump
+    where = app.view.cursor
+    app.cmd_buffer.text = "/line4["
+    assert app.view.cursor == where
+
+
+def test_console_search_jump_and_repeat(app):
+    """`/` typed in the GDB window searches the console scrollback, and
+    n/N in scroll mode repeat it (scr_search_next)."""
+    app._fake["gdb"].emit_console("".join("hit %d\n" % i for i in range(30)))
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    assert app.scroll.active
+    app._search_target = "console"
+    app.execute_command("/hit 2")
+    assert app._console_search_row == 2      # first "hit 2" from the top
+    mx = app.console.max_delta(app._console_height())
+    assert 0 <= app.scroll.delta <= mx       # positioned, clamped
+    # n finds the next match ("hit 20"); N walks back up
+    app.dispatch(ord("n"))
+    assert app._console_search_row == 20
+    app.dispatch(ord("N"))
+    assert app._console_search_row == 2
+    assert app.scroll.active
+    app.execute_command("/zzz_absent")
+    assert "not found" in app.message
+
+
+def test_console_search_without_previous_pattern(app):
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    app._console_search = None
+    app.dispatch(ord("n"))
+    assert "no previous" in app.message
+
+
+def test_source_horizontal_scroll(app, srcfile):
+    """h/l scroll the source text columns (source_hscroll)."""
+    assert app.view.left == 0
+    app.dispatch(ord("l"))
+    app.dispatch(ord("l"))
+    assert app.view.left == 2
+    app.dispatch(ord("h"))
+    assert app.view.left == 1
+    for _ in range(10):
+        app.dispatch(ord("h"))
+    assert app.view.left == 0     # floors at zero
+
+
+def test_source_render_shifts_by_left(app, srcfile):
+    app.view.cursor = 0
+    app.view.left = 4
+    frags = app._source_text()
+    first = "".join(t for _, t in frags).split("\n")[0]
+    # the gutter is intact; the text body lost its first 4 columns
+    assert "lude <stdio.h>" in first
+    assert "#include" not in first
+    app.view.left = 0
+
+
+def test_console_scroll_horizontal(app):
+    """Scroll-mode h/l/0/$ pan the console (scr_left / scr_right)."""
+    app._fake["gdb"].emit_console("".join("x%d\n" % i for i in range(40)))
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    assert app.scroll.active
+    app.dispatch(ord("l"))
+    app.dispatch(ord("l"))
+    assert app.console_left == 2
+    app.dispatch(ord("h"))
+    assert app.console_left == 1
+    app.dispatch(ord("0"))
+    assert app.console_left == 0
+    app.dispatch(ord("$"))
+    assert app.console_left >= 0
+    # leaving scroll mode resets the pan
+    app.dispatch(ord("q"))
+    assert not app.scroll.active
+    assert app.console_left == 0
+
+
 # ---------------------------------------------------------------------------
 # gdb console scroll mode
 # ---------------------------------------------------------------------------
@@ -813,10 +1162,32 @@ def test_scroll_mode_navigation(app):
     assert app.scroll.delta == d0 + 1
     app.dispatch(kc.DOWN)
     assert app.scroll.delta == d0
+    # a lone 'g' is a prefix in the GDB window (gdb_input's gg); only the
+    # pair jumps home, and it must not move on the first press
+    app.dispatch(ord("g"))
+    assert app.scroll.delta == d0
     app.dispatch(ord("g"))
     assert app.scroll.delta == app.console.max_delta(app._console_height())
     app.dispatch(ord("G"))
     assert app.scroll.delta == 0
+
+
+def test_scroll_mode_half_pages_and_enter_leaves(app):
+    """gdb_input scroll mode: Ctrl-U/Ctrl-D move half a page, and Enter
+    leaves scroll mode parked at the bottom (interface.cpp:908-932, 966)."""
+    app._fake["gdb"].emit_console("".join("L%d\n" % i for i in range(60)))
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    assert app.scroll.active
+    d0 = app.scroll.delta
+    h = app._console_height()
+    app.dispatch(kc.CTRL_U)
+    assert app.scroll.delta == d0 + max(1, h // 2)
+    app.dispatch(kc.CTRL_D)
+    assert app.scroll.delta == d0
+    app.dispatch(kc.CTRL_M)          # Enter
+    assert not app.scroll.active
+    assert app.scroll.delta == 0     # parked at the bottom
 
 
 def test_esc_leaves_scroll_mode(app):
@@ -1002,23 +1373,123 @@ def test_command_line_occupies_the_status_row(app):
 
 
 # ---------------------------------------------------------------------------
-# window splitting
+# window splitting (interface.cpp:560-752, 1498-1509; DummyOutput is 80x40)
 # ---------------------------------------------------------------------------
-def test_plus_and_minus_adjust_the_split(app):
-    h0 = app.source_window.height
-    app.source_window.height = 10
-    app.dispatch(ord("+"))
-    assert app.source_window.height == 11
+def _dim(value):
+    """Resolve a possibly-callable pane dimension to its Dimension."""
+    from prompt_toolkit.layout.dimension import to_dimension
+    return to_dimension(value)
+
+
+def test_eq_and_minus_adjust_the_split(app):
+    """`=` / `-` move the split one row at a time (interface.cpp:1263-1281).
+
+    In C this is increase/decrease_win_height(0): window_shift by one and
+    the quarter mark is forgotten (WIN_SPLIT_FREE).
+    """
+    assert _dim(app.source_window.height).preferred == 20
+    app.dispatch(ord("="))
+    assert _dim(app.source_window.height).preferred == 21
     app.dispatch(ord("-"))
-    assert app.source_window.height == 10
-    app.source_window.height = h0 if isinstance(h0, int) else 10
+    assert _dim(app.source_window.height).preferred == 20
+    assert app.win_split is None
+
+
+def test_plus_and_underscore_jump_quarter_marks(app):
+    """`+` / `_` jump between quarter marks (interface.cpp:672-752).
+
+    Half of a 40-row terminal is 20, so src_big (mark 1) puts the source
+    pane at 20 + 20/2 = 30 rows.
+    """
+    app.dispatch(ord("+"))
+    assert app.win_split == 1
+    assert _dim(app.source_window.height).preferred == 30
+    app.dispatch(ord("_"))
+    assert app.win_split == 0
+    assert _dim(app.source_window.height).preferred == 20
 
 
 def test_split_respects_winminheight(app):
+    """winminheight stops `-` from starving the source pane
+    (validate_window_sizes, interface.cpp:560-590)."""
     app.config.set("winminheight", 5)
-    app.source_window.height = 5
-    app.dispatch(ord("-"))
-    assert app.source_window.height == 5
+    for _ in range(40):
+        app.dispatch(ord("-"))
+    # min shift is -(40/2) + 5, so the source pane bottoms out at 5 rows
+    assert _dim(app.source_window.height).preferred == 5
+
+
+def test_ctrl_w_toggles_orientation(app):
+    """Ctrl-W swaps horizontal/vertical split (interface.cpp:1498-1509)."""
+    from prompt_toolkit.layout.containers import VSplit
+
+    app.dispatch(kc.CTRL_W)
+    assert app.split_orientation == WSO_VERTICAL
+    assert isinstance(app.root, VSplit)
+    kids = app.root.children
+    # left column: source above the status row (interface.cpp:17-31);
+    # the `:` command line replaces that same status row
+    left = [c.content if isinstance(c, ConditionalContainer) else c
+            for c in kids[0].children]
+    assert left == [app.source_window, app.status_window,
+                    app.cmdline_window]
+    assert kids[1] is app.vsep_window
+    assert list(kids[2].children) == [app.console_window, app.edit_window]
+
+    app.dispatch(kc.CTRL_W)
+    assert app.split_orientation == WSO_HORIZONTAL
+    assert not isinstance(app.root, VSplit)
+    assert _dim(app.source_window.height).preferred == 20
+
+
+def test_vertical_split_geometry(app):
+    """Vertical geometry per get_* (interface.cpp:227-360): the left column
+    is half the width, the separator is one column, and `=` now widens the
+    left column instead of the source height."""
+    app.dispatch(kc.CTRL_W)
+    assert _dim(app.left_col.width).preferred == 40
+    assert _dim(app.vsep_window.width).preferred == 1
+    app.dispatch(ord("="))
+    assert _dim(app.left_col.width).preferred == 41
+    assert app._gdb_width() == 80 - 41 - 1
+
+
+def test_vertical_split_respects_winminwidth(app):
+    app.dispatch(kc.CTRL_W)
+    app.config.set("winminwidth", 5)
+    for _ in range(60):
+        app.dispatch(ord("-"))
+    # min shift is -(80/2) + 5, so the left column bottoms out at 5 cols
+    assert _dim(app.left_col.width).preferred == 5
+
+
+def test_winsplitorientation_option_switches_layout(app):
+    """`:set winsplitorientation` (abbrev wso) is the rc-file route to the
+    same layout change Ctrl-W makes (command_set_winsplitorientation)."""
+    app.execute_command(":set wso=vertical")
+    assert app.split_orientation == WSO_VERTICAL
+    app.execute_command(":set winsplitorientation=horizontal")
+    assert app.split_orientation == WSO_HORIZONTAL
+
+
+def test_winsplit_option_sets_the_quarter_mark(app):
+    app.execute_command(":set winsplit=src_big")
+    assert app.win_split == 1
+    assert _dim(app.source_window.height).preferred == 30
+
+
+def test_split_geometry_follows_terminal_resize(app):
+    """Pane sizes are callables over the live terminal size, so a resize
+    re-derives them on the next layout pass -- the equivalent of
+    if_resize_term -> if_layout in C."""
+    from prompt_toolkit.data_structures import Size
+
+    assert _dim(app.source_window.height).preferred == 20
+    app.app.output.get_size = lambda: Size(rows=50, columns=120)
+    assert _dim(app.source_window.height).preferred == 25
+    app.dispatch(kc.CTRL_W)
+    assert _dim(app.left_col.width).preferred == 60
+    assert app._gdb_width() == 120 - 60 - 1
 
 
 # ---------------------------------------------------------------------------
