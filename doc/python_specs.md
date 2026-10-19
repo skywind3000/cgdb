@@ -884,40 +884,50 @@ C 版 `sources.cpp` 管理多个 buffer 并可切换。本版 `self.src` 是单�
 并处理与 ptk 默认鼠标绑定（焦点切换、Buffer 光标定位）的冲突。
 **优先级低**：C 版也没有。
 
-### 8.8 横向滚动与控制台内搜索（2026-10 审计，同日补齐）
+### 8.8 横向滚动与控制台内搜索（2026-10 两轮审计，同日补齐并纠偏）
 
-逐键对照 C 版后确认的缺口及落实情况：
+第一轮逐键对照后补齐、第二轮全量审计（§8.10）后**纠正语义**的清单：
 
 - ✅ **源码窗 `h`/`l`**（`source_hscroll`）：`SourceView.left` +
-  `_source_text` 的逐 token 列偏移（gutter 不动，只滚正文）。
-- ✅ **GDB 窗滚动模式的 `h`/`l`/`0`/`$`**：`app.console_left`，
-  `_console_text` 按列切片，退出滚动模式即复位。
+  `_source_text` 的逐 token 列偏移（gutter 不动，只滚正文）；
+  右向钳制到最长行（`sources.cpp:1091-1110` 的
+  `max_width - width + lwidth + 6`），最短行文件滚不动。
+- ✅ **GDB 窗滚动模式的 `h`/`l`/`0`/`$`**：**移动滚动光标列**
+  （`scr_left/scr_right`，`scroller.cpp:254-284`），窗口不横向平移
+  ——vterm 是折行不是横滚。第一轮实现的「整窗平移」是对
+  `interface.cpp:955-962` 的误读，已纠正。
 - ✅ **GDB 窗滚动模式的 `n`/`N`/`/`/`?`**：`ConsoleModel.search`
-  （正反向、无回绕）+ `_goto_console_row` 把命中行定到可视区顶部。
-  C 用 gdb_input_regex_input 在滚筒内逐字符捕获，这里复用状态栏
-  命令行（与源码 `/` 同构）。
+  从**滚动光标位置**起扫（同行第二个匹配可达）、按 `wrapscan`
+  回绕、`?` 之后 n/N 记忆方向（`regex_direction_last`）；
+  命中行放到光标行上。
 - ✅ **`/` 输入时的递进跳转**：`cmd_buffer.on_text_changed` 钩子，
-  每敲一个字符就 `search_in`（部分正则编译失败时原地不动）。
+  每敲一个字符就搜（部分正则编译失败时原地不动）——源码窗、
+  console、filedlg 三处都有（C 侧分别是 `status_bar_regex_input` /
+  `gdb_input_regex_input` / `filedlg_capture_regex`）。
 - ✅ **`:shell`/`:sh`**：`run_in_terminal(spawn)` —— ptk 的
   `in_terminal` 会 `input.detach()` + `cooked_mode()`，让子 shell
   独占控制台再整屏重绘；仅事件循环运行时可用（头部报错降级为
   状态栏消息）。⚠️ `run_in_terminal(func)` 返回 Future、**不是**
-  上下文管理器，用错只得到一条 TypeError。
+  上下文管理器，用错只得到一条 TypeError。子 shell 退出后按
+  C 的 `run_shell_command` 等 "Hit ENTER to continue..."。
 - ✅ **`:syntax` / `:set syntax=<lang>`**：`SourceFile.force_lexer`
-  （Pygments 别名；`off`→TextLexer、空/`unknown`→自动探测），
+  （Pygments 别名；`off`/`no`→TextLexer、空/`unknown`/`on`/`yes`
+  →自动探测——后两者是「开高亮」不是语言名，`cgdbrc.cpp:669-672`），
   对当前文件重 lex、之后打开的文件也生效。
 - ✅ **`o` 文件对话框**：见 §8.4。
 - ❌ 仍缺：**`:logo`**（整屏 logo，纯装饰）、**`:highlight`**
-  （约 50 个配色组的运行时覆盖体系）、**hlsearch 持久高亮**
-  （递进跳转已有，见 §8.2）、**多源码缓冲**（§8.6）、反汇编
-  （§8.5）、鼠标（§8.7）。
+  （约 50 个配色组的运行时覆盖体系）、**hlsearch 持久高亮与
+  INCSEARCH 反色高亮**（递进跳转已有，见 §8.2）、**多源码缓冲**
+  （§8.6）、反汇编（§8.5）、鼠标（§8.7）、**GDB 窗 Ctrl-R 增量
+  历史搜索**（ptk 需要 SearchBufferControl 布局接入）、
+  **gdb `set prompt` 不跟随**（`(gdb) ` 硬编码）。
 
-其余键位/命令已逐项对齐（§5 表）。
-
-### 8.8 inferior 全屏程序
+### 8.8b inferior 全屏程序
 
 需要终端模拟器（`pyte`）+ ConPTY，等于把 C 版故意绕开的 `libvterm` 请回来。
 **建议不做**，与 C 版 Windows 移植保持同样的限制（`win_specs.md` §11.7）。
+inferior 的输出按哑终端模型摄入（CSI/OSC 转义序列会被消费掉，颜色不渲染
+但不会显示 `[31m` 残渣；宽字符按 2 列折行）。
 
 ### 8.9 `:map` 在 GDB 窗生效（imap）
 
@@ -929,6 +939,97 @@ C 版 `sources.cpp` 管理多个 buffer 并可切换。本版 `self.src` 是单�
 （那就丢掉了 §3.9 说的"免费行编辑器"），要么只在 Buffer 的
 `accept_handler` 之前对整行做映射替换。**建议后者**，但语义与 C 版的逐键 imap
 不完全等价，要在文档里写清。
+
+已对齐的部分：映射集随焦点切换（source→`map_set`、GDB→`imap_set`、
+filedlg/命令行→清空，`cgdb.cpp:427-432`），`normal :map` 不再泄漏进文件
+对话框。
+
+### 8.10 第二轮全量审计的对齐（2026-10-19，本次提交）
+
+对 C 原版逐行审计（8 个模块、~60 条差异）后落地的对齐，按域分组；
+完整审计报告存 `.tmp/audit/REPORT.md`（临时件，结论已并入本节）：
+
+**源码窗显示层**（`sources.cpp:760-1058` 重刻）
+- 视口每帧由光标推导：`sel_line - height/2` 居中，短文件整块居中；
+  顶部派生行存回 `view.top` 供测试。
+- gutter = `log10+1` 位行号 + 竖线列 + 标记列；竖线列有焦点时加粗
+  （焦点指示之一）。
+- 断点没有专用字符——**行号染色**：红=enabled、黄=disabled，
+  优先于执行行（绿）/选中行（白）行号色；同表末条胜出（C 的覆盖序）。
+- 执行行默认 `longarrow`：竖线列换 `├`，`─` 伸到首个非空白列再 `>`；
+  选中行默认 `block`（缩进处反色块）；`highlight` 样式整行上色。
+  `executinglinedisplay`/`selectedlinedisplay`/`arrowstyle`（弃用别名，
+  不接受 `block`）全部接线。
+- 文件尾 `~` 行；mark 画在竖线列（HLG_MARK，白粗）。
+- 源码窗有焦点时终端光标显示在选中行行尾（ptk `get_cursor_position`，
+  光标格由渲染时写入的尾随空格提供——ptk 只能把光标放到已写入的格上）。
+
+**配置系统**
+- `set no<opt>` 剥前缀清布尔（仅布尔，`set notabstop` 报错）；
+  `set opt` 无值：布尔置 1，int/string 汇报当前值（C 报错；
+  `:set ts` 决不能把 tabstop 设成 1）。
+- 选项名大小写敏感（C 是 strcmp/bsearch），值大小写不敏感（strcasecmp）。
+- **rc 文件是完整命令语言**（`command_parse_file`）：注释可出现在行中、
+  `\` 续行、行首 `:` 可选；`set` 行在首帧前生效，其余命令在 gdb
+  启动后经 `_do_colon` 重放（`run_rc_commands`），错误逐行报告进
+  console（`Error parsing line N: ...`）且不中断。
+
+**GDB 窗与按键**
+- ESC 非急切（eager）：等 `app.timeoutlen`（=ttimeoutlen，ttimeout/
+  timeout 开关接线，双双关闭则 None=永不 flush），使
+  `ESC+b/f/d/Backspace` = Alt 词操作（ptk 的 `escape,b` 序列绑定，
+  app 级优先）成立；孤立 ESC 才是 cgdbmodekey。
+- F1/F5/F6/F7/F8/F10/Ctrl-L 只在源码窗焦点生效（C 在 `cgdb_input`）；
+  GDB 焦点下吞掉（C 发给 gdb，MI 通道不能塞原始转义序列）。
+- F5 恒 `-exec-run`（inferior 运行中先 interrupt 再 run，C 语义=重启）。
+- 冒号行退格删掉 `:` 前缀即取消（C 空行退格=退出状态栏）；删前缀后
+  输入的内容绝不会当 gdb 命令发出。
+- `/`+回车空模式重放上次搜索；ESC 取消恢复光标/滚动位置
+  （`orig_line_regex` / `scr_disable_search(false)`）；`?` 后 n/N 方向记忆。
+- gdb 空闲时 ^C 清空本地编辑行（readline 的 ^C 语义）；
+  空行 Ctrl-D 发 `-gdb-exit`；冒号命令名大小写敏感、
+  `:q!`/`:h` 不再是命令（C 词法如此），`Unknown command:` 报整行。
+- cgdbmodekey 接受单字符与 `<X>` 记法；Tab/Ctrl-G 设为模式键时
+  条件绑定接管。
+- inferior 运行期间按键逐字节直通 tty（`tgdb_send_char` 语义），
+  回显不带 `(gdb) ` 前缀。
+
+**协议联动**
+- `=thread-selected` 与 `*stopped` 同路：解析 frame → 跳源码位置。
+- `u` 恒发 `until "file":line`（tgdb 传显示文件路径）；
+  `gdb_up/down` 改走 console（MI 没有 `-exec-up`）。
+- 断点行匹配先比 gdb 拼写再比 abspath（fullname 缺失的相对 `file`
+  也能对上）；重开当前文件保视口（`:e` 只在 mtime 变了才重读，
+  filedlg 回车不重置）；`autosourcereload` 接线（每次停止时重读）。
+- inferior tty resize 跟随 GDB 窗（POSIX pty 路径）。
+
+**console**
+- 滚动模式 j/k：光标先走、窗口后滚（`scr_up/down`），滚动光标可见
+  （console 窗口成为 GDB 焦点下的焦点控件）；`[d/max]` 叠加在
+  第 0 行右缘。
+- 内容不足一屏顶对齐（vterm 从 0 行写起）；ESC 离开 GDB 窗保留
+  滚动状态（C 保留，之前是有意偏离——滚动光标可见后按 C 对齐）。
+- 非滚动模式 PageDown 不再进滚动模式（C 发给 gdb）。
+- 转义序列消费、CJK 按显示列折行；`:set scrollbackbuffersize`
+  运行期只存不裁（C 只在创建时读）。
+
+**filedlg**
+- 过滤磁盘上不存在的文件、C 式三桶排序（`.`相对、普通、绝对，
+  组内 strcmp）、去重；显示 gdb 原始拼写。
+- 搜索：硬编码忽略大小写、回绕、方向记忆、逐字符递进；
+- 布局：label + `H-2` 列表行 + 底部状态行（对话框消息住那里）；
+  选中行=行号加粗 + `->` 箭头。
+
+**状态栏**（`update_status_win` 重刻）
+- 内容=当前文件完整路径；消息**替换**整行到下一键为止；
+  超宽 `>`+尾截断。C 源码里 GDB 焦点的 `*` 是死代码
+  （被 if_display_message 重画抹掉；官方 cgdb 实测无 `*`），
+  Python 版同样没有。焦点可观察信号=终端光标位置
+  （源码窗选中行 / GDB 编辑行 / 命令行）。
+
+**CLI**
+- `-v`/`-h` 短选项；无控制台（mintty/管道）启动给出一条干净错误
+  而非 ptk 裸 traceback。
 
 ---
 
