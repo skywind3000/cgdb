@@ -94,13 +94,45 @@ def target():
     shutil.rmtree(d, ignore_errors=True)
 
 
+BUSY_SRC = """#include <stdio.h>
+
+int main(void) {
+    volatile long n = 0;
+    for (;;) {
+        n++;
+    }
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def busy():
+    """An inferior that never exits, for the ^C interrupt test."""
+    if CC is None:
+        pytest.skip("no C compiler")
+    d = tempfile.mkdtemp(prefix="cgdbpy-e2e-busy-")
+    src = os.path.join(d, "busy.c")
+    exe = os.path.join(d, "busy.exe")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(BUSY_SRC)
+    r = subprocess.run([CC, "-g", "-O0", src, "-o", exe],
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        shutil.rmtree(d, ignore_errors=True)
+        pytest.skip("could not compile busy: %s" % r.stderr[:300])
+    yield {"dir": d, "src": src, "exe": exe}
+    shutil.rmtree(d, ignore_errors=True)
+
+
 class Cgdb:
     """One cgdb.py session in a ConPTY."""
 
-    def __init__(self, target, extra=(), env=None):
+    def __init__(self, target, extra=(), env=None, rows=ROWS, cols=COLS):
         self.target = target
         self.extra = list(extra)
         self.env = env
+        self.rows, self.cols = rows, cols
         self.session = None
 
     def argv(self):
@@ -108,7 +140,8 @@ class Cgdb:
                 "--"] + self.extra + [self.target["exe"]]
 
     def __enter__(self):
-        self.session = ConPtySession(self.argv(), rows=ROWS, cols=COLS,
+        self.session = ConPtySession(self.argv(), rows=self.rows,
+                                     cols=self.cols,
                                      cwd=ROOT, env=self.env).__enter__()
         return self
 
@@ -164,9 +197,10 @@ class Cgdb:
         (interface.cpp:459-472), so a test that cares *where* the user is
         typing needs the index, not just the text.
         """
+        name = os.path.basename(self.target["src"])
         for i in range(self.screen.rows):
             line = self.screen.line(i)
-            if "target.c" in line and ("CGDB" in line or "GDB" in line):
+            if name in line and ("CGDB" in line or "GDB" in line):
                 return i
         return None
 
@@ -594,6 +628,261 @@ def test_command_line_lives_on_the_status_row(target):
         assert not line.lstrip().startswith(":"), \
             "command text survived on the status bar: %r" % line
         assert "target.c" in line, repr(line)
+
+
+@needs_gdb
+def test_ctrl_w_switches_to_vertical_split(target):
+    """Ctrl-W (source focus) swaps the split to vertical.
+
+    interface.cpp:17-31: source left, a one-column '|' separator, gdb right,
+    and the status bar becomes the bottom row of the LEFT column. The `:`
+    command line replaces that same row, so it moves with it.
+    """
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+        c.to_source()
+        mid = c.screen.cols // 2          # left column is half the width
+
+        c.send("\x17")                    # Ctrl-W
+        c.settle(1.2)
+        bars = sum(1 for r in range(c.screen.rows)
+                   if c.screen.grid[r][mid] == "|")
+        assert bars >= c.screen.rows - 4, \
+            "no full-height separator column at %d:\n%s" % (mid, c.text())
+        # source pane is truncated at the separator, gdb pane keeps its edit
+        assert "int compute" in c.text()
+        bottom = c.screen.rows - 1
+        assert "CGDB" in c.screen.line(bottom), c.screen.line(bottom)
+        assert "(gdb)" in c.screen.line(bottom)[mid:], \
+            c.screen.line(bottom)
+
+        # the : command line replaces the status row, now bottom-left
+        c.send(":")
+        c.settle(0.6)
+        line = c.screen.line(bottom)
+        assert line.lstrip().startswith(":"), repr(line)
+        assert "(gdb)" in line[mid:], repr(line)
+
+        c.key("esc")
+        c.settle(0.5)
+        # `=` widens the left column by one; the separator moves with it
+        c.send("=")
+        c.settle(1.0)
+        moved = sum(1 for r in range(c.screen.rows)
+                    if c.screen.grid[r][mid + 1] == "|")
+        assert moved >= c.screen.rows - 4, \
+            "separator did not follow `=:\n%s" % c.text()
+
+        # back to horizontal: separator gone, status bar back in the middle
+        c.send("\x17")
+        c.settle(1.2)
+        bars = sum(1 for r in range(c.screen.rows)
+                   if c.screen.grid[r][mid] == "|" or
+                   c.screen.grid[r][mid + 1] == "|")
+        assert bars < 5, c.text()
+        assert c.status_row() is not None, c.text()
+        assert "target.c" in c.status_line()
+
+
+@needs_gdb
+def test_terminal_resize_keeps_session_and_layout(target):
+    """Resize the terminal mid-session, as the C win32 suite does
+    (cases_windows: grow to 50x130, shrink back).
+
+    The pane geometry is derived from the live terminal size, so the
+    session must redraw and still accept commands after each resize.
+    """
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+
+        c.session.resize(50, 130)
+        assert c.wait("int compute", timeout=15), c.text()
+        c.to_gdb()
+        c.type_cmd("echo after-grow\\n")
+        assert c.wait("after-grow", timeout=15), c.text()
+
+        c.session.resize(24, 80)
+        assert c.wait("int compute", timeout=15), c.text()
+        c.to_gdb()
+        c.type_cmd("echo after-shrink\\n")
+        assert c.wait("after-shrink", timeout=15), c.text()
+        assert not c.exited(), "session died on resize:\n%s" % c.text()
+
+
+@needs_gdb
+def test_vertical_split_follows_resize(target):
+    """The vertical separator is placed from the live width: after a
+    resize it must move to the new half, and the session must survive."""
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+        c.to_source()
+        c.send("\x17")                    # Ctrl-W
+        c.settle(1.2)
+        mid = c.screen.cols // 2
+        bars = sum(1 for r in range(c.screen.rows)
+                   if c.screen.grid[r][mid] == "|")
+        assert bars >= c.screen.rows - 4, c.text()
+
+        c.session.resize(30, 60)
+        mid2 = 60 // 2
+        bars = sum(1 for r in range(c.screen.rows)
+                   if c.screen.grid[r][mid2] == "|")
+        assert bars >= c.screen.rows - 4, \
+            "separator did not follow the resize:\n%s" % c.text()
+        c.to_gdb()
+        c.type_cmd("echo resized\\n")
+        assert c.wait("resized", timeout=15), c.text()
+
+
+# ---------------------------------------------------------------------------
+# the `o` file dialog
+# ---------------------------------------------------------------------------
+@needs_gdb
+def test_o_file_dialog_browses_and_opens(target):
+    """`o` lists gdb's source files full-screen, /-search narrows to the
+    target, Enter opens it back into the source pane."""
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+        c.to_source()
+        c.send("o")
+        assert c.wait("Select a file or press q to cancel", timeout=15), \
+            c.text()
+        # gdb's list includes the CRT headers too; search for ours
+        c.send("/")
+        c.settle(0.3)
+        c.send("target.c")
+        c.settle(0.3)
+        c.key("enter")
+        c.settle(0.5)
+        assert c.wait("target.c", timeout=10), c.text()
+        c.key("enter")             # open the selection
+        c.settle(1.2)
+        assert "Select a file" not in c.text(), c.text()
+        assert c.wait("int compute", timeout=15), c.text()
+
+
+@needs_gdb
+def test_o_file_dialog_esc_cancels(target):
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+        c.to_source()
+        c.send("o")
+        assert c.wait("Select a file or press q to cancel", timeout=15)
+        c.key("esc")
+        c.settle(1.0)
+        assert "Select a file" not in c.text(), c.text()
+        assert c.wait("int compute", timeout=15), c.text()   # pane intact
+
+
+# ---------------------------------------------------------------------------
+# file variants and robustness, ported from the C win32 matrix
+# ---------------------------------------------------------------------------
+@needs_gdb
+def test_crlf_source_file_displays(target, tmp_path):
+    src = tmp_path / "crlf.c"
+    src.write_bytes(b"int crlf_fn(void) {\r\n    return 7;\r\n}\r\n")
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("(gdb)", timeout=30)
+        c.settle(0.5)
+        c.to_source()
+        c.send(":open " + str(src).replace("\\", "/"))
+        c.settle(0.4)
+        c.key("enter")
+        assert c.wait("crlf_fn", timeout=15), c.text()
+        assert c.session.parse_errors == []
+
+
+@needs_gdb
+def test_cjk_source_file_displays(target, tmp_path):
+    src = tmp_path / "cjk.c"
+    src.write_text("int cjk_fn(void) { return 1; }  /* 中文注释 */\n",
+                   encoding="utf-8")
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("(gdb)", timeout=30)
+        c.settle(0.5)
+        c.to_source()
+        c.send(":open " + str(src).replace("\\", "/"))
+        c.settle(0.4)
+        c.key("enter")
+        assert c.wait("中文注释", timeout=15), c.text()
+        assert c.session.parse_errors == []
+
+
+@needs_gdb
+def test_ctrl_c_interrupts_the_inferior(busy):
+    """run + ^C: gdb takes the break, the prompt answers again."""
+    with Cgdb(busy, ["-q"]) as c:
+        assert c.wait("(gdb)", timeout=30)
+        c.settle(0.5)
+        c.to_gdb()
+        c.type_cmd("run")
+        c.settle(1.0)
+        c.key("ctrl-c")
+        assert c.wait("stopped", timeout=15), c.text()
+        c.settle(0.5)
+        c.type_cmd("echo after-cc\\n")
+        assert c.wait("after-cc", timeout=15), c.text()
+
+
+@needs_gdb
+def test_tiny_terminal_sizes_stay_alive(target):
+    """12x40 and 6x20, the C matrix's floor sizes.
+
+    `echo` with no trailing newline: the console pane may be a single row
+    at these sizes, and anything that scrolls (the echoed command line, a
+    trailing blank line) scrolls the assertion needle right off it.
+    """
+    for rows, cols in ((12, 40), (6, 20)):
+        with Cgdb(target, ["-q"], rows=rows, cols=cols) as c:
+            assert c.wait("(gdb)", timeout=30), (rows, cols)
+            c.settle(0.8)
+            c.to_gdb()
+            c.type_cmd("echo tiny%d" % rows)
+            assert c.wait("tiny%d" % rows, timeout=15), (rows, cols, c.text())
+
+
+@needs_gdb
+def test_rapid_key_bursts_keep_session_alive(target):
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+        c.to_source()
+        c.send("jjjjkkkkGgg")
+        c.key("esc")
+        c.settle(0.4)
+        c.send("i")
+        c.settle(0.3)
+        c.type_cmd("echo burst-ok\\n")
+        assert c.wait("burst-ok", timeout=15), c.text()
+
+
+@needs_gdb
+def test_shell_command_round_trip(target):
+    """:sh suspends the UI, runs the shell, and restores the session."""
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("(gdb)", timeout=30)
+        c.settle(0.5)
+        c.to_source()
+        c.send(":sh")
+        c.settle(0.3)
+        c.key("enter")
+        # the subshell takes over the console; wait for cmd's banner, not
+        # a bare '>' (that matches cgdb's own screen before cmd starts)
+        assert c.wait("Microsoft", timeout=20), c.text()
+        c.settle(1.0)
+        c.send("echo from-shell\r")
+        assert c.wait("from-shell", timeout=15), c.text()
+        c.send("exit\r")
+        c.settle(2.0)
+        assert c.wait("(gdb)", timeout=15), c.text()
+        c.to_gdb()
+        c.type_cmd("echo back-in-cgdb\\n")
+        assert c.wait("back-in-cgdb", timeout=15), c.text()
 
 
 @needs_gdb

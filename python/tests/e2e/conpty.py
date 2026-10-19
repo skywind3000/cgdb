@@ -55,6 +55,8 @@ k32.CreatePseudoConsole.argtypes = [COORD, wintypes.HANDLE, wintypes.HANDLE,
                                     wintypes.DWORD,
                                     ctypes.POINTER(wintypes.HANDLE)]
 k32.CreatePseudoConsole.restype = ctypes.HRESULT
+k32.ResizePseudoConsole.argtypes = [wintypes.HANDLE, COORD]
+k32.ResizePseudoConsole.restype = ctypes.HRESULT
 
 
 class VTScreen:
@@ -305,6 +307,23 @@ class ConPtySession:
                     self.screen.feed(chunk)
                 except Exception as e:      # a parser bug must not blank the
                     self.parse_errors.append(repr(e))   # screen silently
+
+    def resize(self, rows, cols, settle=1.5):
+        """Resize the pseudoconsole, as a user dragging the window would.
+
+        The VT screen is reset to the new size because prompt_toolkit's
+        renderer erases and repaints the whole screen on a size change;
+        the repaint stream fills the fresh grid. `settle` must cover the
+        application's 0.5s size poll (Application._poll_output_size) plus
+        one repaint.
+        """
+        hr = k32.ResizePseudoConsole(self.hPC, COORD(cols, rows))
+        assert hr == 0, "ResizePseudoConsole failed: %#x" % hr
+        with self._lock:
+            self.screen.rows, self.screen.cols = rows, cols
+            self.screen.reset()
+        self.rows, self.cols = rows, cols
+        time.sleep(settle)
 
     def send(self, text):
         data = text.encode("utf-8") if isinstance(text, str) else text
