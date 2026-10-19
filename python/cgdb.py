@@ -169,21 +169,39 @@ def _executable_exists(path):
     return False
 
 
+def _cgdb_home_dir():
+    """cgdb's home directory (init_home_dir, cgdb.cpp:353).
+
+    $CGDB_DIR wins; otherwise ~/.cgdb, where ~ resolves through HOME,
+    USERPROFILE and APPDATA on Windows -- the same order the C version
+    uses, so both builds share one config and log directory.
+    """
+    env = os.environ.get("CGDB_DIR")
+    if env:
+        return env
+    if os.name == "nt":
+        home = (os.environ.get("HOME") or os.environ.get("USERPROFILE")
+                or os.environ.get("APPDATA") or ".")
+    else:
+        home = os.environ.get("HOME") or "."
+    return os.path.join(home, ".cgdb")
+
+
 def _load_rc(config):
-    """Load ~/.cgdbrc then ./.cgdbrc, mirroring cgdb's rc lookup."""
-    candidates = []
-    home = os.path.expanduser("~")
-    if home:
-        candidates.append(os.path.join(home, ".cgdbrc"))
-    candidates.append(os.path.join(os.getcwd(), ".cgdbrc"))
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                errors = config.load_file(path)
-            except OSError:
-                continue
-            for e in errors:
-                sys.stderr.write("cgdb: %s\n" % e)
+    """Load <cgdb home>/cgdbrc, mirroring parse_cgdbrc_file (cgdb.cpp:244).
+
+    That single file is all the C version reads -- not ~/.cgdbrc, and
+    not a per-project rc in the current directory.
+    """
+    path = os.path.join(_cgdb_home_dir(), "cgdbrc")
+    if not os.path.exists(path):
+        return
+    try:
+        errors = config.load_file(path)
+    except OSError:
+        return
+    for e in errors:
+        sys.stderr.write("cgdb: %s\n" % e)
 
 
 def _wait_for_debugger():

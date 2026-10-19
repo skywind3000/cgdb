@@ -105,7 +105,8 @@ prompt_toolkit 的 Buffer 提供，不需要自己实现。
 
 配置项名称、缩写、类型和默认值全部照抄 `cgdb/cgdbrc.cpp`，
 `tests/test_cgdbrc.py` 会**直接从 C 源码里正则抓出选项表来比对**，防止漂移。
-也读 `~/.cgdbrc` 和 `./.cgdbrc`。
+也读 `~/.cgdb/cgdbrc`（与 C 版同一位置，`$CGDB_DIR` 可改；Windows 下
+HOME → USERPROFILE → APPDATA 依次解析）。
 
 ## 架构
 

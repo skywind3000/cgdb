@@ -144,3 +144,40 @@ def test_no_arguments_at_all():
     opts = cgdb.parse_args([])
     assert opts["gdb_args"] == []
     assert opts["gdb"] is None
+
+
+# ---------------------------------------------------------------------------
+# the rc file: <cgdb home>/cgdbrc, like parse_cgdbrc_file (cgdb.cpp:244)
+# ---------------------------------------------------------------------------
+def test_rc_is_read_from_the_cgdb_home_dir(tmp_path, monkeypatch):
+    home = tmp_path / ".cgdb"
+    home.mkdir()
+    (home / "cgdbrc").write_text("set wso=vertical\n", encoding="utf-8")
+    monkeypatch.setenv("CGDB_DIR", str(home))
+    from cgdbpy.cgdbrc import Config
+    config = Config()
+    cgdb._load_rc(config)
+    assert config.get("winsplitorientation") == "vertical"
+
+
+def test_rc_home_dir_resolution_order(monkeypatch, tmp_path):
+    """$CGDB_DIR wins outright; otherwise ~/.cgdb with HOME ->
+    USERPROFILE -> APPDATA on Windows (init_home_dir, cgdb.cpp:353)."""
+    monkeypatch.setenv("CGDB_DIR", str(tmp_path / "custom"))
+    assert cgdb._cgdb_home_dir() == str(tmp_path / "custom")
+    monkeypatch.delenv("CGDB_DIR")
+    for var in ("HOME", "USERPROFILE", "APPDATA"):
+        monkeypatch.setenv(var, str(tmp_path / var))
+    assert cgdb._cgdb_home_dir() == str(tmp_path / "HOME" / ".cgdb")
+    monkeypatch.delenv("HOME")
+    assert cgdb._cgdb_home_dir() == str(tmp_path / "USERPROFILE" / ".cgdb")
+    monkeypatch.delenv("USERPROFILE")
+    assert cgdb._cgdb_home_dir() == str(tmp_path / "APPDATA" / ".cgdb")
+
+
+def test_missing_rc_is_silently_ignored(tmp_path, monkeypatch):
+    monkeypatch.setenv("CGDB_DIR", str(tmp_path / "nowhere"))
+    from cgdbpy.cgdbrc import Config
+    config = Config()
+    cgdb._load_rc(config)      # must not raise
+    assert config.get("winsplitorientation") == "horizontal"
