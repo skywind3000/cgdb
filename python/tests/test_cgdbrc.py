@@ -42,8 +42,7 @@ EXPECTED = [
     ("timeout", "to", BOOL, 1),
     ("timeoutlen", "tm", INT, 1000),
     ("ttimeout", "ttimeout", BOOL, 1),
-    # C's default is 100; this port halves it for a snappier ESC
-    ("ttimeoutlen", "ttm", INT, 50),
+    ("ttimeoutlen", "ttm", INT, 100),
     ("winminheight", "wmh", INT, 0),
     ("winminwidth", "wmw", INT, 0),
     ("winsplit", "winsplit", STRING, WIN_SPLIT_EVEN),

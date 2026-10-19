@@ -228,9 +228,14 @@ class KeyContext:
         self.defer_on_empty = defer_on_empty
 
     def set_map_set(self, map_set):
+        # C's kui_ctx::set_map_set only swaps the pointer -- it does NOT
+        # drop pending keys. Clearing here killed any mapping whose
+        # expansion switches the focus mid-way (`:map <f4> iinfo
+        # locals<cr><esc>`): the first rhs key 'i' changes the focus,
+        # set_map_set swaps to the imap set, and the rest of the rhs was
+        # wiped before it could be dispatched.
         self.map_set = map_set
         self.tree = map_set.tree
-        self.buffer.clear()
 
     def can_get_key(self):
         return bool(self.buffer)

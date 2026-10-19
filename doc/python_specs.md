@@ -57,7 +57,7 @@ python -m pytest tests/ -q                                                      
 | 测试总数 | **714 全绿**（从推送后的全新克隆复跑验证过） |
 | 代码量 | `cgdbpy/` 3,576 行 + `cgdb.py` 203 行；测试 4,980 行 |
 | 启动到首帧 | ~260 ms（解释器 31 + import ptk 131 + 首帧 98） |
-| ESC 键延迟 | 旧默认 100ms 时 ~107 ms；2026-10-19 起默认 `ttimeoutlen=50`，体感即切（见 §7.3） |
+| ESC 键延迟 | ~107 ms（受 `ttimeoutlen=100` 支配，见 §7.3；嫌慢可 `:set ttm=50`） |
 | 普通键延迟 | 0–4 ms |
 | MI 往返 | 中位 117 µs（gdb 侧）+ 30 µs（Python 侧） |
 | MI 摄入吞吐 | ~2 MB/s / ~50k 行/s |
@@ -664,7 +664,7 @@ ptk 从**顶部**开始显示 formatted text；在顶部补空行会把真实内
 | `showmarks` | `showmarks` | bool | on | gutter 是否显示标记列 |
 | `cgdbmodekey` | — | string | `esc` | 支持 `esc` / `tab` / `ctrl-g` |
 | `timeoutlen` | `tm` | int | 1000 | kui 映射超时（ms） |
-| `ttimeoutlen` | `ttm` | int | 50 | ⚠️ **直接决定 ESC 延迟**，见 §7.3；C 默认 100，本移植改 50（用户反馈 100 手感偏慢） |
+| `ttimeoutlen` | `ttm` | int | 100 | ⚠️ **直接决定 ESC 延迟**，见 §7.3 |
 | `winminheight` | `wmh` | int | 0 | `=`/`-` 调整的下限（横向分屏） |
 | `winminwidth` | `wmw` | int | 0 | `=`/`-` 调整的下限（纵向分屏） |
 | `winsplit` | `winsplit` | string | `even` | 1/4 分割刻度，`src_big`/`src_full`/`gdb_big`/`gdb_full`（`top_*`/`bottom_*` 为兼容旧写法） |
@@ -942,7 +942,13 @@ inferior 的输出按哑终端模型摄入（CSI/OSC 转义序列会被消费掉
 
 已对齐的部分：映射集随焦点切换（source→`map_set`、GDB→`imap_set`、
 filedlg/命令行→清空，`cgdb.cpp:427-432`），`normal :map` 不再泄漏进文件
-对话框。
+对话框。**映射 rhs 穿越焦点切换**（2026-10-19 修复）：C 的
+`kui_ctx::set_map_set` 只换指针不清缓冲，移植版曾把 pending 键清掉，
+`:map <f4> iinfo locals<cr><esc>` 这类"切窗口+打命令+回来"的映射在首个
+`i` 切焦点后整条 rhs 被吞；现对齐 C 不清缓冲，且 `gdb_key` 的 default
+分支把映射注入的普通键/回车/退格写进 gdb 编辑缓冲（终端直打的键仍归
+ptk Buffer，到达该分支的只可能是映射展开）——`<cr>`=`validate_and_handle`、
+`<esc>` 走 mode-key 回源码窗。映射 rhs 里的其他控制键（Ctrl-A 等）暂丢弃。
 
 ### 8.10 第二轮全量审计的对齐（2026-10-19，本次提交）
 

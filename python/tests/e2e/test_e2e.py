@@ -1111,3 +1111,24 @@ def test_help_shows_the_builtin_cheatsheet(target):
         c.settle(0.5)
         assert "key reference" not in c.text()
         assert c.wait("int compute", timeout=10), c.text()
+
+
+@needs_gdb
+def test_map_f4_runs_a_gdb_command_and_returns(target):
+    """The classic mapping: `:map <f4> i<cmd><cr><esc>` must type the
+    command into the GDB window, run it, and come back to the source
+    window. The rhs has to survive its own first key ('i' switches the
+    focus, which swaps the active map set), the text keys have to land
+    in the edit line, and <cr>/<esc> close the loop."""
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("int compute", timeout=30)
+        c.settle(0.5)
+        c.to_source()
+        c.send(":map <f4> ibreak main<cr><esc>")
+        c.settle(0.4)
+        c.key("enter")
+        c.settle(0.5)
+        c.key("f4")
+        assert c.wait("Breakpoint 1", timeout=15), c.text()
+        c.settle(0.6)
+        assert c.focus() == "CGDB", c.focus()

@@ -81,10 +81,7 @@ _SPEC = [
     ("timeout", "to", BOOL, 1, None),
     ("timeoutlen", "tm", INT, 1000, None),
     ("ttimeout", "ttimeout", BOOL, 1, None),
-    # C's default is 100; this port halves it -- 100ms reads as a laggy
-    # ESC on the focus switch (user feedback), and 50ms is still well
-    # above a real terminal's escape-sequence arrival gap
-    ("ttimeoutlen", "ttm", INT, 50, None),
+    ("ttimeoutlen", "ttm", INT, 100, None),
     ("winminheight", "wmh", INT, 0, None),
     ("winminwidth", "wmw", INT, 0, None),
     ("winsplit", "winsplit", STRING, WIN_SPLIT_EVEN,

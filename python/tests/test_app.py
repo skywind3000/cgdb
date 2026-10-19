@@ -2062,3 +2062,48 @@ def test_source_cursor_hides_only_in_source_focus(app):
     assert not app.source_window.always_hide_cursor()
     app.set_focus(FOCUS_COMMAND)
     assert not app.source_window.always_hide_cursor()
+
+
+def test_map_f4_types_a_gdb_command_and_returns(app):
+    """:map <f4> iinfo locals<cr><esc> -- the classic "run a command and
+    come back" mapping.
+
+    Two things have to hold. The expansion must survive its own first
+    key: 'i' switches the focus to the GDB window, which swaps the
+    active map set -- C's kui keeps pending keys across that swap, and
+    the port used to clear them, killing the whole rhs after 'i'. And
+    the text keys of the rhs must land in the synthesized edit line:
+    terminal-typed keys go straight to prompt_toolkit's Buffer, but a
+    mapping's rhs is dispatched key by key, so gdb_key has to type them
+    in -- <cr> runs the command, <esc> returns to the source window.
+    """
+    import time
+    g = app._fake["gdb"]
+    app.set_focus(FOCUS_SOURCE)
+    app.execute_command(":map <f4> iinfo locals<cr><esc>")
+    assert "f4" in str(app.map_set.entries()) or len(app.map_set) == 1
+
+    press(app, kc.F4)
+    time.sleep(0.3)
+
+    # the command reached gdb through the console interpreter
+    cmds = [c for c in g.commands if "info locals" in c]
+    assert cmds, g.commands
+    assert any("interpreter-exec" in c for c in cmds), cmds
+    # the edit line is empty again (accept reset it) and we are back
+    assert app.gdb_buffer.text == ""
+    assert app.focus == FOCUS_SOURCE
+
+
+def test_map_rhs_keys_edit_the_gdb_line(app):
+    """The buffer-typing path also covers backspace."""
+    app.set_focus(FOCUS_SOURCE)
+    app.execute_command(":map <f7> ifoo<BS><BS>bar<cr>")
+    press(app, kc.F7)
+    import time
+    time.sleep(0.25)
+    g = app._fake["gdb"]
+    cmds = [c for c in g.commands if "bar" in c and "foo" not in c]
+    assert cmds, g.commands
+    # no <esc> in this rhs: the focus stays in the GDB window
+    assert app.focus == FOCUS_GDB

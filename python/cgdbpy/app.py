@@ -1056,13 +1056,23 @@ class CgdbApp:
             # (gdb_input's default -> result=1 -> tgdb_send_char)
             self._send_key_to_inferior(key)
             return
-        # Everything else belongs to gdb. gdb_input() says the same thing with
-        # `default: result = 1` -- "this tells the input to go to active GDB
-        # command" (interface.cpp:996-1000) -- so `:`, `/`, NPAGE and the
-        # F-keys are only cgdb's once ESC has moved the focus to the source
-        # window. Ordinary keys never even reach this method:
-        # _buffer_owns_keys() keeps the catch-all binding off while the edit
-        # line has focus.
+        # Keys that reach THIS branch while the edit line has focus can
+        # only come from a :map expansion: _buffer_owns_keys() keeps
+        # terminal-typed ordinary keys in prompt_toolkit's Buffer, but a
+        # mapping's rhs is dispatched key by key by the kui drain. C sends
+        # such keys to gdb's readline through the pty; here they have to
+        # be typed into the synthesized edit line instead -- that is what
+        # makes `:map <f4> iinfo locals<cr><esc>` work: 'i' switches to
+        # the GDB window, the text accumulates, <cr> runs the command,
+        # <esc> returns to the source window.
+        if key == kc.CTRL_M:
+            self.gdb_buffer.validate_and_handle()
+        elif key == kc.CTRL_H:
+            self.gdb_buffer.delete_before_cursor(1)
+        elif not kc.is_special(key) and 32 <= key < 127:
+            self.gdb_buffer.insert_text(chr(key))
+        # other control keys from a mapping rhs are dropped for now; the
+        # readline editing defaults stay owned by prompt_toolkit's bindings
 
     def _send_key_to_inferior(self, key):
         """Byte-wise passthrough while the inferior runs.
