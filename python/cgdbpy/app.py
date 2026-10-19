@@ -2069,6 +2069,10 @@ class CgdbApp:
 
             # --- text -------------------------------------------------------
             line_cls = hl_cls if style == "highlight" else ""
+            # ptk concatenates class names by SPLITTING ON SPACES: without
+            # the separator "class:selected-lineclass:kw" parses as one
+            # unknown class and the whole style (fg and bg) is lost
+            tok_prefix = (line_cls + " ") if line_cls else ""
             eff_left = left + colskip
             toks = self.src.tokens_for_line(line)
             col = 0
@@ -2086,7 +2090,8 @@ class CgdbApp:
                         val = val[eff_left:]
                         eff_left = 0
                     room = avail - col
-                    out.append((line_cls + style_for_token(tok), val[:room]))
+                    out.append((tok_prefix + style_for_token(tok),
+                                val[:room]))
                     col += len(val[:room])
             else:
                 body = raw.expandtabs(tabstop)[left + colskip:

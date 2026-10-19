@@ -2022,3 +2022,31 @@ def test_selected_line_defaults_to_the_highlight_style(app):
     text = app._source_text()
     assert not any("class:selected-line" in s for s, _ in text)
     assert any("class:sel-block" in s for s, _ in text)
+
+
+def test_selected_line_keeps_token_foreground_and_bar_background(app):
+    """The highlight bar must cover syntax-highlighted tokens too.
+
+    Regression: the rewrite concatenated "class:selected-line" and
+    "class:kw" without the separating space, so ptk parsed the pair as one
+    unknown class name and the selected line's tokens lost BOTH the
+    keyword colour and the bar background -- keywords looked like black
+    cells punching holes in the cursor bar.
+    """
+    app.config.set("sld", "highlight")
+    app.view.cursor = 2          # "int compute(int n)" -- a keyword line
+    app.view.height = 10
+    frags = app._source_text()
+    kw = [(s, t) for s, t in frags
+          if s.startswith("class:selected-line ")
+          and ("class:kw" in s or "class:kwtype" in s)]
+    assert kw, ("no highlighted keyword on the selected line:\n%r"
+                % (frags[:12],))
+    for s, _ in kw:
+        # the token class is SPACE-joined, not glued: ptk splits class
+        # names on spaces, so a glued pair resolves to nothing at all
+        assert s == "class:selected-line class:kw" \
+            or s == "class:selected-line class:kwtype", s
+    attrs = app.style.get_attrs_for_style_str(kw[0][0])
+    assert attrs.color in ("ff79c6", "8be9fd")   # the keyword keeps its colour
+    assert attrs.bgcolor == "2e4a62"             # and the bar background
