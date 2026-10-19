@@ -12,7 +12,7 @@ import pytest
 from cgdbpy.cgdbrc import (
     read_rc_commands,
     BOOL, INT, STRING, Config, ConfigError,
-    LINE_DISPLAY_BLOCK, LINE_DISPLAY_LONG_ARROW,
+    LINE_DISPLAY_BLOCK, LINE_DISPLAY_HIGHLIGHT, LINE_DISPLAY_LONG_ARROW,
     LINE_DISPLAY_SHORT_ARROW, WIN_SPLIT_EVEN,
     WIN_SPLIT_SRC_BIG, WIN_SPLIT_TOP_BIG,
     WSO_HORIZONTAL, WSO_VERTICAL)
@@ -33,7 +33,9 @@ EXPECTED = [
     ("hlsearch", "hls", BOOL, 0),
     ("ignorecase", "ic", BOOL, 0),
     ("scrollbackbuffersize", "sbbs", INT, 10000),
-    ("selectedlinedisplay", "sld", STRING, LINE_DISPLAY_BLOCK),
+    # C's default is block; this port prefers the whole-line highlight
+    # (the block marker reads as a second cursor next to the hardware one)
+    ("selectedlinedisplay", "sld", STRING, LINE_DISPLAY_HIGHLIGHT),
     ("showmarks", "showmarks", BOOL, 1),
     ("syntax", "syn", STRING, ""),
     ("tabstop", "ts", INT, 8),

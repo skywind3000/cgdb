@@ -957,12 +957,19 @@ filedlg/命令行→清空，`cgdb.cpp:427-432`），`normal :map` 不再泄漏�
 - 断点没有专用字符——**行号染色**：红=enabled、黄=disabled，
   优先于执行行（绿）/选中行（白）行号色；同表末条胜出（C 的覆盖序）。
 - 执行行默认 `longarrow`：竖线列换 `├`，`─` 伸到首个非空白列再 `>`；
-  选中行默认 `block`（缩进处反色块）；`highlight` 样式整行上色。
+  选中行**本移植默认 `highlight`（整行上色）——C 默认是 `block`**
+  （缩进处反色块），但 block 标记与行尾的硬件光标并排会被读成
+  "两个光标"，且 block 不随 h/l 滚动而硬件光标会（用户实测反馈）；
+  C 的形态保留为 `:set sld=block`。
   `executinglinedisplay`/`selectedlinedisplay`/`arrowstyle`（弃用别名，
   不接受 `block`）全部接线。
 - 文件尾 `~` 行；mark 画在竖线列（HLG_MARK，白粗）。
 - 源码窗有焦点时终端光标显示在选中行行尾（ptk `get_cursor_position`，
   光标格由渲染时写入的尾随空格提供——ptk 只能把光标放到已写入的格上）。
+  ⚠️ 实测陷阱：**不能用 `always_hide_cursor` 隐藏它再指望位置**——渲染器
+  仍会把隐藏光标 move 到正确格（`renderer._cursor_pos` 正确），但 ConPTY
+  不把隐藏光标的定位镜像进 VT 流，屏幕上/e2e 解析里光标停在最后一帧
+  差分绘制的单元。e2e 的焦点检测正是依赖这条流。
 
 **配置系统**
 - `set no<opt>` 剥前缀清布尔（仅布尔，`set notabstop` 报错）；

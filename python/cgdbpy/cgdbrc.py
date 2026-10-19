@@ -68,7 +68,11 @@ _SPEC = [
     ("hlsearch", "hls", BOOL, 0, None),
     ("ignorecase", "ic", BOOL, 0, None),
     ("scrollbackbuffersize", "sbbs", INT, 10000, None),
-    ("selectedlinedisplay", "sld", STRING, LINE_DISPLAY_BLOCK,
+    ("selectedlinedisplay", "sld", STRING, LINE_DISPLAY_HIGHLIGHT,
+     # C's default is LINE_DISPLAY_BLOCK; this port defaults to the
+     # whole-line highlight instead -- the block marker reads as a second
+     # cursor next to the terminal one (user feedback), and the C look
+     # stays one `:set sld=block` away.
      (LINE_DISPLAY_SHORT_ARROW, LINE_DISPLAY_LONG_ARROW,
       LINE_DISPLAY_HIGHLIGHT, LINE_DISPLAY_BLOCK)),
     ("showmarks", "showmarks", BOOL, 1, None),

@@ -2000,3 +2000,25 @@ def test_message_clears_on_the_next_key(app):
     app.message = "old message"
     app.dispatch(ord("j"))
     assert app.message == ""
+
+
+def test_selected_line_defaults_to_the_highlight_style(app):
+    """One cursor glyph, and it is the highlighted line (user feedback).
+
+    C's default selectedlinedisplay=block paints a reverse block at the
+    code's first non-blank; next to the hardware cursor at the line end
+    that reads as *two* cursors, and the block never moves with h/l
+    scrolling while the hardware cursor does. This port highlights the
+    whole line instead -- exactly one glyph, the cursor; the C look stays
+    one `:set sld=block` away.
+    """
+    app.view.cursor = 3
+    app.view.height = 10
+    text = app._source_text()
+    assert any("class:selected-line" in s for s, _ in text)
+    assert not any("class:sel-block" in s for s, _ in text)
+
+    app.config.set("sld", "block")
+    text = app._source_text()
+    assert not any("class:selected-line" in s for s, _ in text)
+    assert any("class:sel-block" in s for s, _ in text)
