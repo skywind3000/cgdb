@@ -72,6 +72,10 @@ def style_for_token(tok):
 
 # prompt_toolkit Style.from_dict entries. Colours chosen to read on both light
 # and dark terminals; `:set color=off` swaps in the monochrome style.
+#
+# The cursor line and the status bar are deliberately different hues
+# (blue-grey vs violet-grey): sharing one colour made the selected line
+# read as "another status bar" at a glance.
 COLOR_STYLE = {
     "kw": "#ff79c6",
     "kwtype": "#8be9fd",
@@ -99,7 +103,7 @@ COLOR_STYLE = {
     "line-number.current": "bold #f8f8f2",
     "breakpoint": "bold #ff5555",
     "exec-arrow": "bold #50fa7b",
-    "selected-line": "bg:#44475a",
+    "selected-line": "bg:#2e4a62",
     "status": "bg:#44475a #f8f8f2",
     "status.focus": "bg:#50fa7b #282a36",
     "command": "bold #f8f8f2",
@@ -119,7 +123,7 @@ MONO_STYLE.update({
     "line-number.current": "bold",
     "breakpoint": "bold",
     "exec-arrow": "bold",
-    "selected-line": "reverse",
+    "selected-line": "bold",
     "status": "reverse",
     "status.focus": "bold reverse",
     "command": "bold",

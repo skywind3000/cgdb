@@ -1511,6 +1511,28 @@ def test_color_option_rebuilds_the_style(app):
     assert app.config.get("color") == 1
 
 
+def test_cursor_line_is_distinct_from_the_status_bar(app):
+    """The cursor-line highlight and the status bar must resolve to
+    different attributes; when both used bg:#44475a the selected line
+    read as a second status bar at a glance.
+
+    Checked through the real style translation, not just the dict, and
+    in monochrome too (bold vs reverse)."""
+    from prompt_toolkit.styles import DEFAULT_ATTRS
+
+    sel = app.style.get_attrs_for_style_str("class:selected-line",
+                                            DEFAULT_ATTRS)
+    bar = app.style.get_attrs_for_style_str("class:status", DEFAULT_ATTRS)
+    assert sel.bgcolor != bar.bgcolor
+
+    app.execute_command(":set color=off")
+    sel = app.style.get_attrs_for_style_str("class:selected-line",
+                                            DEFAULT_ATTRS)
+    bar = app.style.get_attrs_for_style_str("class:status", DEFAULT_ATTRS)
+    assert (sel.bold, sel.reverse) != (bar.bold, bar.reverse)
+    app.execute_command(":set color=on")
+
+
 def test_scrollback_option_reaches_the_console(app):
     app.execute_command(":set scrollbackbuffersize=77")
     assert app.console.scrollback == 77
