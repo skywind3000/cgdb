@@ -128,16 +128,20 @@ def busy():
 class Cgdb:
     """One cgdb.py session in a ConPTY."""
 
-    def __init__(self, target, extra=(), env=None, rows=ROWS, cols=COLS):
+    def __init__(self, target, extra=(), env=None, rows=ROWS, cols=COLS,
+                 source=True):
         self.target = target
         self.extra = list(extra)
         self.env = env
         self.rows, self.cols = rows, cols
+        self.source = source
         self.session = None
 
     def argv(self):
-        return [PY, CGDB_PY, "-d", GDB, "--source", self.target["src"],
-                "--"] + self.extra + [self.target["exe"]]
+        argv = [PY, CGDB_PY, "-d", GDB]
+        if self.source:
+            argv += ["--source", self.target["src"]]
+        return argv + ["--"] + self.extra + [self.target["exe"]]
 
     def __enter__(self):
         self.session = ConPtySession(self.argv(), rows=self.rows,
@@ -300,9 +304,10 @@ def test_startup_shows_source_status_and_prompt(target):
         assert "(gdb)" in t
         st = c.status_line()
         # cgdb starts in the GDB window (interface.cpp:139) so commands can be
-        # typed straight away
+        # typed straight away. The view sits at main's line: gdb's answer to
+        # -file-list-exec-source-file positioned it, as C does at startup.
         assert st.startswith("GDB"), st
-        assert "1/" in st
+        assert "10/" in st
         assert c.session.parse_errors == []
 
 
@@ -318,6 +323,28 @@ def test_line_numbers_are_rendered(target):
 
 
 @needs_gdb
+def test_startup_opens_the_debuggees_main_source(target):
+    """The debuggee's main file lands in the source window before anything
+    has run: gdb's answer to -file-list-exec-source-file, which is what
+    tgdb_request_current_location asks for in C.
+
+    No --source flag here -- the point is that cgdb finds the file itself.
+    """
+    with Cgdb(target, ["-q"], source=False) as c:
+        assert c.wait("(gdb)", timeout=30)
+        assert c.wait("int compute", timeout=15), c.text()
+        assert "target.c" in c.status_line(), c.status_line()
+        # positioned at main, not merely opened
+        assert "int main" in c.text(), c.text()
+        # and a stop still works on top of it
+        c.to_gdb()
+        c.type_cmd("break main")
+        assert c.wait("Breakpoint 1", timeout=15), c.text()
+        c.type_cmd("run")
+        assert c.wait("MARKER", timeout=30), c.text()
+
+
+@needs_gdb
 def test_pythonhome_in_our_env_does_not_break_gdb(target):
     """A PYTHONHOME we inherit must not reach gdb.
 
@@ -328,7 +355,11 @@ def test_pythonhome_in_our_env_does_not_break_gdb(target):
     exactly the people who have PYTHONHOME set.
     """
     env = dict(os.environ)
-    env["PYTHONHOME"] = os.path.dirname(os.path.dirname(PY))
+    # the interpreter running cgdb.py accepts its own home here; gdb's
+    # embedded CPython does not, and dies during startup -- exactly the
+    # combination _child_env() strips. (Pointing one level higher would
+    # kill cgdb.py's own interpreter before it could start.)
+    env["PYTHONHOME"] = os.path.dirname(PY)
     with Cgdb(target, ["-q"], env=env) as c:
         assert c.wait("(gdb)", timeout=30), c.text()
         c.settle(0.8)
@@ -518,15 +549,18 @@ def test_slash_search_moves_the_cursor(target):
         assert c.wait("int compute", timeout=30)
         c.settle(0.8)
         c.to_source()
-        assert "1/" in c.status_line()
-        c.send("/main")
+        # startup positioned the view at main (gdb's reported line)
+        st0 = c.status_line()
+        assert "/14" in st0, st0
+        c.send("/printf")
         c.settle(0.4)
         c.key("enter")
-        assert c.wait("int main(void)", timeout=15)
+        assert c.wait("printf", timeout=15)
         c.settle(1.0)
         st = c.status_line()
-        # the cursor must have moved off line 1
-        assert " 1/" not in st, st
+        # the cursor must have moved to the printf line, off main
+        assert st != st0, (st0, st)
+        assert " 12/" in st, st
 
 
 @needs_gdb

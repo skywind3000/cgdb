@@ -1747,6 +1747,24 @@ class CgdbApp:
             self.tty = None
             self._on_console("cgdb: inferior tty unavailable (%s); "
                              "program output may interleave with MI\n" % e)
+        # C asks gdb for the current location as soon as gdb is ready
+        # (tgdb_request_current_location -> -file-list-exec-source-file);
+        # that is what puts the debuggee's main file into the source
+        # window before anything has run. Without symbols gdb answers
+        # ^error and there is simply nothing to show.
+        try:
+            rec = self.gdb.call("-file-list-exec-source-file", timeout=10)
+        except GdbError:
+            rec = None
+        if rec is not None and rec.kind == "result" and rec.cls == "done":
+            payload = rec.payload or {}
+            path = payload.get("fullname") or payload.get("file") or ""
+            try:
+                line = int(payload.get("line") or 0)
+            except (TypeError, ValueError):
+                line = 0
+            if path:
+                self.goto_file_line(path, line or None)
         self.refresh_breakpoints()
         self._gdb_ready = True
         return True

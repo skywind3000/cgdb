@@ -278,8 +278,21 @@ class ConPtySession:
 
         cmdline = subprocess.list2cmdline(self.argv)
         pi = PROCESS_INFORMATION()
+        # lpEnvironment: NULL inherits ours; an explicit env must be packed
+        # into a double-null-terminated unicode block AND flagged
+        # CREATE_UNICODE_ENVIRONMENT, or Windows parses it as ANSI and
+        # fails with ERROR_INVALID_PARAMETER -- the env= tests would
+        # silently run with the parent's environment instead.
+        if self.env is None:
+            env_param = None
+            flags = 0x00080000            # EXTENDED_STARTUPINFO_PRESENT
+        else:
+            block = "\0".join("%s=%s" % (k, v)
+                              for k, v in self.env.items()) + "\0\0"
+            env_param = ctypes.c_wchar_p(block)
+            flags = 0x00080000 | 0x00000400   # + CREATE_UNICODE_ENVIRONMENT
         ok = k32.CreateProcessW(None, ctypes.create_unicode_buffer(cmdline),
-                                None, None, False, 0x00080000, None,
+                                None, None, False, flags, env_param,
                                 self.cwd, ctypes.byref(si.StartupInfo),
                                 ctypes.byref(pi))
         assert ok, "CreateProcessW failed: %d" % k32.GetLastError()

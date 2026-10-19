@@ -613,6 +613,7 @@ ptk 从**顶部**开始显示 formatted text；在顶部补空行会把真实内
 | 功能键 F1/F5/F6/F7/F8/F10 的语义 | `interface.cpp:1511-1537` |
 | ESC = cgdbmodekey = 切回源码窗；已在源码窗时无操作 | `interface.cpp:1546-1585` |
 | **启动焦点 = GDB 窗**（一进来就能敲 gdb 命令；源码窗才是 vim 式按键） | `interface.cpp:139` |
+| **gdb 就绪即打开主源文件**：启动时发 `-file-list-exec-source-file`（= C 的 tgdb_request_current_location），把调试对象的主文件带行号开进源码窗——不需要 run/break，也不需要 `--source` | `tgdb.cpp:1172-1177, 1982-1986` |
 | **GDB 窗内 `:` 和 `/` 是普通字符，归 gdb**；进了源码窗才是 cgdb 的命令键 | `interface.cpp:996-1000` |
 | **`:` / `/` 命令行画在中间状态栏行**（顶替状态栏那一行，不是屏幕底部） | `interface.cpp:459-472` |
 | **gdb 退出（EOF）→ cgdb 跟着退出**；启动期就死则留在屏幕上展示报错 | `cgdb.cpp:760-772` |
