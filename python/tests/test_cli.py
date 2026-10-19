@@ -156,7 +156,12 @@ def test_rc_is_read_from_the_cgdb_home_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("CGDB_DIR", str(home))
     from cgdbpy.cgdbrc import Config
     config = Config()
-    cgdb._load_rc(config)
+    # _load_rc returns the full command list; set lines are applied by the
+    # caller, the rest are replayed by the app
+    lines = cgdb._load_rc()
+    for _no, line in lines:
+        if line.split(None, 1)[0].lower() == "set":
+            config.apply_set(line.split(None, 1)[1])
     assert config.get("winsplitorientation") == "vertical"
 
 
@@ -177,7 +182,4 @@ def test_rc_home_dir_resolution_order(monkeypatch, tmp_path):
 
 def test_missing_rc_is_silently_ignored(tmp_path, monkeypatch):
     monkeypatch.setenv("CGDB_DIR", str(tmp_path / "nowhere"))
-    from cgdbpy.cgdbrc import Config
-    config = Config()
-    cgdb._load_rc(config)      # must not raise
-    assert config.get("winsplitorientation") == "horizontal"
+    assert cgdb._load_rc() == []      # must not raise

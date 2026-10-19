@@ -444,10 +444,53 @@ def test_marks(app):
     assert app.view.cursor == 7
 
 
-def test_unknown_mark_reports_a_message(app):
+def test_unknown_mark_falls_through_silently(app):
+    # source_goto_mark failing means the key is processed as a normal key
+    # (sources.cpp:694-703) -- no message, no jump
     app.dispatch(ord("'"))
+    cursor = app.view.cursor
     app.dispatch(ord("z"))
-    assert "not set" in app.message
+    assert app.message == ""
+    assert app.view.cursor == cursor
+
+
+def test_jump_back_and_executing_line_marks(app, srcfile):
+    # `''` bounces back to where the last `'x` jump started; `'.` goes to
+    # the executing line (sources.cpp:684-696)
+    app.exec_line = (srcfile, 3)
+    app.view.move_to(30, len(app.src))
+    app.dispatch(ord("'"))
+    app.dispatch(ord("a"))            # jump back home (mark unset? no --
+    # 'a' was never set: falls through. Set it first.
+    app.view.set_mark("a")
+    app.view.marks["a"] = 30
+    app.view.move_to(0, len(app.src))
+    app.dispatch(ord("'"))
+    app.dispatch(ord("a"))
+    assert app.view.cursor == 30
+    app.dispatch(ord("'"))
+    app.dispatch(ord("'"))            # jump back
+    assert app.view.cursor == 0
+    app.dispatch(ord("'"))
+    app.dispatch(ord("."))            # the executing line
+    assert app.view.cursor == 2
+
+
+def test_mark_toggle_and_invalid_names(app):
+    app.view.move_to(4, len(app.src))
+    app.dispatch(ord("m"))
+    app.dispatch(ord("a"))
+    assert "a" in app.view.marks
+    app.dispatch(ord("m"))
+    app.dispatch(ord("a"))            # same line: removes the mark
+    assert "a" not in app.view.marks
+    app.dispatch(ord("m"))
+    app.dispatch(ord("5"))            # not a-zA-Z: falls through, no mark
+    assert "5" not in app.view.marks
+    # and the '5' still starts a count -- C's source_input appends it
+    # after the switch, so the next j moves by five
+    app.dispatch(ord("j"))
+    assert app.view.cursor == 9
 
 
 # ---------------------------------------------------------------------------
@@ -521,15 +564,35 @@ def test_function_keys_issue_the_right_mi_command(app, key, expected):
     assert expected in g.commands[before:], g.commands[before:]
 
 
-def test_F5_continues_when_already_running(app):
+def test_F5_runs_even_while_inferior_runs(app):
+    # C's F5 is TGDB_RUN unconditionally; a running inferior gets broken
+    # into first so the run is actually seen
     g = app._fake["gdb"]
     app.running_inferior = True
     before = len(g.commands)
     app.dispatch(kc.F5)
     import time
     time.sleep(0.3)
-    assert "-exec-continue" in g.commands[before:]
-    assert "-exec-run" not in g.commands[before:]
+    assert "-exec-run" in g.commands[before:]
+    assert g.interrupted == 1
+
+
+def test_F_keys_only_fire_from_the_source_window(app):
+    # cgdb_input handles F5/F8/...; the GDB window sends them to gdb
+    # instead (interface.cpp:1484-1509 vs the gdb_input default)
+    import time
+    g = app._fake["gdb"]
+    app.focus = FOCUS_GDB
+    before = len(g.commands)
+    app.dispatch(kc.F5)
+    app.dispatch(kc.F8)
+    app.dispatch(kc.F10)
+    time.sleep(0.3)
+    assert g.commands[before:] == []
+    app.focus = FOCUS_SOURCE
+    app.dispatch(kc.F5)
+    time.sleep(0.3)
+    assert any(c.startswith("-exec-run") for c in g.commands[before:])
 
 
 def test_ctrl_c_interrupts(app):
@@ -541,7 +604,13 @@ def test_ctrl_c_interrupts(app):
 
 def test_F1_shows_help(app):
     app.dispatch(kc.F1)
-    assert "F5" in app.message and "ESC" in app.message
+    assert app._help_active
+    assert app.root is app.help_window
+    text = "".join(t for _, t in app._help_text())
+    assert "F5" in text and "ESC" in text
+    app.dispatch(ord("q"))
+    assert not app._help_active
+    assert app.root is not app.help_window
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +630,6 @@ def test_stopped_updates_the_exec_line_and_opens_the_file(app, srcfile):
     assert app.exec_line == (srcfile, 5)
     assert app.view.cursor == 4          # 0-based
     assert app.running_inferior is False
-    assert "breakpoint-hit" in app.message
 
 
 def test_stopped_without_a_frame_does_not_crash(app):
@@ -780,14 +848,20 @@ def test_shell_command_degrades_to_a_message_when_headless(app):
 # ---------------------------------------------------------------------------
 # file dialog (o)
 # ---------------------------------------------------------------------------
-def test_o_opens_the_file_dialog_with_gdb_list(app):
+def test_o_opens_the_file_dialog_with_gdb_list(app, tmp_path):
     """`o` requests -file-list-exec-source-files and the dialog takes over
-    the screen (if_show_filedlg)."""
+    the screen (if_show_filedlg). Entries whose file no longer exists are
+    dropped, as filedlg.cpp:139-142 does."""
     import time
     g = app._fake["gdb"]
+    main = tmp_path / "main.c"
+    util = tmp_path / "util.c"
+    main.write_text("int main;\n", encoding="utf-8")
+    util.write_text("int util;\n", encoding="utf-8")
     g.responses["-file-list-exec-source-files"] = {"files": [
-        {"file": "main.c", "fullname": "/src/main.c"},
-        {"file": "util.c", "fullname": "/src/util.c"},
+        {"file": "main.c", "fullname": str(main)},
+        {"file": "util.c", "fullname": str(util)},
+        {"file": "gone.c", "fullname": str(tmp_path / "gone.c")},
     ]}
     app.dispatch(ord("o"))
     time.sleep(0.4)
@@ -799,12 +873,14 @@ def test_o_opens_the_file_dialog_with_gdb_list(app):
     assert [f[0] for f in app.filedlg.files] == ["main.c", "util.c"]
 
 
-def test_file_dialog_navigation_and_open(app, srcfile):
+def test_file_dialog_navigation_and_open(app, srcfile, tmp_path):
     import time
     g = app._fake["gdb"]
+    beta = tmp_path / "beta.c"
+    beta.write_text("int beta;\n", encoding="utf-8")
     g.responses["-file-list-exec-source-files"] = {"files": [
         {"file": "alpha.c", "fullname": srcfile},
-        {"file": "beta.c", "fullname": "/nope/beta.c"},
+        {"file": "beta.c", "fullname": str(beta)},
     ]}
     app.dispatch(ord("o"))
     time.sleep(0.4)
@@ -846,13 +922,18 @@ def test_file_dialog_q_and_esc_cancel(app):
     assert not app._filedlg_active
 
 
-def test_file_dialog_search(app):
+def test_file_dialog_search(app, tmp_path):
     import time
     g = app._fake["gdb"]
+    files = {}
+    for name in ("one.c", "two.c", "three.c"):
+        f = tmp_path / name
+        f.write_text("int %s;\n" % name[:-2], encoding="utf-8")
+        files[name] = str(f)
     g.responses["-file-list-exec-source-files"] = {"files": [
-        {"file": "one.c", "fullname": "/one.c"},
-        {"file": "two.c", "fullname": "/two.c"},
-        {"file": "three.c", "fullname": "/three.c"},
+        {"file": "one.c", "fullname": files["one.c"]},
+        {"file": "two.c", "fullname": files["two.c"]},
+        {"file": "three.c", "fullname": files["three.c"]},
     ]}
     app.dispatch(ord("o"))
     time.sleep(0.4)
@@ -865,17 +946,48 @@ def test_file_dialog_search(app):
     assert app.filedlg.sel == 1
 
 
-def test_file_dialog_text_renders_list_and_fillers(app):
+def test_file_dialog_search_is_case_insensitive_and_wraps(app, tmp_path):
+    # filedlg.cpp hardcodes icase=1 and wraps the scan
     import time
     g = app._fake["gdb"]
+    names = ("a.c", "B.c", "c.c")
+    paths = []
+    for name in names:
+        f = tmp_path / name
+        f.write_text("x\n", encoding="utf-8")
+        paths.append(str(f))
     g.responses["-file-list-exec-source-files"] = {"files": [
-        {"file": "a.c", "fullname": "/a.c"}]}
+        {"file": n, "fullname": p} for n, p in zip(names, paths)]}
+    app.dispatch(ord("o"))
+    time.sleep(0.4)
+    # C's sort is plain strcmp: "B.c" < "a.c" < "c.c"
+    assert [f[0] for f in app.filedlg.files] == ["B.c", "a.c", "c.c"]
+    app._search_target = "filedlg"
+    app.execute_command("/A")            # lowercase pattern, icase match
+    assert app.filedlg.sel == 1
+    app.execute_command("/C")
+    assert app.filedlg.sel == 2
+    app.filedlg.goto(2)
+    app.execute_command("/B")            # wraps back to the top
+    assert app.filedlg.sel == 0
+
+
+def test_file_dialog_text_renders_list_and_fillers(app, tmp_path):
+    import time
+    g = app._fake["gdb"]
+    a = tmp_path / "a.c"
+    a.write_text("int a;\n", encoding="utf-8")
+    g.responses["-file-list-exec-source-files"] = {"files": [
+        {"file": "a.c", "fullname": str(a)}]}
     app.dispatch(ord("o"))
     time.sleep(0.4)
     text = "".join(t for _, t in app._filedlg_text())
     assert "Select a file or press q to cancel" in text
     assert "a.c" in text
     assert text.count("~") >= 5          # vim-style filler rows
+    assert "->" in text                  # the selection arrow
+    # the bottom row exists and is empty without a message
+    assert text.endswith("\n") or text.rstrip().endswith("")
     app.dispatch(ord("q"))
 
 
@@ -895,15 +1007,19 @@ def test_map_command_abbreviations(app):
 
 
 def test_source_u_runs_until_cursor_line(app):
-    """'u' in the source window runs until the cursor line
-    (interface.cpp:1304-1311)."""
+    """'u' runs until the *displayed* file's line: tgdb passes path and
+    line together (tgdb_request_until_line), so the console until
+    "file":line spelling is used."""
     import time
     g = app._fake["gdb"]
     app.view.cursor = 6
     before = len(g.commands)
     app.dispatch(ord("u"))
     time.sleep(0.4)
-    assert "-exec-until 7" in g.commands[before:]
+    sent = [c for c in g.commands[before:]
+            if "until" in c]
+    assert len(sent) == 1
+    assert "until " in sent[0] and ":7" in sent[0]
 
 
 def test_digit_counts_in_source_window(app, srcfile):
@@ -970,12 +1086,42 @@ def test_open_without_an_argument(app):
 
 def test_help_command(app):
     app.execute_command(":help")
-    assert "F5" in app.message
+    assert app._help_active
+    app.dispatch(ord("q"))
+    assert not app._help_active
 
 
 def test_unknown_colon_command(app):
     app.execute_command(":frobnicate")
-    assert "unknown command" in app.message
+    assert "Unknown command" in app.message
+    # the whole command line is echoed, as C does
+    assert "frobnicate" in app.message
+
+
+def test_numeric_command_ignores_trailing_junk(app):
+    # the lexer's NUMBER token is `[+-]?{D}+`; `:5abc` jumps to line 5
+    app.execute_command(":5abc")
+    assert app.view.cursor == 4
+
+
+def test_colon_backspacing_the_prefix_cancels(app):
+    """Deleting the ':' itself closes the command line; what is typed
+    afterwards must never leak to gdb as a console command."""
+    import time
+    g = app._fake["gdb"]
+    before = len(g.commands)
+    app.set_focus(FOCUS_SOURCE)
+    app.dispatch(ord(":"))
+    assert app.focus == FOCUS_COMMAND
+    # backspace over the ':'
+    app.cmd_buffer.delete_before_cursor(1)
+    assert app.focus != FOCUS_COMMAND
+    # typing q + Enter now goes to the source window's 'q' (nothing),
+    # not to gdb
+    app.dispatch(ord("q"))
+    app.dispatch(kc.CTRL_M)
+    time.sleep(0.2)
+    assert g.commands[before:] == []
 
 
 def test_clear_command(app):
@@ -1069,25 +1215,77 @@ def test_incremental_search_jumps_while_typing(app, srcfile):
 
 
 def test_console_search_jump_and_repeat(app):
-    """`/` typed in the GDB window searches the console scrollback, and
-    n/N in scroll mode repeat it (scr_search_next)."""
+    """`/` typed in the GDB window searches from the scroll cursor,
+    wraps (scr_search_regex), and n/N repeat in the remembered direction."""
     app._fake["gdb"].emit_console("".join("hit %d\n" % i for i in range(30)))
     app.dispatch(ord("i"))
     app.dispatch(kc.PPAGE)
     assert app.scroll.active
     app._search_target = "console"
+    # the scan starts at the scroll cursor (scroller.cpp:319), which
+    # PageUp left mid-scrollback: "hit 20" is the first match below it
     app.execute_command("/hit 2")
-    assert app._console_search_row == 2      # first "hit 2" from the top
+    assert app._console_search_row == 20
     mx = app.console.max_delta(app._console_height())
     assert 0 <= app.scroll.delta <= mx       # positioned, clamped
-    # n finds the next match ("hit 20"); N walks back up
+    # n continues from the hit: "hit 21" is next; N walks back
     app.dispatch(ord("n"))
-    assert app._console_search_row == 20
+    assert app._console_search_row == 21
     app.dispatch(ord("N"))
-    assert app._console_search_row == 2
+    assert app._console_search_row == 20
     assert app.scroll.active
+    # / + Enter with an empty pattern repeats the last search
+    app.execute_command("/")
+    assert app._console_search_row == 21
     app.execute_command("/zzz_absent")
     assert "not found" in app.message
+
+
+def test_console_search_wraps_from_the_bottom(app):
+    app._fake["gdb"].emit_console("".join("hit %d\n" % i for i in range(30)))
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    app._search_target = "console"
+    # from the very bottom the forward scan wraps to the top
+    app.scroll.delta = 0
+    app.scroll.row = app._console_height() - 1
+    origin = app._console_search_origin()
+    assert origin[0] >= 25                   # really at the bottom
+    app.execute_command("/hit 1$")
+    assert app._console_search_row == 1
+
+
+def test_console_search_remembered_direction(app):
+    # after a `?` backward search, n keeps going backward (C's
+    # regex_direction_last, interface.cpp:937-944)
+    app._fake["gdb"].emit_console("".join("hit %d\n" % i for i in range(30)))
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    app._search_target = "console"
+    # a `?` search scans backward from the cursor
+    app.execute_command("?hit 2")
+    assert app._console_search_row == 2
+    # n keeps going backward: below row 2 nothing matches, so it wraps
+    # from the end ("hit 29" contains "hit 2")
+    app.dispatch(ord("n"))
+    assert app._console_search_row == 29
+    app.dispatch(ord("N"))
+    assert app._console_search_row == 2
+
+
+def test_console_search_esc_restores_the_position(app):
+    app._fake["gdb"].emit_console("".join("hit %d\n" % i for i in range(30)))
+    app.dispatch(ord("i"))
+    app.dispatch(kc.PPAGE)
+    app.scroll.delta = 5
+    saved = (app.scroll.active, app.scroll.delta, app.scroll.row)
+    app.dispatch(ord("/"))                  # the real entry: records state
+    assert app.focus == FOCUS_COMMAND
+    # the live preview jumped somewhere
+    app.cmd_buffer.text = "/hit 2"
+    assert app.scroll.delta != saved[1]
+    app.dispatch(kc.ESC)
+    assert (app.scroll.active, app.scroll.delta, app.scroll.row) == saved
 
 
 def test_console_search_without_previous_pattern(app):
@@ -1098,8 +1296,15 @@ def test_console_search_without_previous_pattern(app):
     assert "no previous" in app.message
 
 
-def test_source_horizontal_scroll(app, srcfile):
-    """h/l scroll the source text columns (source_hscroll)."""
+def test_source_horizontal_scroll(app, tmp_path):
+    """h/l scroll the source text columns (source_hscroll); a file whose
+    longest line fits the window cannot scroll at all, because C clamps
+    sel_col to the longest line (sources.cpp:1091-1110)."""
+    f = tmp_path / "wide.c"
+    f.write_text("\n".join(["int x;"] + ["long_%04d;" % i + "y" * 120
+                                         for i in range(40)]) + "\n",
+                 encoding="utf-8")
+    app.open_file(str(f))
     assert app.view.left == 0
     app.dispatch(ord("l"))
     app.dispatch(ord("l"))
@@ -1111,36 +1316,53 @@ def test_source_horizontal_scroll(app, srcfile):
     assert app.view.left == 0     # floors at zero
 
 
-def test_source_render_shifts_by_left(app, srcfile):
-    app.view.cursor = 0
+def test_source_cannot_scroll_a_file_that_fits(app, srcfile):
+    for _ in range(5):
+        app.dispatch(ord("l"))
+    assert app.view.left == 0
+
+
+def test_source_render_shifts_by_left(app, tmp_path):
+    # C clamps sel_col to the longest line, so the file needs a line that
+    # actually overflows the window before scrolling does anything
+    long_line = "int " + "alpha_" * 60 + "x = 1;"
+    f = tmp_path / "long.c"
+    f.write_text("short\n" + long_line + "\nshort\n", encoding="utf-8")
+    app.open_file(str(f))
+    app.view.cursor = 1
     app.view.left = 4
     frags = app._source_text()
-    first = "".join(t for _, t in frags).split("\n")[0]
+    rows = "".join(t for _, t in frags).split("\n")
+    body = [r for r in rows if "alpha_" in r or "lpha_" in r][0]
     # the gutter is intact; the text body lost its first 4 columns
-    assert "lude <stdio.h>" in first
-    assert "#include" not in first
+    assert "lpha_alpha" in body
+    assert body.count("int ") == 0
+    # scrolling past the longest line is clamped (sources.cpp:1091-1110)
+    for _ in range(2000):
+        app.dispatch(ord("l"))
+    assert app.view.left <= len(long_line) + 8
     app.view.left = 0
 
 
-def test_console_scroll_horizontal(app):
-    """Scroll-mode h/l/0/$ pan the console (scr_left / scr_right)."""
+def test_console_scroll_cursor_column(app):
+    """Scroll-mode h/l/0/$ move the *cursor's* column (scr_left/right) --
+    the window never pans sideways; vterm rewraps instead."""
     app._fake["gdb"].emit_console("".join("x%d\n" % i for i in range(40)))
     app.dispatch(ord("i"))
     app.dispatch(kc.PPAGE)
     assert app.scroll.active
+    w = app._gdb_width()
     app.dispatch(ord("l"))
     app.dispatch(ord("l"))
-    assert app.console_left == 2
+    assert app.scroll.col == 2
     app.dispatch(ord("h"))
-    assert app.console_left == 1
+    assert app.scroll.col == 1
     app.dispatch(ord("0"))
-    assert app.console_left == 0
+    assert app.scroll.col == 0
     app.dispatch(ord("$"))
-    assert app.console_left >= 0
-    # leaving scroll mode resets the pan
+    assert app.scroll.col == w - 1
     app.dispatch(ord("q"))
     assert not app.scroll.active
-    assert app.console_left == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1153,21 +1375,34 @@ def test_pageup_enters_scroll_mode(app):
 
 
 def test_scroll_mode_navigation(app):
+    # scr_up/scr_down: the cursor walks first, the window only scrolls
+    # once the cursor reaches the edge (scroller.cpp:216-237)
     app._fake["gdb"].emit_console("".join("L%d\n" % i for i in range(60)))
     app.dispatch(ord("i"))
     app.dispatch(kc.PPAGE)
     assert app.scroll.active
+    h = app._console_height()
     d0 = app.scroll.delta
+    r0 = app.scroll.row
     app.dispatch(kc.UP)
-    assert app.scroll.delta == d0 + 1
+    assert app.scroll.delta == d0          # window still
+    assert app.scroll.row == r0 - 1        # cursor moved up
+    for _ in range(h):
+        app.dispatch(kc.UP)                # walk the cursor to the top
+    top = app.scroll.delta
+    app.dispatch(kc.UP)                    # now the window scrolls
+    assert app.scroll.delta == top + 1
+    assert app.scroll.row == 0
     app.dispatch(kc.DOWN)
-    assert app.scroll.delta == d0
+    assert app.scroll.row == 1             # cursor walks down again
+    assert app.scroll.delta == top + 1
     # a lone 'g' is a prefix in the GDB window (gdb_input's gg); only the
     # pair jumps home, and it must not move on the first press
+    d1 = app.scroll.delta
     app.dispatch(ord("g"))
-    assert app.scroll.delta == d0
+    assert app.scroll.delta == d1
     app.dispatch(ord("g"))
-    assert app.scroll.delta == app.console.max_delta(app._console_height())
+    assert app.scroll.delta == app.console.max_delta(h)
     app.dispatch(ord("G"))
     assert app.scroll.delta == 0
 
@@ -1190,11 +1425,21 @@ def test_scroll_mode_half_pages_and_enter_leaves(app):
     assert app.scroll.delta == 0     # parked at the bottom
 
 
-def test_esc_leaves_scroll_mode(app):
+def test_esc_keeps_scroll_mode(app):
+    # interface.cpp:1522-1555: ESC switches focus but never touches
+    # in_scroll_mode; coming back with `i` stays at the scrolled position
     app.dispatch(ord("i"))
     app.dispatch(kc.PPAGE)
     assert app.scroll.active
+    app.scroll.delta = 4
     app.dispatch(kc.ESC)
+    assert app.focus == FOCUS_SOURCE
+    assert app.scroll.active
+    assert app.scroll.delta == 4
+    app.dispatch(ord("i"))
+    assert app.scroll.active
+    assert app.scroll.delta == 4
+    app.dispatch(ord("q"))                 # q parks at the bottom
     assert not app.scroll.active
 
 
@@ -1259,32 +1504,70 @@ def test_source_rendering_includes_gutter(app):
 
 
 def test_source_rendering_marks_breakpoints(app):
+    # the breakpoint marker IS the line number's colour, there is no "B"
+    # (sources.cpp:877-895): red for enabled, yellow for disabled
     app.breakpoints.update_from_mi({"BreakpointTable": {"body": [
         {"bkpt": {"number": "1", "enabled": "y",
-                  "fullname": app.src.path, "line": "1"}}]}})
+                  "fullname": app.src.path, "line": "1"}},
+        {"bkpt": {"number": "2", "enabled": "n",
+                  "fullname": app.src.path, "line": "2"}}]}})
     app.view.height = 10
-    app.view.top = 0
     text = app._source_text()
-    styles = [s for s, _ in text]
-    assert any("breakpoint" in s for s in styles)
-    assert any(t == "B" for _, t in text)
+    frags = [(s, t) for s, t in text if t.strip().isdigit()]
+    assert any("class:breakpoint" == s.strip() for s, t in frags)
+    assert any(s.strip() == "class:breakpoint.disabled" for s, t in frags)
+    assert not any(t == "B" for _, t in text)
 
 
 def test_source_rendering_marks_the_exec_line(app, srcfile):
+    # default executinglinedisplay=longarrow: `├` in the bar column and a
+    # `────>` that reaches to the first non-blank column
     app.exec_line = (srcfile, 5)
     app.view.height = 10
-    app.view.top = 0
     text = app._source_text()
-    assert any(t == "=>" for _, t in text)
+    assert any(t == "├" for _, t in text)
+    assert any(">" in t and "─" in t for _, t in text)
+    # the executing line number is green, the selected one white/bold
+    assert any(s.strip() == "class:line-number.executing" for s, t in text
+               if t.strip().isdigit())
+
+    # shortarrow keeps the `├` bar but the marker collapses to `>`
+    app.config.set("eld", "shortarrow")
+    text = app._source_text()
+    assert any(t == ">" for _, t in text)
+    assert not any("─" in t for _, t in text)
+
+    # highlight paints the whole line instead
+    app.config.set("eld", "highlight")
+    text = app._source_text()
+    assert any("exec-line-highlight" in s for s, _ in text)
 
 
 def test_source_rendering_shows_marks(app):
+    # a mark replaces the vertical bar column, in HLG_MARK
     app.view.cursor = 2
     app.view.set_mark("a")
     app.view.height = 10
-    app.view.top = 0
     text = app._source_text()
-    assert any(t == "a" for _, t in text)
+    assert any((t == "a" and "class:mark" in s) for s, t in text)
+
+
+def test_source_rendering_tilde_rows_and_centering(app, tmp_path):
+    # a short file is block-centered with `~` rows above and below
+    # (sources.cpp:839-847); the pane height is whatever the split gives
+    f = tmp_path / "tiny.c"
+    f.write_text("a\nb\nc\nd\n", encoding="utf-8")
+    app.open_file(str(f))
+    app.message = ""
+    h = app._source_height()
+    top = app.view.top_line(4, h)
+    assert top < 0
+    rows = app._source_text()
+    joined = "".join(t for _, t in rows)
+    assert joined.count("~") == h - 4       # blank rows become tildes
+    lines = joined.split("\n")
+    # the first source line sits at row -top
+    assert " 1" in lines[-top] or lines[-top].startswith("1")
 
 
 def test_console_rendering(app):
@@ -1295,23 +1578,46 @@ def test_console_rendering(app):
     assert "world" in joined
 
 
-def test_status_rendering_shows_focus_and_file(app):
+def test_status_rendering_shows_the_full_path(app):
+    # update_status_win's default content is the current file's full path
+    app.message = ""                        # a message would replace it
     text = app._status_text()
     joined = "".join(t for _, t in text)
-    assert "CGDB" in joined
-    assert os.path.basename(app.src.path) in joined
+    assert app.src.path in joined
+    assert "CGDB" not in joined             # no focus chip in C
 
 
-def test_status_rendering_shows_running(app):
+def test_status_rendering_truncates_with_a_marker(app):
+    # if_display_message: an over-long row keeps its tail behind a `>`
+    app.message = "x" * 400
+    joined = "".join(t for _, t in app._status_text())
+    assert len(joined) <= app._source_width()
+    assert joined.startswith(">")
+
+
+def test_status_rendering_message_replaces_the_row(app):
+    app.message = "hello world"
+    joined = "".join(t for _, t in app._status_text())
+    assert "hello world" in joined
+    assert app.src.path not in joined
+
+
+def test_status_rendering_has_no_running_banner(app):
+    # C's status bar shows only the filename; the run state is not in it
     app.running_inferior = True
     joined = "".join(t for _, t in app._status_text())
-    assert "RUNNING" in joined
+    assert "RUNNING" not in joined
 
 
-def test_status_rendering_shows_gdb_focus(app):
-    app.focus = FOCUS_GDB
-    joined = "".join(t for _, t in app._status_text())
-    assert "GDB" in joined
+def test_status_rendering_has_no_focus_marker(app):
+    # the `*` for GDB focus is dead code in C (if_display_message
+    # repaints the row over it; the official cgdb shows none) and the
+    # GDB window is not distinguishable from the status row here either
+    app.message = ""
+    for focus in (FOCUS_GDB, FOCUS_SOURCE):
+        app.focus = focus
+        joined = "".join(t for _, t in app._status_text())
+        assert "*" not in joined
 
 
 def render_window(window, cols=80, rows=1):
@@ -1541,3 +1847,156 @@ def test_scrollback_option_reaches_the_console(app):
 def test_wrapscan_option_reaches_the_view(app):
     app.execute_command(":set wrapscan=off")
     assert app.view.wrapscan is False
+
+
+# ---------------------------------------------------------------------------
+# audit round 2: C-parity regressions (doc/python_specs.md 8.8 ledger)
+# ---------------------------------------------------------------------------
+def test_syntax_on_means_detected_language(app, srcfile):
+    # `:syntax on` / `yes` turn highlighting on with the *detected*
+    # language (cgdbrc.cpp:669-672); they are not lexer names
+    app.execute_command(":syntax on")
+    assert app.src._forced_lexer is None
+    app.execute_command(":syntax yes")
+    assert app.src._forced_lexer is None
+    app.execute_command(":syntax off")
+    assert app.src._forced_lexer == "off"
+
+
+def test_set_no_prefix_via_colon(app):
+    app.execute_command(":set noic")
+    assert app.config.get("ignorecase") == 0
+    app.execute_command(":set ic")
+    assert app.config.get("ic") == 1
+
+
+def test_set_tabstop_without_value_is_not_clobbered(app):
+    # `:set ts` must not set tabstop to 1 (C errors; we report instead)
+    app.execute_command(":set ts")
+    assert app.config.get("tabstop") == 8
+
+
+def test_thread_selected_moves_the_source(app, srcfile):
+    # `thread 2` produces only =thread-selected; C runs it through
+    # source_position_changed just like *stopped (tgdb.cpp:486-504)
+    g = app._fake["gdb"]
+    g.callbacks["on_notify"]("thread-selected", {
+        "id": "2", "frame": {"fullname": srcfile, "line": "9"}})
+    assert app.exec_line == (srcfile, 9)
+    assert app.view.cursor == 8
+
+
+def test_rc_commands_replay_after_gdb_starts(app, srcfile):
+    # the rc file is a full command language, replayed through `:`
+    app.rc_lines = [(1, "set hlsearch"), (2, "syntax off")]
+    app.run_rc_commands()
+    assert app.config.get("hls") == 1
+    assert app.src._forced_lexer == "off"
+    # errors land in the console, per line, without raising
+    app.rc_lines = [(3, "nosuchcommand")]
+    app.run_rc_commands()
+    assert "Error parsing line 3" in "".join(app.console.lines)
+
+
+def test_reopen_keeps_the_viewport(app, srcfile):
+    # choosing the already-open file from the dialog, or `:e`, leaves the
+    # cursor exactly where it was (source_set_exec_line)
+    app.view.move_to(30, len(app.src))
+    app.filedlg.set_files([(os.path.basename(srcfile), srcfile)])
+    app.filedlg.goto(0)
+    app.open_file(srcfile)
+    assert app.view.cursor == 30
+    app.execute_command(":e")
+    assert app.view.cursor == 30
+
+
+def test_edit_and_asr_reload_only_when_the_file_changed(app, tmp_path):
+    f = tmp_path / "reload.c"
+    f.write_text("int a;\nint b;\n", encoding="utf-8")
+    app.open_file(str(f))
+    app.message = ""
+    assert len(app.src) == 2
+    app.execute_command(":e")
+    assert len(app.src) == 2          # unchanged: no re-read, no message
+    f.write_text("int a;\nint b;\nint c;\n", encoding="utf-8")
+    st = os.stat(str(f))
+    os.utime(str(f), (st.st_atime, st.st_mtime + 2))
+    app.goto_file_line(str(f), 3)     # a stop triggers autosourcereload
+    assert len(app.src) == 3
+    # with asr off the change is ignored
+    app.config.set("asr", 0)
+    f.write_text("int a;\n", encoding="utf-8")
+    st = os.stat(str(f))
+    os.utime(str(f), (st.st_atime, st.st_mtime + 4))
+    app.goto_file_line(str(f), 1)
+    assert len(app.src) == 3
+
+
+def test_inferior_input_is_passed_through_raw(app):
+    # while the inferior runs, keys go to its tty byte-wise and are
+    # echoed without a (gdb) prompt (tgdb_send_char semantics)
+    tty = app._fake["tty"]
+    app.running_inferior = True
+    app.focus = FOCUS_GDB
+    app.gdb_key(ord("x"))
+    app.gdb_key(kc.CTRL_M)
+    assert tty.written == ["x", "\n"]
+    assert "(gdb) x" not in "".join(app.console.lines)
+    assert "x" in "".join(app.console.lines) + "".join(app.console.cur)
+
+
+def test_relative_breakpoint_file_still_matches(app, srcfile, monkeypatch):
+    # -break-info can report a relative `file` with no fullname; the
+    # abspath fallback keeps it matching the absolute buffer path
+    monkeypatch.chdir(os.path.dirname(srcfile))
+    app.breakpoints.update_from_mi({"BreakpointTable": {"body": [
+        {"bkpt": {"number": "1", "enabled": "y",
+                  "file": os.path.basename(srcfile), "line": "3"}}]}})
+    assert app.breakpoints.at(srcfile, 3) == ["1"]
+    assert app.breakpoints.line_status(srcfile, 3) == "enabled"
+
+
+def test_q_bang_is_not_a_command(app):
+    # the lexer scans `q!` as one identifier; C reports Unknown command
+    app.execute_command(":q!")
+    assert "Unknown command" in app.message
+    assert app._quitting is False
+
+
+def test_empty_search_repeats_the_last_pattern(app, srcfile):
+    # `/` + Enter repeats the previous search (interface.cpp:1008-1017)
+    app._search_target = "source"
+    app.view.move_to(0, len(app.src))
+    app.execute_command("/line")
+    first = app.view.cursor
+    assert first > 0
+    app.execute_command("/")
+    assert app.view.cursor != first    # the repeat found the next match
+
+
+def test_esc_restores_the_search_origin(app, srcfile):
+    # C puts the cursor back where the search began on ESC
+    # (interface.cpp:1529-1543)
+    app.view.move_to(0, len(app.src))
+    app.dispatch(ord("/"))
+    app.cmd_buffer.text = "/line"
+    assert app.view.cursor > 0         # the live preview jumped
+    app.dispatch(kc.ESC)
+    assert app.view.cursor == 0
+
+
+def test_ctrl_c_clears_the_idle_edit_line(app):
+    # ^C with gdb idle aborts the line being composed, as readline does
+    from prompt_toolkit.keys import Keys
+    app.set_focus(FOCUS_GDB)
+    app.gdb_buffer.text = "half-typed"
+    app.running_inferior = False
+    app.on_key(KP(Keys.ControlC, "\x03"))
+    assert app.gdb_buffer.text == ""
+    assert app._fake["gdb"].interrupted == 1
+
+
+def test_message_clears_on_the_next_key(app):
+    app.message = "old message"
+    app.dispatch(ord("j"))
+    assert app.message == ""

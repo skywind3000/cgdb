@@ -9,11 +9,13 @@ import os
 
 import pytest
 
-from cgdbpy.cgdbrc import (BOOL, INT, STRING, Config, ConfigError,
-                           LINE_DISPLAY_BLOCK, LINE_DISPLAY_LONG_ARROW,
-                           LINE_DISPLAY_SHORT_ARROW, WIN_SPLIT_EVEN,
-                           WIN_SPLIT_SRC_BIG, WIN_SPLIT_TOP_BIG,
-                           WSO_HORIZONTAL)
+from cgdbpy.cgdbrc import (
+    read_rc_commands,
+    BOOL, INT, STRING, Config, ConfigError,
+    LINE_DISPLAY_BLOCK, LINE_DISPLAY_LONG_ARROW,
+    LINE_DISPLAY_SHORT_ARROW, WIN_SPLIT_EVEN,
+    WIN_SPLIT_SRC_BIG, WIN_SPLIT_TOP_BIG,
+    WSO_HORIZONTAL, WSO_VERTICAL)
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CGDBRC_CPP = os.path.join(REPO, "cgdb", "cgdbrc.cpp")
@@ -99,10 +101,12 @@ def test_lookup_by_abbreviation():
     assert c.resolve("wmh").name == "winminheight"
 
 
-def test_lookup_is_case_insensitive():
+def test_lookup_is_case_sensitive():
+    # C's option lookup is strcmp/bsearch over the table -- case matters
     c = Config()
-    assert c.resolve("TABSTOP").name == "tabstop"
-    assert c.resolve("TS").name == "tabstop"
+    assert c.resolve("TABSTOP") is None
+    assert c.resolve("TS") is None
+    assert c.resolve("tabstop").name == "tabstop"
 
 
 def test_lookup_by_unambiguous_prefix():
@@ -181,10 +185,46 @@ def test_set_string_without_choices_accepts_anything():
     assert c.get("syntax") == "rust"
 
 
-def test_set_with_no_value_defaults_to_one():
+def test_set_with_no_value():
+    # a bare boolean turns on; an int option *reports* its value instead of
+    # being clobbered to 1 (C errors there -- `set tabstop` must never
+    # break the rendering the way tabstop=1 would)
     c = Config()
     assert c.set("hlsearch") == 1
-    assert c.set("tabstop") == 1
+    assert c.set("tabstop") == 8
+
+
+def test_set_no_prefix_clears_a_boolean():
+    # command_parse_set strips a leading "no" (cgdbrc.cpp:910-915)
+    c = Config()
+    c.set("hlsearch")
+    assert c.set("nohlsearch") == 0
+    assert c.get("hls") == 0
+    assert c.set("noic") == 0
+
+
+def test_set_no_prefix_rejected_for_non_boolean():
+    c = Config()
+    with pytest.raises(ConfigError):
+        c.set("notabstop")
+
+
+def test_set_values_are_case_insensitive():
+    # every C value parser uses strcasecmp
+    c = Config()
+    assert c.set("winsplit", "SRC_BIG") == WIN_SPLIT_SRC_BIG
+    assert c.set("wso", "VERTICAL") == WSO_VERTICAL
+
+
+def test_arrowstyle_writes_executinglinedisplay():
+    # command_set_arrow_style is the deprecated alias of eld
+    c = Config()
+    c.set("arrowstyle", "highlight")
+    assert c.get("eld") == "highlight"
+    c.set("executinglinedisplay", "shortarrow")
+    assert c.get("as") == "shortarrow"
+    with pytest.raises(ConfigError):
+        c.set("arrowstyle", "block")     # C rejects block for the alias
 
 
 def test_set_calls_on_change_hook():
@@ -200,58 +240,46 @@ def test_set_calls_on_change_hook():
 # ---------------------------------------------------------------------------
 # command lines
 # ---------------------------------------------------------------------------
-def test_execute_set_with_value():
+def test_apply_set_with_value():
     c = Config()
-    c.execute("set tabstop=4")
+    c.apply_set("tabstop=4")
     assert c.get("tabstop") == 4
 
 
-def test_execute_set_with_spaces():
+def test_apply_set_with_spaces():
     c = Config()
-    c.execute("set   tabstop = 6 ")
+    c.apply_set("  tabstop = 6 ")
     assert c.get("tabstop") == 6
 
 
-def test_execute_set_bare_bool():
+def test_apply_set_bare_bool():
     c = Config()
-    c.execute("set hlsearch")
+    c.apply_set("hlsearch")
     assert c.get("hls") == 1
 
 
-def test_execute_set_bare_string_returns_current():
+def test_apply_set_bare_string_returns_current():
     c = Config()
-    assert c.execute("set winsplit") == WIN_SPLIT_EVEN
+    assert c.apply_set("winsplit") == WIN_SPLIT_EVEN
 
 
-def test_execute_set_all_returns_every_option():
+def test_apply_set_all_returns_every_option():
     c = Config()
-    out = c.execute("set all")
+    out = c.apply_set("all")
     assert isinstance(out, list)
     assert len(out) == len(EXPECTED)
     assert "tabstop=8" in out
 
 
-def test_execute_set_empty_returns_every_option():
+def test_apply_set_empty_returns_every_option():
     c = Config()
-    assert len(c.execute("set")) == len(EXPECTED)
+    assert len(c.apply_set("")) == len(EXPECTED)
 
 
-def test_execute_unknown_option():
-    c = Config()
-    with pytest.raises(ConfigError):
-        c.execute("set nosuchoption=1")
-
-
-def test_execute_non_set_command():
+def test_apply_set_unknown_option():
     c = Config()
     with pytest.raises(ConfigError):
-        c.execute("map abc def")
-
-
-def test_execute_blank_is_a_noop():
-    c = Config()
-    assert c.execute("") is None
-    assert c.execute("   ") is None
+        c.apply_set("nosuchoption=1")
 
 
 def test_describe_bool_shows_on_off():
@@ -270,33 +298,32 @@ def test_describe_int_and_string():
 # ---------------------------------------------------------------------------
 # rc files
 # ---------------------------------------------------------------------------
-def test_load_file(tmp_path):
+def test_read_rc_commands(tmp_path):
+    # the rc file is a full command language (command_parse_file): set
+    # lines, map lines, anything a `:` line accepts
     p = tmp_path / ".cgdbrc"
-    p.write_text("# a comment\n\nset tabstop=4\nset hlsearch\n"
+    p.write_text("# a comment\n\nset tabstop=4\nmap a b\n"
                  "set winsplit=src_big\n", encoding="utf-8")
-    c = Config()
-    errors = c.load_file(str(p))
-    assert errors == []
-    assert c.get("tabstop") == 4
-    assert c.get("hls") == 1
-    assert c.get("winsplit") == WIN_SPLIT_SRC_BIG
+    cmds = read_rc_commands(str(p))
+    assert [c for _, c in cmds] == ["set tabstop=4", "map a b",
+                                    "set winsplit=src_big"]
 
 
-def test_load_file_collects_errors_without_aborting(tmp_path):
+def test_read_rc_commands_strips_leading_colon_and_inline_comment(tmp_path):
     p = tmp_path / ".cgdbrc"
-    p.write_text("set tabstop=4\nset bogus=1\nset hlsearch\n", encoding="utf-8")
-    c = Config()
-    errors = c.load_file(str(p))
-    assert len(errors) == 1
-    assert "bogus" in errors[0]
-    assert ":2:" in errors[0]           # line number is reported
-    # the good lines still applied
-    assert c.get("tabstop") == 4
-    assert c.get("hls") == 1
+    p.write_text(":set hlsearch   # vim style\n", encoding="utf-8")
+    assert read_rc_commands(str(p)) == [(1, "set hlsearch")]
 
 
-def test_load_file_ignores_comments_and_blanks(tmp_path):
+def test_read_rc_commands_joins_continuations(tmp_path):
+    p = tmp_path / ".cgdbrc"
+    p.write_text("set hlsearch \\\n   on # long line\n", encoding="utf-8")
+    # a trailing backslash joins lines; the joined line keeps the first
+    # line's number
+    assert read_rc_commands(str(p)) == [(1, "set hlsearch     on")]
+
+
+def test_read_rc_commands_ignores_comments_and_blanks(tmp_path):
     p = tmp_path / ".cgdbrc"
     p.write_text("# only a comment\n\n   \n", encoding="utf-8")
-    c = Config()
-    assert c.load_file(str(p)) == []
+    assert read_rc_commands(str(p)) == []

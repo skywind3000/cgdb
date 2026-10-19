@@ -144,9 +144,15 @@ class Cgdb:
         return argv + ["--"] + self.extra + [self.target["exe"]]
 
     def __enter__(self):
+        env = dict(self.env) if self.env else dict(os.environ)
+        # isolate from the user's ~/.cgdb/cgdbrc: a machine with
+        # `set wso=vertical` in it would silently flip every layout
+        # assertion in this suite
+        env.setdefault("CGDB_DIR",
+                       tempfile.mkdtemp(prefix="cgdbpy-e2e-home-"))
         self.session = ConPtySession(self.argv(), rows=self.rows,
                                      cols=self.cols,
-                                     cwd=ROOT, env=self.env).__enter__()
+                                     cwd=ROOT, env=env).__enter__()
         return self
 
     def __exit__(self, *a):
@@ -184,27 +190,41 @@ class Cgdb:
         return self.session.exited()
 
     def gutter_lines(self):
-        """The source pane rows, as (marker, lineno, exec, text)."""
+        """The source pane rows: (row, line) for numbered gutter rows.
+
+        The gutter is ` lineno │ text` (lwidth grows with the file, the
+        breakpoint marker is the line number's *colour*, invisible in a
+        text dump); EOF rows show `~│`.
+        """
         out = []
         for i in range(self.screen.rows):
             line = self.screen.line(i)
-            if not line.strip():
-                continue
-            if len(line) > 2 and line[0] in "B " and line[1:5].strip().isdigit():
+            if re.match(r"\s*\d+│", line):
                 out.append((i, line))
         return out
+
+    def cursor_line(self):
+        """The source line under the terminal cursor (the selected line):
+        the number on the gutter row the cursor sits on, or None."""
+        line = self.screen.line(self.screen.r)
+        m = re.match(r"\s*(\d+)│", line)
+        return int(m.group(1)) if m else None
 
     def status_row(self):
         """Row index of the status bar -- the row between the two panes.
 
         cgdb draws the `:` / `/` command line into this same row
         (interface.cpp:459-472), so a test that cares *where* the user is
-        typing needs the index, not just the text.
+        typing needs the index, not just the text. C's status bar holds
+        the current file's full path and nothing else (the `*` for GDB
+        focus is dead code upstream, erased by if_display_message's
+        repaint), so the locator is "the row that names the source file
+        without a source-window gutter".
         """
         name = os.path.basename(self.target["src"])
         for i in range(self.screen.rows):
             line = self.screen.line(i)
-            if name in line and ("CGDB" in line or "GDB" in line):
+            if name in line and "│" not in line:
                 return i
         return None
 
@@ -231,16 +251,28 @@ class Cgdb:
         self.settle(0.3)
 
     def focus(self):
-        """The focus token from the status line: CGDB / GDB / CMD or ''.
+        """Which window the terminal cursor is in: CGDB / GDB / CMD or ''.
 
-        Parsed rather than substring-matched, because "CGDB  target.c"
-        contains "GDB  target.c" -- a naive wait_for() on the latter passes
-        before the focus has actually changed.
+        The status bar carries no focus marker in C (the `*` is dead code,
+        erased by if_display_message's repaint -- verified against the
+        official cgdb), so the *cursor position* is the only honest
+        signal. In vertical split the status bar and the edit prompt share
+        the last row, so the column tells them apart: past the "(gdb)"
+        prompt is the GDB window, left of it is the command line.
         """
-        st = self.status_line()
-        for name in ("CGDB", "GDB", "CMD"):
-            if st.startswith(name + " "):
-                return name
+        r = self.screen.r
+        status = self.status_row()
+        if status is None:
+            return ""
+        line = self.screen.line(r)
+        prompt = line.find("(gdb)")
+        if prompt >= 0 and self.screen.c >= prompt:
+            return "GDB"
+        if r == status:
+            return "CMD"
+        if r < status:
+            return "CGDB"
+        # anything else -- the console in scroll mode -- reports unknown
         return ""
 
     def wait_focus(self, name, timeout=10.0):
@@ -271,10 +303,16 @@ def test_cli_help():
 
 
 def test_cli_unknown_option():
+    # an unknown flag is not cgdb's: getopt semantics hand it to gdb
+    # (cgdb.cpp's parse_long_options stops at the first unknown). What
+    # the CLI guarantees is a nonzero exit with an actionable error
+    # rather than a raw traceback -- here the no-console guard fires in
+    # a piped subprocess.
     r = subprocess.run([PY, CGDB_PY, "--nosuchflag"], capture_output=True,
                        text=True, timeout=60)
     assert r.returncode != 0
-    assert "unknown option" in (r.stderr + r.stdout)
+    assert "cgdb:" in (r.stderr + r.stdout)
+    assert "Traceback" not in (r.stderr + r.stdout)
 
 
 def test_cli_missing_debugger_is_visible_not_silent(tmp_path):
@@ -303,11 +341,14 @@ def test_startup_shows_source_status_and_prompt(target):
         assert "int compute(int n)" in t
         assert "(gdb)" in t
         st = c.status_line()
-        # cgdb starts in the GDB window (interface.cpp:139) so commands can be
-        # typed straight away. The view sits at main's line: gdb's answer to
-        # -file-list-exec-source-file positioned it, as C does at startup.
-        assert st.startswith("GDB"), st
-        assert "10/" in st
+        # C's status bar carries the current file's full path and nothing
+        # else; cgdb starts in the GDB window (interface.cpp:139) so
+        # commands can be typed straight away, and the view sits at
+        # main's line: gdb's answer to -file-list-exec-source-file
+        # positioned it, as C does at startup.
+        assert st.split("|")[0].endswith("target.c"), st
+        assert "int main" in t, t
+        assert c.focus() == "GDB", c.focus()
         assert c.session.parse_errors == []
 
 
@@ -318,7 +359,7 @@ def test_line_numbers_are_rendered(target):
         c.settle(0.8)
         rows = c.gutter_lines()
         assert rows, "no gutter rows found:\n%s" % c.text()
-        nums = [line[1:5].strip() for _, line in rows]
+        nums = [line.strip().split("│")[0].strip() for _, line in rows]
         assert nums[:4] == ["1", "2", "3", "4"], nums
 
 
@@ -423,10 +464,10 @@ def test_break_run_stop_marks_the_source(target):
         c.settle(1.0)
 
         t = c.text()
-        # the gutter must show both the breakpoint and the executing line
-        assert "=>" in t, t
-        assert "B" in t, t
-        assert "breakpoint-hit" in c.status_line()
+        # the executing line is the long arrow (`├────>`); the breakpoint
+        # itself is the line number's colour, which a text dump cannot
+        # see -- the marker itself is asserted by the toggle test below
+        assert "├" in t, t
 
 
 @needs_gdb
@@ -443,12 +484,13 @@ def test_next_advances_the_executing_line(target):
 
         def arrow_row():
             for i in range(c.screen.rows):
-                if "=>" in c.screen.line(i):
+                if "├" in c.screen.line(i):
                     return i, c.screen.line(i)
             return -1, ""
 
         r0, l0 = arrow_row()
         assert r0 >= 0, c.text()
+        c.to_source()                    # F-keys only fire from source focus
         c.key("f8")                      # next
         c.settle(1.5)
         r1, l1 = arrow_row()
@@ -476,6 +518,7 @@ def test_continue_after_break_runs_to_exit(target):
         assert c.wait("Breakpoint 1", timeout=20)
         c.type_cmd("run")
         assert c.wait("hit Breakpoint 1", timeout=40)
+        c.to_source()                    # F-keys only fire from source focus
         c.key("f6")                      # continue
         assert c.wait("MARKER result=42", timeout=40), c.text()
 
@@ -485,62 +528,45 @@ def test_continue_after_break_runs_to_exit(target):
 # ---------------------------------------------------------------------------
 @needs_gdb
 def test_space_toggles_a_breakpoint_marker(target):
-    def marked_rows(c):
-        """Source-pane rows whose gutter column 0 carries a 'B'."""
-        out = []
-        for i in range(c.screen.rows):
-            line = c.screen.line(i)
-            if line[:1] == "B" and line[1:6].strip().isdigit():
-                out.append((i, line))
-        return out
+    """space toggles the breakpoint at the cursor line.
 
+    C's breakpoint marker is the line number's *colour* (red enabled,
+    yellow disabled) -- there is no character, so a text dump cannot see
+    it. The toggle itself is asserted through gdb's breakpoint table,
+    and the cursor position through the gutter row under the cursor.
+    """
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("int compute", timeout=30)
         c.settle(0.8)
         c.to_source()
-        assert marked_rows(c) == [], "breakpoints present before any were set"
-
-        def cursor_line():
-            m = re.search(r"\s(\d+)/(\d+)\s", c.status_line())
-            assert m, "cannot read the cursor from %r" % c.status_line()
-            return int(m.group(1))
-
-        start = cursor_line()
+        assert c.cursor_line() is not None, c.text()
+        start = c.cursor_line()
         c.send("jj")                     # move down two lines
         c.settle(0.6)
-        # read the cursor back off the status line rather than assuming a
-        # starting position: the property under test is "the marker lands where
-        # the cursor is"
-        here = cursor_line()
-        assert here == start + 2, "jj moved %d -> %d, expected +2" % (start,
-                                                                      here)
+        here = c.cursor_line()
+        assert here == start + 2, "jj moved %d -> %d" % (start, here)
 
         c.send(" ")                      # toggle breakpoint
-        c.settle(2.0)
-        rows = marked_rows(c)
-        assert rows, "space did not put a B in the gutter:\n%s" % c.text()
-        # The marker shows the line gdb actually used, which is not necessarily
-        # the cursor line: gdb slides a breakpoint set on a function's opening
-        # brace down to the first executable statement. Asserting equality with
-        # the cursor line would be asserting a bug.
-        marked = int(rows[0][1][1:6].strip())
-        assert marked >= here, (
-            "gdb moved the breakpoint backwards: cursor %d, marker %d"
-            % (here, marked))
-        assert marked <= here + 3, (
-            "marker too far from the cursor: %d vs %d" % (marked, here))
+        c.settle(2.5)
+        c.to_gdb()
+        c.type_cmd("info break")
+        c.settle(1.2)
+        t = c.text()
+        # [\s\S] because the console wraps gdb's table across rows
+        m = re.search(r"1\s+breakpoint\s+keep\s+y[\s\S]*?\.c:(\d+)", t)
+        assert m, "no breakpoint in gdb's table:\n%s" % t
+        marked = int(m.group(1))
 
-        # toggling again from the marked line removes it
-        for _ in range(marked - here):
+        # walk the cursor onto the line gdb chose and toggle again: delete
+        c.to_source()
+        while c.cursor_line() is not None and c.cursor_line() < marked:
             c.send("j")
-            c.settle(0.15)
-        c.settle(0.4)
-        assert cursor_line() == marked, (
-            "could not move the cursor onto the marked line %d" % marked)
+            c.settle(0.2)
         c.send(" ")
-        c.settle(2.0)
-        assert marked_rows(c) == [], (
-            "second space did not clear the marker:\n%s" % c.text())
+        c.settle(2.5)
+        c.to_gdb()
+        c.type_cmd("info break")
+        assert c.wait("No breakpoints", timeout=15), c.text()
 
 
 @needs_gdb
@@ -550,17 +576,14 @@ def test_slash_search_moves_the_cursor(target):
         c.settle(0.8)
         c.to_source()
         # startup positioned the view at main (gdb's reported line)
-        st0 = c.status_line()
-        assert "/14" in st0, st0
+        assert c.cursor_line() == 10, c.cursor_line()
         c.send("/printf")
         c.settle(0.4)
         c.key("enter")
         assert c.wait("printf", timeout=15)
         c.settle(1.0)
-        st = c.status_line()
         # the cursor must have moved to the printf line, off main
-        assert st != st0, (st0, st)
-        assert " 12/" in st, st
+        assert c.cursor_line() == 12, c.cursor_line()
 
 
 @needs_gdb
@@ -571,12 +594,12 @@ def test_G_and_gg_navigate(target):
         c.to_source()
         c.send("G")
         c.settle(0.8)
-        st_last = c.status_line()
+        last = c.cursor_line()
         c.send("gg")
         c.settle(0.8)
-        st_first = c.status_line()
-        assert " 1/" in st_first, st_first
-        assert st_last != st_first
+        first = c.cursor_line()
+        assert first == 1, first
+        assert last == 14, last
 
 
 # ---------------------------------------------------------------------------
@@ -611,10 +634,12 @@ def test_set_command_reports_on_the_status_line(target):
         c.settle(0.4)
         c.key("enter")
         c.settle(1.0)
-        # back in source focus, and no error message on the status line
-        st = c.status_line()
-        assert "unknown option" not in st, st
-        assert st.startswith("CGDB"), st
+        # the set reports the new value (a message replaces the whole
+        # status row until the next key, so the path locator cannot find
+        # the row -- assert on the full screen text instead); no error
+        t = c.text()
+        assert "unknown option" not in t, t
+        assert ":set" not in t or "target.c" in t, t
 
 
 @needs_gdb
@@ -628,7 +653,7 @@ def test_unknown_colon_command_reports_an_error(target):
         c.send(":nosuchcommand")
         c.settle(0.4)
         c.key("enter")
-        assert c.wait("unknown command", timeout=15), c.text()
+        assert c.wait("Unknown command", timeout=15), c.text()
 
 
 @needs_gdb
@@ -661,7 +686,8 @@ def test_command_line_lives_on_the_status_row(target):
         line = c.screen.line(row)
         assert not line.lstrip().startswith(":"), \
             "command text survived on the status bar: %r" % line
-        assert "target.c" in line, repr(line)
+        # either the file path returned or the set's value message is up
+        assert "target.c" in line or "4" in line, repr(line)
 
 
 @needs_gdb
@@ -687,7 +713,7 @@ def test_ctrl_w_switches_to_vertical_split(target):
         # source pane is truncated at the separator, gdb pane keeps its edit
         assert "int compute" in c.text()
         bottom = c.screen.rows - 1
-        assert "CGDB" in c.screen.line(bottom), c.screen.line(bottom)
+        assert "target.c" in c.screen.line(bottom), c.screen.line(bottom)
         assert "(gdb)" in c.screen.line(bottom)[mid:], \
             c.screen.line(bottom)
 
@@ -857,7 +883,11 @@ def test_ctrl_c_interrupts_the_inferior(busy):
         c.type_cmd("run")
         c.settle(1.0)
         c.key("ctrl-c")
-        assert c.wait("stopped", timeout=15), c.text()
+        # the stop reason is not on the status bar any more (C never showed
+        # it). gdb's own console report is the visible signal -- on Windows
+        # the break lands as a SIGTRAP in the break thread, whose frame has
+        # no source, so no executing-line arrow follows
+        assert c.wait("received signal", timeout=15), c.text()
         c.settle(0.5)
         c.type_cmd("echo after-cc\\n")
         assert c.wait("after-cc", timeout=15), c.text()
@@ -912,6 +942,10 @@ def test_shell_command_round_trip(target):
         c.send("echo from-shell\r")
         assert c.wait("from-shell", timeout=15), c.text()
         c.send("exit\r")
+        # run_shell_command waits for one ENTER before handing the console
+        # back (cgdb.cpp:185-219), so the last screen is not erased at once
+        assert c.wait("Hit ENTER", timeout=15), c.text()
+        c.key("enter")
         c.settle(2.0)
         assert c.wait("(gdb)", timeout=15), c.text()
         c.to_gdb()

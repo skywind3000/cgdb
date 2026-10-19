@@ -158,10 +158,31 @@ def test_utf8_is_not_split_on_wrap():
 
 
 def test_cjk_characters():
+    # vterm counts a wide char as two cells: 4 CJK chars fill 8 columns
     committed, cur, col = lines_of("中文测试", width=8)
     assert committed == []
     assert cur == "中文测试"
-    assert col == 4
+    assert col == 8
+
+
+def test_cjk_wraps_at_display_columns():
+    committed, cur, col = lines_of("中文中文", width=6)
+    # 3 wide chars fill the 6-column row exactly; the 4th wraps whole
+    assert committed == ["中文中"]
+    assert cur == "文"
+    assert col == 2
+
+
+def test_ansi_escapes_are_consumed():
+    m = ConsoleModel(width=80)
+    m.add_bytes(b"\x1b[31mred\x1b[0m plain\n")
+    assert list(m.lines) == ["red plain"]
+
+
+def test_osc_and_charset_escapes_are_consumed():
+    m = ConsoleModel(width=80)
+    m.add_bytes(b"\x1b]0;title\x07a\x1b(Bb\n")
+    assert list(m.lines) == ["ab"]
 
 
 def test_utf8_split_across_add_bytes_calls():
@@ -218,13 +239,15 @@ def test_scrollback_trims_oldest():
     assert list(m.lines) == ["3", "4", "5"]
 
 
-def test_set_scrollback_trims_immediately():
+def test_set_scrollback_is_stored_not_applied():
+    # scroller.cpp reads scrollbackbuffersize once, at creation
+    # (cgdbrc.cpp:330-333); changing it live has no effect in C either
     m = ConsoleModel(width=80, scrollback=100)
     m.add_text("".join("%d\n" % i for i in range(50)))
     assert len(m.lines) == 50
     m.set_scrollback(10)
-    assert len(m.lines) == 10
-    assert list(m.lines)[-1] == "49"
+    assert len(m.lines) == 50
+    assert m.scrollback == 10
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +269,13 @@ def test_visible_lines_scrolled_back():
     assert got == ["L11", "L12", "L13", "L14", "L15"]
 
 
-def test_visible_lines_pads_when_short():
+def test_visible_lines_tops_when_short():
+    # vterm writes from row 0: sparse output sits at the TOP and the
+    # bottom stays blank, instead of being padded down to the bottom
     m = ConsoleModel(width=80)
     m.add_text("only\n")
     got = m.visible_lines(height=4, delta=0)
-    assert len(got) == 4
-    assert got[-2:] == ["only", ""]
+    assert got == ["only", ""]
 
 
 def test_visible_lines_includes_current_line():

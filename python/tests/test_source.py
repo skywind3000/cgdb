@@ -366,18 +366,23 @@ def test_move_to_clamps():
     assert v.cursor == total - 1
 
 
-def test_move_to_scrolls_down():
+def test_top_line_is_derived_centered():
+    # the window no longer scrolls incrementally: source_display derives
+    # the top line from the cursor on every frame (sources.cpp:837-847)
     v, total = make_view(height=10)
     v.move_to(15, total)
     assert v.cursor == 15
-    assert v.top == 6              # 15 - 10 + 1
-
-
-def test_move_to_scrolls_up():
-    v, total = make_view(height=10)
-    v.move_to(50, total)
+    assert v.top_line(total) == 15 - 5    # cursor centered
     v.move_to(3, total)
-    assert v.top == 3
+    assert v.top_line(total) == 0         # clamped at the top
+
+
+def test_top_line_centers_short_files():
+    v, total = make_view(height=10)
+    assert v.top_line(4, 10) == -3        # block-centered, tildes above
+    assert v.top_line(10, 10) == 0
+    v.move_to(10, 20)
+    assert v.top_line(20, 10) == 5
 
 
 def test_ensure_visible_is_minimal():
@@ -501,7 +506,21 @@ def test_search_ignorecase():
         s = SourceFile(p)
         v = SourceView(height=5)
         assert v.search_in(s, "ALPHA", ignorecase=False) is None
+        # from a line that is not the match, the wrapped search finds it
+        v.move_to(2, len(s))
         assert v.search_in(s, "ALPHA", ignorecase=True) == 0
+    finally:
+        os.unlink(p)
+
+
+def test_search_wrap_excludes_the_start_row():
+    # sources.cpp's wrap loop never retests line_start: the sole match
+    # being the current line reads as "not found"
+    p = make_search_file()
+    try:
+        s = SourceFile(p)
+        v = SourceView(height=5)
+        assert v.search_in(s, "alpha", ignorecase=True) is None
     finally:
         os.unlink(p)
 
