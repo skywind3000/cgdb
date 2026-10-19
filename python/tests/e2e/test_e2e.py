@@ -1084,3 +1084,30 @@ def test_key_latency_is_not_the_500ms_escape_bug(target):
         assert dt < 0.45, (
             "ESC took %.3f s; prompt_toolkit's default ttimeoutlen (0.5 s) is "
             "probably not being overridden by cgdb's 100 ms setting" % dt)
+
+
+@needs_gdb
+def test_help_shows_the_builtin_cheatsheet(target):
+    """:help swaps in a built-in key reference -- C opens the tgdb help
+    file, which this port does not ship, so the reference is compiled in:
+    modes and window switching, the F-keys, the common motions, and the
+    file/breakpoint keys. q (or ESC) closes it."""
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("int compute", timeout=30)
+        c.settle(0.5)
+        c.to_source()
+        c.send(":help")
+        c.settle(0.4)
+        c.key("enter")
+        assert c.wait("key reference", timeout=10), c.text()
+        t = c.text()
+        for needle in ("ESC", "F5 run", "F10 step", "h j k l",
+                       "Ctrl-U/D", "gg / G", "space",
+                       "open the file dialog"):
+            assert needle in t, needle
+        # the page replaces the whole screen while open
+        assert "int compute" not in t
+        c.send("q")
+        c.settle(0.5)
+        assert "key reference" not in c.text()
+        assert c.wait("int compute", timeout=10), c.text()

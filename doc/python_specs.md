@@ -57,7 +57,7 @@ python -m pytest tests/ -q                                                      
 | 测试总数 | **714 全绿**（从推送后的全新克隆复跑验证过） |
 | 代码量 | `cgdbpy/` 3,576 行 + `cgdb.py` 203 行；测试 4,980 行 |
 | 启动到首帧 | ~260 ms（解释器 31 + import ptk 131 + 首帧 98） |
-| ESC 键延迟 | ~107 ms（受 `ttimeoutlen=100` 支配，见 §7.3） |
+| ESC 键延迟 | 旧默认 100ms 时 ~107 ms；2026-10-19 起默认 `ttimeoutlen=50`，体感即切（见 §7.3） |
 | 普通键延迟 | 0–4 ms |
 | MI 往返 | 中位 117 µs（gdb 侧）+ 30 µs（Python 侧） |
 | MI 摄入吞吐 | ~2 MB/s / ~50k 行/s |
@@ -664,7 +664,7 @@ ptk 从**顶部**开始显示 formatted text；在顶部补空行会把真实内
 | `showmarks` | `showmarks` | bool | on | gutter 是否显示标记列 |
 | `cgdbmodekey` | — | string | `esc` | 支持 `esc` / `tab` / `ctrl-g` |
 | `timeoutlen` | `tm` | int | 1000 | kui 映射超时（ms） |
-| `ttimeoutlen` | `ttm` | int | 100 | ⚠️ **直接决定 ESC 延迟**，见 §7.3 |
+| `ttimeoutlen` | `ttm` | int | 50 | ⚠️ **直接决定 ESC 延迟**，见 §7.3；C 默认 100，本移植改 50（用户反馈 100 手感偏慢） |
 | `winminheight` | `wmh` | int | 0 | `=`/`-` 调整的下限（横向分屏） |
 | `winminwidth` | `wmw` | int | 0 | `=`/`-` 调整的下限（纵向分屏） |
 | `winsplit` | `winsplit` | string | `even` | 1/4 分割刻度，`src_big`/`src_full`/`gdb_big`/`gdb_full`（`top_*`/`bottom_*` 为兼容旧写法） |

@@ -2222,28 +2222,42 @@ class CgdbApp:
         return [("class:status", text)]
 
     def _help_text(self):
+        """The :help cheatsheet, kept to one screen on purpose.
+
+        C swaps in the tgdb help *file* (a full manual); this port has no
+        such file and shows this built-in reference instead -- modes and
+        window switching first, then what the F-keys do, then the common
+        motions and the file/breakpoint keys.
+        """
         lines = [
             "CGDB (Python) -- key reference",
             "",
-            "ESC    switch to the source window      i / s    switch to the GDB window (s = scroll mode)",
-            "j k    move (with a count prefix)         h l     scroll the source columns",
-            "Ctrl-D/U, Ctrl-F/B, PageUp/Down           gg / G  top / bottom (G with a count goes to the line)",
-            "m<ch>  set mark a-z (same line: remove)   '<ch>   jump to mark; '' back; '. the executing line",
-            "/ ?    search forward / backward          n N     next / previous match",
-            "space  toggle breakpoint at the cursor    t       temporary breakpoint",
-            "F5     run    F6 continue    F7 finish    F8 next    F10 step",
-            "u      run until the cursor line          o       open the file dialog",
-            "Ctrl-W toggle split orientation           = - + _ resize the split",
-            ":      command line (:set, :map, :q ...)  Ctrl-L  redraw",
-            "Ctrl-C interrupt the inferior             q here  close this help",
+            "modes",
+            "  ESC   to the source window        i     to the GDB window",
+            "  s     GDB window, scroll mode     :     command line",
             "",
-            "press q to exit help",
+            "function keys (source window)",
+            "  F5 run   F6 continue   F7 finish   F8 next   F10 step",
+            "",
+            "moving around (source window)",
+            "  h j k l   move, h/l scrolls      gg / G   top / bottom",
+            "  Ctrl-F/B, PageUp/PageDown         Ctrl-U/D   page / half page",
+            "  / ? n N   search                  5j   a count moves 5 lines",
+            "",
+            "files and breakpoints (source window)",
+            "  space     toggle breakpoint       t     temporary breakpoint",
+            "  o         open the file dialog    u     run until this line",
+            "",
+            "misc: Ctrl-W split, = - + _ resize, Ctrl-L redraw,",
+            "      Ctrl-C interrupt, m/' marks -- q or ESC closes this page",
         ]
         out = []
         for i, text in enumerate(lines):
             if i:
                 out.append(("", "\n"))
-            cls = "class:filedlg.label" if i in (0, len(lines) - 1) else ""
+            cls = "class:filedlg.label" if i == 0 else ""
+            if text and text.endswith(":") and len(text) < 30:
+                cls = "class:filedlg.label"
             out.append((cls, text))
         return out
 
