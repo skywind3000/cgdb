@@ -98,37 +98,62 @@ COLOR_STYLE = {
     "error": "bg:#ff5555 #ffffff",
     "diffdel": "#ff5555",
     "diffins": "#50fa7b",
-    # chrome
+    # chrome. The interface groups mirror highlight_groups.cpp's defaults:
+    # enabled/disabled breakpoints and the executing line number colour the
+    # line NUMBER (bold red / bold yellow / bold green); arrows are bold
+    # green (executing) and bold white (selected); blocks are reverse video.
     "line-number": "#6272a4",
     "line-number.current": "bold #f8f8f2",
+    "line-number.executing": "bold #50fa7b",
     "breakpoint": "bold #ff5555",
+    "breakpoint.disabled": "bold #ffcb6b",
     "exec-arrow": "bold #50fa7b",
+    "sel-arrow": "bold #f8f8f2",
+    "exec-block": "reverse #50fa7b",
+    "sel-block": "reverse #f8f8f2",
+    "exec-line-highlight": "bold bg:#50fa7b #282a36",
+    "mark": "bold #f8f8f2",
+    "vline": "#6272a4",
+    "vline-focus": "bold #6272a4",
     "selected-line": "bg:#2e4a62",
     "status": "bg:#44475a #f8f8f2",
-    "status.focus": "bg:#50fa7b #282a36",
     "command": "bold #f8f8f2",
     "console": "",
     "console.prompt": "bold #50fa7b",
     "search-match": "bg:#ffb86c #282a36",
+    "scroll-status": "bold",
     "filedlg": "",
     "filedlg.label": "bold",
-    "filedlg.selected": "bg:#44475a #f8f8f2",
+    "filedlg.selnum": "bold",
+    "filedlg.arrow": "bold #50fa7b",
     "filedlg.filler": "#6272a4",
     "border": "#6272a4",
 }
 
 MONO_STYLE = {k: "" for k in COLOR_STYLE}
-# keep structural emphasis even without colour
+# keep structural emphasis even without colour -- the same groups C marks
+# SWIN_A_BOLD (arrows, line numbers, breakpoints, marks) stay bold, the
+# reverse-video groups (status bar, blocks) stay reverse
 MONO_STYLE.update({
     "line-number.current": "bold",
+    "line-number.executing": "bold",
     "breakpoint": "bold",
+    "breakpoint.disabled": "bold",
     "exec-arrow": "bold",
+    "sel-arrow": "bold",
+    "exec-block": "reverse",
+    "sel-block": "reverse",
+    "exec-line-highlight": "bold",
+    "mark": "bold",
+    "vline-focus": "bold",
     "selected-line": "bold",
     "status": "reverse",
-    "status.focus": "bold reverse",
     "command": "bold",
     "search-match": "reverse",
+    "scroll-status": "bold",
     "filedlg.label": "bold",
+    "filedlg.selnum": "bold",
+    "filedlg.arrow": "bold",
     "filedlg.selected": "reverse",
 })
 

@@ -37,6 +37,12 @@ class SourceFile:
         self.encoding = encoding
         if text is None:
             text, self.encoding = self._read(path)
+        self._mtime = None
+        if path and text is not None and os.path.exists(path):
+            try:
+                self._mtime = os.path.getmtime(path)
+            except OSError:
+                pass
         # keepends=False but remember whether the file was CRLF so that
         # re-display and column maths stay consistent (testsuite cases_files
         # exercises CRLF + CJK sources)
@@ -81,6 +87,34 @@ class SourceFile:
             return self.lines[i]
         return ""
 
+    def changed_on_disk(self):
+        """True when the file's mtime moved after it was loaded.
+
+        source_reload's dirty test (sources.cpp:1387-1388): autosourcereload
+        and `:e` re-read only when this says so.
+        """
+        if self._mtime is None or not self.path:
+            return False
+        try:
+            return os.path.getmtime(self.path) != self._mtime
+        except OSError:
+            return False
+
+    def display_max_width(self, tabstop=8):
+        """Longest line in display columns (tabs expanded).
+
+        sources.cpp clamps sel_col to `max_width - width + lwidth + 6`;
+        this is that max_width. Cached per tabstop -- it walks every line,
+        which has no business running per frame.
+        """
+        cache = getattr(self, "_max_width_cache", None)
+        if cache is None or cache[0] != tabstop:
+            w = max((len(l.expandtabs(tabstop)) for l in self.lines),
+                    default=0)
+            cache = (tabstop, w)
+            self._max_width_cache = cache
+        return cache[1]
+
     # --- highlighting -----------------------------------------------------
     @property
     def lex_state(self):
@@ -89,14 +123,19 @@ class SourceFile:
     def lexer(self):
         forced = getattr(self, "_forced_lexer", None)
         if forced is not None:
-            # :syntax <name> -- force a lexer ("" means plain text, "off")
-            if forced in ("", "off"):
+            # :syntax <name> -- force a lexer. "on"/"yes" keep auto detection
+            # (command_parse_syntax: they only turn highlighting back on);
+            # ""/"off"/"no" mean plain text.
+            if forced in ("", "off", "no"):
                 return TextLexer()
-            try:
-                return get_lexer_by_name(forced, stripnl=False,
-                                         stripall=False, ensurenl=False)
-            except Exception:
-                pass              # unknown name: fall through to detection
+            if forced in ("on", "yes"):
+                forced = None
+            else:
+                try:
+                    return get_lexer_by_name(forced, stripnl=False,
+                                             stripall=False, ensurenl=False)
+                except Exception:
+                    pass          # unknown name: fall through to detection
         try:
             return get_lexer_for_filename(self.path, stripnl=False,
                                           stripall=False, ensurenl=False)
@@ -111,10 +150,10 @@ class SourceFile:
         """Override the lexer (``:syntax``), then re-highlight.
 
         `name` is a Pygments lexer alias; "" or "off" disables colour;
-        None returns to filename/content detection. Raises ValueError for
-        an alias Pygments does not know.
+        "on"/"yes" return to filename/content detection; None clears the
+        override. Raises ValueError for an alias Pygments does not know.
         """
-        if name not in (None, "", "off"):
+        if name not in (None, "", "off", "no", "on", "yes"):
             try:
                 get_lexer_by_name(name)
             except Exception:
@@ -167,15 +206,20 @@ class SourceFile:
         t.start()
         return t
 
-    def ensure_highlighted(self):
-        """Small files lex inline; large ones go async."""
+    def ensure_highlighted(self, on_done=None):
+        """Small files lex inline; large ones go async.
+
+        `on_done` fires (from the lex thread) when the cache is ready, so
+        the UI can repaint -- without it a big file stays colourless until
+        the next unrelated key or gdb output.
+        """
         with self._lock:
             if self._lex_state in ("pending", "ready"):
                 return
         if len(self.lines) <= ASYNC_LEX_THRESHOLD:
             self.highlight_sync()
         else:
-            self.highlight_async()
+            self.highlight_async(on_done)
 
     def tokens_for_line(self, i):
         """[(token, text)] for line i, or None if not highlighted yet."""
@@ -306,22 +350,60 @@ class Breakpoints:
     def all(self):
         return [self._by_id[n] for n in self.numbers()]
 
+    @staticmethod
+    def _same_path(a, b):
+        """gdb spells both sides, so compare the spellings first and only
+        fall back to abspath (covers a relative `file` against an absolute
+        buffer path when fullname was missing)."""
+        if not a or not b:
+            return False
+        if os.path.normcase(a) == os.path.normcase(b):
+            return True
+        try:
+            return os.path.normcase(os.path.abspath(a)) == \
+                os.path.normcase(os.path.abspath(b))
+        except Exception:
+            return False
+
     def at(self, path, line):
         """Breakpoint numbers set on path:line (0-based line -> 1-based gdb)."""
         if not path:
             return []
-        want = os.path.normcase(os.path.abspath(path))
         out = []
         for n in self.numbers():
             for (f, l) in self._by_id[n]["locations"]:
-                if l == line and os.path.normcase(os.path.abspath(f)) == want:
+                if l == line and self._same_path(f, path):
                     out.append(n)
                     break
         return out
 
+    def line_status(self, path, line):
+        """'enabled' / 'disabled' / None for a source line.
+
+        sources.cpp colors the *line number*: ENABLED_BREAKPOINT (red) or
+        DISABLED_BREAKPOINT (yellow), taking priority over the executing and
+        selected line colors. When several breakpoints share a line the last
+        one in table order wins, which is what C's overwrite loop does.
+        """
+        status = None
+        for n in self.numbers():
+            for (f, l) in self._by_id[n]["locations"]:
+                if l == line and self._same_path(f, path):
+                    status = "enabled" if self._by_id[n]["enabled"] \
+                        else "disabled"
+                    break
+        return status
+
 
 class SourceView:
-    """Window state over one SourceFile: top line, cursor, marks, search."""
+    """Window state over one SourceFile: cursor, marks, search.
+
+    There is no stored `top`: source_display (sources.cpp:837-847) derives
+    the first visible line on every frame from the cursor -- `sel_line -
+    height/2` clamped to the file -- so the cursor line is always centered
+    (and a file shorter than the window is block-centered). `top` remains
+    as a field, but only as the value the last render derived, for tests.
+    """
 
     def __init__(self, height=20):
         self.height = max(1, height)
@@ -329,21 +411,36 @@ class SourceView:
         self.left = 0          # horizontal scroll of the text columns
         self.cursor = 0          # 0-based line index
         self.marks = {}          # 'a'..'z' -> line index
+        self.jump_back = None    # line index recorded before a `'x` jump
         self.last_line_col = 0
         self.search_pattern = None
         self.search_matches = []
         self.wrapscan = True
 
+    def top_line(self, total, height=None):
+        """C's starting-line formula (sources.cpp:837-847)."""
+        h = max(1, height if height is not None else self.height)
+        if total < h:
+            return (total - h) // 2     # block-center; may be negative
+        return max(0, min(self.cursor - h // 2, total - h))
+
     def resize(self, height):
         self.height = max(1, height)
 
-    def hscroll(self, delta):
-        """source_hscroll: shift the visible text columns, floors at 0."""
+    def hscroll(self, delta, max_left=None):
+        """source_hscroll: shift the visible text columns.
+
+        Floors at 0 and, when `max_left` is given, caps at it -- C clamps
+        sel_col to `max_width - width + lwidth + 6` so the view cannot roll
+        off into blank columns.
+        """
         self.left = max(0, self.left + delta)
+        if max_left is not None:
+            self.left = min(self.left, max_left)
         return self.left
 
     def ensure_visible(self, n=None):
-        """Scroll minimally so the cursor line is on screen."""
+        """Kept for API compatibility; rendering centers, not this."""
         if n is None:
             n = self.cursor
         if n < self.top:
@@ -353,18 +450,22 @@ class SourceView:
         self.top = max(0, self.top)
 
     def center(self, total):
-        self.top = max(0, min(self.cursor - self.height // 2,
-                              max(0, total - self.height)))
+        self.top = self.top_line(total)
 
     def move_to(self, n, total):
         self.cursor = max(0, min(n, total - 1)) if total else 0
-        self.ensure_visible()
 
     def scroll(self, n, total):
         self.top = max(0, min(self.top + n, max(0, total - self.height)))
 
     def set_mark(self, ch):
+        """m<char>: set the mark; re-setting it at the same line removes it
+        (source_set_mark's toggle, sources.cpp:645-646)."""
+        if ch in self.marks and self.marks[ch] == self.cursor:
+            del self.marks[ch]
+            return False
         self.marks[ch] = self.cursor
+        return True
 
     def goto_mark(self, ch):
         return self.marks.get(ch)
@@ -385,10 +486,13 @@ class SourceView:
         order = list(range(self.cursor + 1, total)) if forward \
             else list(range(self.cursor - 1, -1, -1))
         if self.wrapscan:
+            # C's wrap loop does not retest the line the search started from
+            # (sources.cpp:1263-1301), so the sole match being the current
+            # line reads as "not found" -- kept verbatim.
             if forward:
-                order += list(range(0, self.cursor + 1))
+                order += list(range(0, self.cursor))
             else:
-                order += list(range(total - 1, self.cursor - 1, -1))
+                order += list(range(total - 1, self.cursor, -1))
         for i in order:
             if rx.search(src.line(i)):
                 self.move_to(i, total)

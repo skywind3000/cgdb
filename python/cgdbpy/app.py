@@ -50,7 +50,7 @@ import threading
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
@@ -189,8 +189,13 @@ def _debug_key(key_press, key):
 class CgdbApp:
     def __init__(self, gdb_path=None, gdb_args=(), config=None,
                  source_path=None, client_factory=None, tty_factory=None,
-                 output=None):
+                 output=None, rc_lines=None):
         self.config = config or Config()
+        # (lineno, command) pairs from ~/.cgdb/cgdbrc. C's rc file is a full
+        # command language (command_parse_file feeds every line to the `:`
+        # parser), so the lines are replayed through _do_colon once gdb is
+        # up -- see run_rc_commands().
+        self.rc_lines = list(rc_lines or ())
         # cgdb starts in the GDB window (interface.cpp:139,
         # `static enum Focus focus = GDB`), so the user can type gdb commands
         # immediately without pressing `i` first.
@@ -214,12 +219,14 @@ class CgdbApp:
                                     scrollback=self.config.get(
                                         "scrollbackbuffersize"))
         self.scroll = ScrollState()
-        # horizontal offset of the GDB window in scroll mode (scr_left/right)
-        self.console_left = 0
-        # the last console search: compiled pattern + row of the last hit,
-        # repeated by n/N in scroll mode (scr_search_next)
+        # the last console search: compiled pattern, the row/col of the last
+        # hit and the direction it ran in, repeated by n/N in scroll mode
+        # (scr_search_next + regex_direction_last)
         self._console_search = None
         self._console_search_row = None
+        self._console_search_col = 0
+        self._console_search_dir = True
+        self._console_search_saved = None
         # where a `/` typed at the command line targets: the source window
         # or the console, decided by which window had focus
         self._search_target = "source"
@@ -230,6 +237,9 @@ class CgdbApp:
         # --- source -------------------------------------------------------
         self.src = None
         self.view = SourceView(height=20)
+        # (row, x) of the selected line's cursor cell, written by
+        # _source_text for _source_cursor_pos
+        self._cursor_cell = None
         self.breakpoints = Breakpoints()
         self.exec_line = None       # (path, 1-based line) gdb is stopped at
 
@@ -255,6 +265,8 @@ class CgdbApp:
         self.filedlg = FileDialog()
         self._filedlg_active = False
         self._filedlg_g = False
+        # the :help / F1 full-screen reference page (q closes it)
+        self._help_active = False
 
         # --- gdb ----------------------------------------------------------
         self.tty = None
@@ -288,6 +300,9 @@ class CgdbApp:
         self._key_queue = []
         self.map_set = kui.MapSet()
         self.imap_set = kui.MapSet()
+        # focus==FILE_DLG / COMMAND clears the active map set in C
+        # (cgdb.cpp:427-432); this stand-in is what "clear" points at
+        self._empty_set = kui.MapSet()
         self.mapctx = kui.KeyContext(self.map_set, self._read_queued_key,
                                      timeout=self.config.get("timeoutlen"),
                                      name="normal", defer_on_empty=True)
@@ -344,18 +359,21 @@ class CgdbApp:
 
     def _build_ui(self):
         # focusable=True on the source pane: without it Layout.focus() refuses
-        # the window and ESC silently fails to leave the GDB pane.
-        self.source_control = FormattedTextControl(self._source_text,
-                                                   focusable=True)
+        # the window and ESC silently fails to leave the GDB pane. The cursor
+        # sits at the end of the selected line while this pane is focused,
+        # like swin_curs_set(!!focus) + the final wrefresh in source_display.
+        self.source_control = FormattedTextControl(
+            self._source_text, focusable=True, show_cursor=True,
+            get_cursor_position=self._source_cursor_pos)
         self.status_control = FormattedTextControl(self._status_text)
-        self.console_control = FormattedTextControl(self._console_text,
-                                                    focusable=True)
+        self.console_control = FormattedTextControl(
+            self._console_text, focusable=True, show_cursor=True,
+            get_cursor_position=self._console_cursor_pos)
         self.cmdline_control = BufferControl(buffer=self.cmd_buffer)
         self.filedlg_control = FormattedTextControl(self._filedlg_text,
                                                     focusable=True)
 
         self.source_window = Window(self.source_control, wrap_lines=False,
-                                    always_hide_cursor=True,
                                     height=D(weight=1, preferred=0.6))
         # Window(style=...) is prepended to every cell of the window including
         # the blank ones past the end of the text, which is what paints the bar
@@ -365,7 +383,6 @@ class CgdbApp:
         self.status_window = Window(self.status_control, height=1,
                                     style="class:status")
         self.console_window = Window(self.console_control, wrap_lines=False,
-                                     always_hide_cursor=True,
                                      height=D(weight=1, preferred=0.4))
         self.edit_window = Window(
             BufferControl(
@@ -378,6 +395,9 @@ class CgdbApp:
         # the `o` dialog: full screen while open (if_draw's FILE_DLG branch)
         self.filedlg_window = Window(self.filedlg_control, wrap_lines=False,
                                      always_hide_cursor=True)
+        self.help_window = Window(
+            FormattedTextControl(self._help_text, focusable=True),
+            wrap_lines=False, always_hide_cursor=True)
 
         # The `:` / `/` command line *is* the status bar in cgdb: it replaces
         # the status row, not the bottom edit line. update_status_win() draws
@@ -415,6 +435,11 @@ class CgdbApp:
             self.vsep_window = None
             self.root = self.filedlg_window
             return self.root
+        if self._help_active:
+            self.left_col = None
+            self.vsep_window = None
+            self.root = self.help_window
+            return self.root
         in_command = Condition(lambda: self.focus == FOCUS_COMMAND)
         status = ConditionalContainer(self.status_window, filter=~in_command)
         cmdline = ConditionalContainer(self.cmdline_window, filter=in_command)
@@ -433,30 +458,60 @@ class CgdbApp:
         return self.root
 
     def _apply_ttimeoutlen(self):
-        """Wire cgdb's `ttimeoutlen` onto prompt_toolkit's flush timer.
+        """Wire cgdb's timeout options onto prompt_toolkit's two waits.
 
-        This is not cosmetic. With VT input mode enabled, prompt_toolkit's
-        Vt100Parser holds a lone ESC until it knows no escape sequence
-        follows, and only releases it from Application.auto_flush_input()
-        after `ttimeoutlen`. prompt_toolkit's default is 0.5 s, which made ESC
-        -- cgdb's focus-switch key -- feel broken (measured: ESC arrived 499 ms
-        after it was sent, while ordinary keys arrived in 0-3 ms). cgdb's own
-        default is 100 ms, and that is what we use.
+        There are two of them, and both matter:
+
+          * ``app.ttimeoutlen`` -- the vt100/win32 input parser holding a
+            lone ESC byte until it knows no escape sequence follows.
+          * ``app.timeoutlen`` -- the KeyProcessor flushing an incomplete
+            key *binding* prefix, e.g. ESC waiting to see whether b follows
+            (``escape,b`` = Alt-b). That is vim's keycode timeout, so it
+            takes ttimeoutlen when `ttimeout` is on, else timeoutlen when
+            `timeout` is on (cgdbrc.cpp:1198-1220); both off means "wait
+            forever", which ptk spells None.
+
+        prompt_toolkit's defaults are 0.5 s / 1.0 s; with ESC being the
+        focus-switch key those values feel broken. cgdb's own default is
+        100 ms, and that is what we use.
         """
         try:
             self.app.ttimeoutlen = self.config.get("ttimeoutlen") / 1000.0
+            ttm = self.config.get("ttimeoutlen")
+            if ttm < 0:
+                ttm = self.config.get("timeoutlen")
+            if bool(self.config.get("ttimeout")):
+                self.app.timeoutlen = ttm / 1000.0
+            elif bool(self.config.get("timeout")):
+                self.app.timeoutlen = \
+                    self.config.get("timeoutlen") / 1000.0
+            else:
+                self.app.timeoutlen = None
         except Exception:
             pass
+
+    def _mode_key_is(self, name):
+        return str(self.config.get("cgdbmodekey")).strip().lower() == name
 
     def _build_keybindings(self):
         """Register bindings.
 
-        Precedence design: while the GDB edit line has focus and we are not in
-        scroll mode, ordinary typing and cursor editing belong to
+        Precedence design: while the GDB edit line has focus and we are not
+        in scroll mode, ordinary typing and cursor editing belong to
         prompt_toolkit's Buffer (that is where the free line editor comes
-        from). The catch-all is therefore filtered off in that state, and only
-        the keys cgdb must own -- ESC, PageUp/PageDown, the F-keys, Ctrl-L,
+        from). The catch-all is therefore filtered off in that state, and
+        only the keys cgdb must own -- ESC, PageUp/PageDown, the F-keys,
         Ctrl-C -- stay bound unconditionally.
+
+        Escape is deliberately NOT eager. A bare ESC must wait out the
+        keycode timeout (ttimeoutlen) so that ESC followed by b/f/d/
+        Backspace within the window is Alt-b/f/d/Backspace -- readline word
+        motions, exactly as C's kui resolves "\033b" to BACKWARD_WORD.
+        prompt_toolkit's KeyProcessor holds the prefix and flushes on
+        `app.timeoutlen`, which _apply_ttimeoutlen keeps in sync with
+        ttimeoutlen. When the flush comes, our own escape binding (an
+        application-level binding outranks the default emacs one in
+        prompt_toolkit's merge order) runs the cgdb_mode_key switch.
         """
         kb = KeyBindings()
         editing = Condition(self._buffer_owns_keys)
@@ -474,12 +529,41 @@ class CgdbApp:
                     Keys.F11, Keys.F12):
             self._bind(kb, key)
 
-        # Escape must be eager. prompt_toolkit treats a bare Escape as a
-        # possible prefix of a longer sequence and otherwise waits out
-        # `ttimeoutlen` (0.5 s) before calling the handler, which makes ESC
-        # feel broken when it is cgdb's focus-switch key. Eager matches take
-        # priority and suppress the longer-match wait.
-        self._bind(kb, Keys.Escape, eager=True)
+        self._bind(kb, Keys.Escape)
+
+        # ESC + b/f/d/Backspace == Alt-b/f/d/Backspace == the readline word
+        # operations (kui_term.cpp:130-133 + cgdb.cpp:1040-1052). Registered
+        # at application level so they win over ptk's own defaults and fire
+        # only while a Buffer owns the keys, i.e. while a line is edited.
+        from prompt_toolkit.key_binding.bindings.named_commands import \
+            get_by_name as _nc
+        for seq, name in ((("escape", "b"), "backward-word"),
+                          (("escape", "f"), "forward-word"),
+                          (("escape", "d"), "kill-word"),
+                          (("escape", Keys.Backspace),
+                           "backward-kill-word")):
+            @kb.add(*seq, filter=editing)
+            def _word_op(event, name=name):
+                _nc(name)(event)
+
+        # C-d on an empty GDB edit line: readline reads EOF and gdb exits,
+        # taking cgdb with it (kui_term CTRL_D -> "\004" -> tgdb_send_char).
+        @kb.add(Keys.ControlD,
+                filter=Condition(lambda: self.focus == FOCUS_GDB
+                                 and not self.scroll.active
+                                 and not self.gdb_buffer.text))
+        def _ctrl_d_exit(event):
+            self._run_async("-gdb-exit")
+
+        # when cgdbmodekey is reconfigured to Tab / Ctrl-G those keys must
+        # reach on_key() instead of the Buffer's own bindings; only then is
+        # the binding active at all
+        for ptk_key, mode_key in ((Keys.Tab, "tab"),
+                                  (Keys.ControlG, "ctrl-g")):
+            @kb.add(ptk_key, filter=Condition(
+                lambda mk=mode_key: self._mode_key_is(mk)))
+            def _mode_key_binding(event):
+                self.on_key(event.key_sequence[-1])
 
         # in GDB focus the arrow keys must reach the Buffer (history), so they
         # are only ours when scroll mode is on
@@ -521,6 +605,12 @@ class CgdbApp:
         if key is None:
             return
         if key == kc.CTRL_C:
+            # ^C with gdb idle aborts the line being composed: readline
+            # clears it and reprints the prompt (tgdb writes VINTR). The
+            # local edit line is our readline, so clear it here too.
+            if not self.running_inferior and self.focus == FOCUS_GDB \
+                    and self.gdb_buffer.text:
+                self.gdb_buffer.reset()
             self.interrupt()
             self.invalidate()
             return
@@ -542,6 +632,10 @@ class CgdbApp:
     def _arm_map_timeout(self):
         if self._timeout_handle is not None:
             return
+        if not bool(self.config.get("timeout")):
+            # :set notimeout: a half-typed mapping waits forever, exactly
+            # as C's kui does (cgdbrc.cpp:1213-1220)
+            return
         delay = self.config.get("timeoutlen") / 1000.0
         try:
             loop = self.app.loop if hasattr(self.app, "loop") else None
@@ -562,102 +656,119 @@ class CgdbApp:
             self.invalidate()
 
     def dispatch(self, key):
-        """Route one mapped key. Mirrors internal_if_input()."""
+        """Route one mapped key. Mirrors internal_if_input().
+
+        Every key becomes last_key_pressed when it is done being processed
+        (interface.cpp:1594-1601); handlers that consume an m/g/' prefix
+        zero it. A pending status message is consumed at the same point --
+        if_display_message output only survives until the next draw in C.
+        """
+        self.message = ""
+        if self._help_active:
+            if key == ord("q") or key == kc.ESC:
+                self._close_help()
+            return
         mode_key = self._cgdb_mode_key()
         if key == mode_key:
             if self.focus != FOCUS_SOURCE:
                 if self.focus == FOCUS_COMMAND:
                     self._cancel_command()
-                # leaving the GDB window also leaves its scroll mode, otherwise
-                # the console stays frozen at an old offset with no visible
-                # indication of why
-                self.scroll.leave()
+                # leaving the GDB window *keeps* scroll mode and its
+                # position, as in C (interface.cpp:1522-1555 never touches
+                # in_scroll_mode); the scroll cursor and the [d/max] status
+                # make the parked state visible
                 self.set_focus(FOCUS_SOURCE)
+            self.last_key = key
             return
         if self.focus == FOCUS_FILEDLG:
             # internal_if_input routes FILE_DLG straight to the dialog,
             # before any global key (interface.cpp:1586-1606)
             self._filedialog_key(key)
+            self.last_key = key
             return
         if self.focus == FOCUS_COMMAND:
             self._command_key(key)
-            return
-        # global keys, available in every focus (interface.cpp:1511-1537)
-        if key == kc.F1:
-            self.show_help()
-            return
-        if key == kc.F5:
-            self.gdb_run()
-            return
-        if key == kc.F6:
-            self.gdb_continue()
-            return
-        if key == kc.F7:
-            self.gdb_finish()
-            return
-        if key == kc.F8:
-            self.gdb_next()
-            return
-        if key == kc.F10:
-            self.gdb_step()
-            return
-        if key == kc.CTRL_L:
-            self.relayout()
+            self.last_key = key
             return
         if self.focus == FOCUS_SOURCE:
             self.source_key(key)
         elif self.focus == FOCUS_GDB:
             self.gdb_key(key)
+        if self.last_key != 0:
+            self.last_key = key
 
     def _cgdb_mode_key(self):
-        name = str(self.config.get("cgdbmodekey")).lower()
-        return {"esc": kc.ESC, "tab": kc.CTRL_I,
-                "ctrl-g": kc.CTRL_G}.get(name, kc.ESC)
+        """The key that leaves the GDB window (cgdbrc's cgdbmodekey).
+
+        Accepts a single character, the three historical spellings, and any
+        ``<X>`` keycode notation kui knows -- C takes anything
+        kui_term_get_cgdb_key_from_keycode resolves (cgdbrc.cpp:437-461).
+        """
+        name = str(self.config.get("cgdbmodekey")).strip()
+        if not name:
+            return kc.ESC
+        if len(name) == 1 and not name.startswith("<"):
+            return ord(name.lower()) if name.isalpha() else ord(name)
+        low = name.lower()
+        if low in ("esc", "<esc>", "escape"):
+            return kc.ESC
+        if low in ("tab", "<tab>", "<c-i>"):
+            return kc.CTRL_I
+        if low in ("ctrl-g", "<c-g>", "^g"):
+            return kc.CTRL_G
+        try:
+            keys = kc.string_to_keys(name)
+            if keys:
+                return keys[0]
+        except Exception:
+            pass
+        return kc.ESC
 
     # =====================================================================
     # Source window keys (cgdb_input + source_input)
     # =====================================================================
     def source_key(self, key):
+        # cgdb_input's early returns (i, s, :, /, ?, o, F-keys, ESC) happen
+        # BEFORE source_input, so the digit count survives them; it is only
+        # source_input itself that clears or extends it
+        # (interface.cpp:1298-1303 vs 1312-1317).
         self._source_key(key)
-        # Digits accumulate into a line-number count that j/k/G consume;
-        # any other key clears it (G_line_number, interface.cpp:1312-1317).
-        # This runs after the switch, exactly like C -- so m5 sets mark "5"
-        # and also starts a count, quirky corner included.
-        if 0x30 <= key <= 0x39:
-            self._line_number += chr(key)
-        else:
-            self._line_number = ""
 
     def _source_key(self, key):
         total = len(self.src) if self.src else 0
         # mark handling: m<char> and '<char>. cgdb does this with
         # last_key_pressed (interface.cpp:1425-1444), and so do we -- a
         # two-key sequence must not be resolvable by the mapping engine alone,
-        # or `:map gg <Up>` could never fire.
-        if self.last_key == ord("m") and not kc.is_special(key):
-            self.view.set_mark(chr(key))
-            self.message = "mark %s set at line %d" % (chr(key),
-                                                       self.view.cursor + 1)
-            self.last_key = 0
-            return
-        if self.last_key == ord("'") and not kc.is_special(key):
-            ln = self.view.goto_mark(chr(key))
-            if ln is None:
-                self.message = "mark %s not set" % chr(key)
-            else:
-                self.view.move_to(ln, total)
-            self.last_key = 0
-            return
+        # or `:map gg <Up>` could never fire. C only accepts a-zA-Z as a mark
+        # name; an unset mark or a non-mark char falls back to normal key
+        # processing (sources.cpp:641-656, 694-703).
+        if self.last_key == ord("m"):
+            if not kc.is_special(key) and chr(key).isalpha():
+                self.view.set_mark(chr(key))
+                self.last_key = 0
+                self._line_number = ""
+                return
+            # not a mark name: the key falls through as itself
+        elif self.last_key == ord("'"):
+            ch = chr(key) if not kc.is_special(key) else ""
+            if ch and (ch.isalnum() or ch in ("'", ".")):
+                if self._goto_mark_key(ch, total):
+                    self.last_key = 0
+                    self._line_number = ""
+                    return
+            # unset mark / non-mark char: falls through as itself
         if self.last_key == ord("g") and key == ord("g"):
             self.view.move_to(0, total)
             self.last_key = 0
+            self._line_number = ""
             return
 
         if key == ord("i"):
             self.set_focus(FOCUS_GDB)
             return
         if key == ord("s"):
-            self.scroll.enter(self.console.max_delta(self._console_height()))
+            self.scroll.enter(self.console.max_delta(self._console_height()),
+                              row=self._console_cursor_row())
             self.set_focus(FOCUS_GDB)
             return
         if key == ord(":"):
@@ -687,9 +798,10 @@ class CgdbApp:
             self._open_filedlg()
             return
         if key == ord("u"):
-            # run until the cursor line (interface.cpp:1304-1311)
+            # run until the cursor line (interface.cpp:1304-1311); C passes
+            # the *displayed* file's path too, so the right file:line runs
             if self.src:
-                self.gdb_until(self.view.cursor + 1)
+                self.gdb_until(self.src.path, self.view.cursor + 1)
             else:
                 self.message = "no source file"
             return
@@ -708,6 +820,29 @@ class CgdbApp:
         if key == ord("_"):
             self._window_resize_jump(-1)
             return
+        # the F-keys live in cgdb_input, so they only fire from the source
+        # window (interface.cpp:1484-1509); the GDB window sends them to gdb
+        if key == kc.F1:
+            self.show_help()
+            return
+        if key == kc.F5:
+            self.gdb_run()
+            return
+        if key == kc.F6:
+            self.gdb_continue()
+            return
+        if key == kc.F7:
+            self.gdb_finish()
+            return
+        if key == kc.F8:
+            self.gdb_next()
+            return
+        if key == kc.F10:
+            self.gdb_step()
+            return
+        if key == kc.CTRL_L:
+            self.relayout()
+            return
         if key == ord("m"):
             self.last_key = ord("m")
             return
@@ -715,27 +850,32 @@ class CgdbApp:
             self.last_key = ord("'")
             return
 
-        # motion. j/k and the arrows honour the digit count, like
-        # source_vscroll(sview, lineno) does in C. h/l scroll the text
-        # columns (source_hscroll, interface.cpp:1243-1247).
-        count = int(self._line_number) if self._line_number else 1
+        # source_input proper starts here. C reads G_line_number as the
+        # PREVIOUS keys left it and only updates it after the switch
+        # (interface.cpp:1298-1303), so `5` then `j` moves five lines.
+        try:
+            count = int(self._line_number) if self._line_number else 1
+        except ValueError:
+            count = 1
+        if count > 0x7FFFFFFF:
+            count = 1     # C's atoi overflow leaves the count at 1
         h = self._source_height()
         if key in (ord("h"), kc.LEFT):
-            self.view.hscroll(-1)
+            self.view.hscroll(-1, self._max_source_left())
         elif key in (ord("l"), kc.RIGHT):
-            self.view.hscroll(+1)
-        elif key in (ord("j"), kc.DOWN, kc.CTRL_N):
+            self.view.hscroll(+1, self._max_source_left())
+        elif key in (ord("j"), kc.DOWN):
             self.view.move_to(self.view.cursor + count, total)
-        elif key in (ord("k"), kc.UP, kc.CTRL_P):
+        elif key in (ord("k"), kc.UP):
             self.view.move_to(self.view.cursor - count, total)
         elif key == kc.CTRL_D:
             self.view.move_to(self.view.cursor + max(1, h // 2), total)
         elif key == kc.CTRL_U:
             self.view.move_to(self.view.cursor - max(1, h // 2), total)
         elif key == kc.CTRL_F or key == kc.NPAGE:
-            self.view.move_to(self.view.cursor + h, total)
+            self.view.move_to(self.view.cursor + h - 1, total)
         elif key == kc.CTRL_B or key == kc.PPAGE:
-            self.view.move_to(self.view.cursor - h, total)
+            self.view.move_to(self.view.cursor - h + 1, total)
         elif key == ord("G"):
             # with a count, G goes to that line; without, the last line
             if self._line_number:
@@ -746,15 +886,57 @@ class CgdbApp:
             # prefix of `gg`; resolved above on the next key. Anything else
             # after `g` falls through as a no-op, matching vim.
             self.last_key = ord("g")
-            return
-        elif key == kc.HOME:
-            self.view.move_to(0, total)
-        elif key == kc.END:
-            self.view.move_to(total - 1, total)
         else:
             self.last_key = key
-            return
-        self.last_key = key
+        # motion. j/k and the arrows honour the digit count, like
+        # source_vscroll(sview, lineno) does in C. h/l scroll the text
+        # columns (source_hscroll, interface.cpp:1243-1247); pages move
+        # height-1 rows so one line of context overlaps, as C does.
+        # Store digits into G_line_number for the 'G' command, after the
+        # motion has consumed whatever the previous keys accumulated.
+        if 0x30 <= key <= 0x39:
+            self._line_number += chr(key)
+        else:
+            self._line_number = ""
+
+    def _goto_mark_key(self, ch, total):
+        """`'x`, `''` (jump back) and `'.` (the executing line).
+
+        sources.cpp:684-696: a successful `'x` jump records where it jumped
+        FROM so `''` bounces back, and `'.` goes to the current executing
+        line. Returns False when the mark does not exist, so the caller can
+        let the key fall through to normal processing like C does.
+        """
+        if ch == "'":
+            ln = self.view.jump_back
+            if ln is None:
+                return False
+        elif ch == ".":
+            if self.exec_line and self.src and self._same_file(
+                    self.exec_line[0], self.src.path):
+                ln = self.exec_line[1] - 1
+            else:
+                return False
+        else:
+            ln = self.view.goto_mark(ch)
+            if ln is None:
+                return False
+        origin = self.view.cursor
+        self.view.move_to(ln, total)
+        if ch not in ("'", "."):
+            self.view.jump_back = origin
+        return True
+
+    def _max_source_left(self):
+        """The sel_col clamp: sources.cpp:1091-1110 stops the horizontal
+        scroll at `max_width - width + lwidth + 6` so the view cannot roll
+        off into blank columns."""
+        if self.src is None or not len(self.src):
+            return 0
+        lwidth = len(str(len(self.src)))
+        avail = max(0, self._source_width() - lwidth - 2)
+        tabstop = int(self.config.get("tabstop"))
+        return max(0, self.src.display_max_width(tabstop) - avail + 6)
 
     def _repeat_search(self, forward, total):
         if not self.src or not self.view.search_pattern:
@@ -768,6 +950,11 @@ class CgdbApp:
     # =====================================================================
     # GDB window keys
     # =====================================================================
+    def _console_cursor_row(self):
+        """The row the terminal cursor sits on: the current output line."""
+        h = self._console_height()
+        return max(0, min(self.console.line_count() - 1, h - 1))
+
     def gdb_key(self, key):
         h = self._console_height()
         mx = self.console.max_delta(h)
@@ -776,12 +963,15 @@ class CgdbApp:
         g_pending = self._gdb_g
         self._gdb_g = False
         if self.scroll.active:
+            w = self._gdb_width()
             if key == ord("g"):
                 if g_pending:
                     self.scroll.home(mx, h)
                 else:
                     self._gdb_g = True
             elif key in (kc.UP, ord("k"), kc.CTRL_P):
+                # the cursor walks first; the window only scrolls once the
+                # cursor hits the edge (scr_up/scr_down, scroller.cpp:216-237)
                 self.scroll.up(1, mx, h)
             elif key in (kc.DOWN, ord("j"), kc.CTRL_N):
                 self.scroll.down(1, mx, h)
@@ -789,65 +979,85 @@ class CgdbApp:
                 self.scroll.up(max(1, h // 2), mx, h)
             elif key == kc.CTRL_D:
                 self.scroll.down(max(1, h // 2), mx, h)
-            elif key in (kc.PPAGE, kc.CTRL_B):
+            elif key == kc.PPAGE:
                 self.scroll.page_up(mx, h)
-            elif key in (kc.NPAGE, kc.CTRL_F):
+            elif key == kc.NPAGE:
                 self.scroll.page_down(mx, h)
             elif key in (kc.HOME, kc.F11):
                 self.scroll.home(mx, h)
             elif key in (kc.END, kc.F12, ord("G")):
                 self.scroll.end(mx, h)
             elif key in (kc.LEFT, ord("h")):
-                self.console_left = max(0, self.console_left - 1)
+                # h/l move the *scroll cursor's* column; the window never
+                # pans sideways (scr_left/scr_right, scroller.cpp:254-284)
+                self.scroll.left(w)
             elif key in (kc.RIGHT, ord("l")):
-                self.console_left += 1
+                self.scroll.right(w)
             elif key == ord("0"):
-                self.console_left = 0
+                self.scroll.beginning_of_row()
             elif key == ord("$"):
-                longest = max((len(ln) for ln in
-                               self.console.visible_lines(h, self.scroll.delta)),
-                              default=0)
-                self.console_left = max(0, longest - self._gdb_width())
+                self.scroll.end_of_row(w)
             elif key in (ord("/"), ord("?")):
                 # console search: the pattern is typed at the same status
                 # command line a source search uses, then n/N repeat it
                 self._search_target = "console"
                 self.search_forward = (key == ord("/"))
+                self._console_search_saved = (self.scroll.active,
+                                              self.scroll.delta,
+                                              self.scroll.row)
                 self._start_command("/" if self.search_forward else "?")
             elif key == ord("n"):
-                self._console_search_next(True)
+                self._console_search_next(self._console_search_dir)
             elif key == ord("N"):
-                self._console_search_next(False)
-            elif key == kc.ESC or key == ord("q") or key == ord("i") \
-                    or key == kc.CTRL_M:
+                self._console_search_next(not self._console_search_dir)
+            elif key in (ord("q"), ord("i"), kc.CTRL_M):
                 # q/i/Enter all leave scroll mode parked at the bottom
                 # (gdb_input: scr_end + set_scroll_mode(false))
                 self.scroll.leave()
-                self.console_left = 0
-                if key == ord("i"):
-                    self.set_focus(FOCUS_GDB)
+                self.set_focus(FOCUS_GDB)
             # everything else in scroll mode is swallowed, as C does by
             # returning result = 0 (no key reaches gdb from here).
             return
         if key == kc.PPAGE:
-            self.scroll.enter(mx)
-            self.console_left = 0
+            self.scroll.enter(mx, row=self._console_cursor_row())
+            self.set_focus(FOCUS_GDB)
             self.scroll.page_up(mx, h)
-            return
-        if key == kc.NPAGE:
-            self.scroll.enter(mx)
-            self.console_left = 0
-            self.scroll.page_down(mx, h)
             return
         if key == kc.ESC:
             self.set_focus(FOCUS_SOURCE)
             return
+        if self.running_inferior and self.tty is not None:
+            # the inferior owns the terminal: keys pass through byte-wise,
+            # exactly as C writes each key into the console pty
+            # (gdb_input's default -> result=1 -> tgdb_send_char)
+            self._send_key_to_inferior(key)
+            return
         # Everything else belongs to gdb. gdb_input() says the same thing with
         # `default: result = 1` -- "this tells the input to go to active GDB
-        # command" (interface.cpp:996-1000) -- so `:` and `/` are only cgdb's
-        # once ESC has moved the focus to the source window. Ordinary keys
-        # never even reach this method: _buffer_owns_keys() keeps the
-        # catch-all binding off while the edit line has focus.
+        # command" (interface.cpp:996-1000) -- so `:`, `/`, NPAGE and the
+        # F-keys are only cgdb's once ESC has moved the focus to the source
+        # window. Ordinary keys never even reach this method:
+        # _buffer_owns_keys() keeps the catch-all binding off while the edit
+        # line has focus.
+
+    def _send_key_to_inferior(self, key):
+        """Byte-wise passthrough while the inferior runs.
+
+        C writes each key into the console pty; its line discipline echoes
+        the input back. The inferior pipe here has no echo, so printable
+        keys and edits are echoed into the console model by hand.
+        """
+        if key == kc.CTRL_M:
+            ch = "\n"
+        elif key == kc.CTRL_H:
+            ch = "\b"
+        elif not kc.is_special(key) and 32 <= key < 127:
+            ch = chr(key)
+        else:
+            return
+        self.tty.write(ch)
+        self.console.add_text(ch)
+        self.invalidate()
 
     # =====================================================================
     # File dialog (filedlg.cpp)
@@ -881,16 +1091,22 @@ class CgdbApp:
                 if name:
                     entries.append((name, full))
         if not entries:
-            self.message = "no source files known to gdb"
+            self.message = ("Error: No sources available! "
+                            "Was the program compiled with debug?")
             self.invalidate()
             return
         self.filedlg.set_files(entries)
+        if not self.filedlg.count():
+            # every entry pointed at a file that no longer exists
+            self.message = ("Error: No sources available! "
+                            "Was the program compiled with debug?")
+            self.invalidate()
+            return
         self.set_focus(FOCUS_FILEDLG)
-        self.message = ""
 
     def _filedialog_key(self, key):
         """One key in the dialog (filedlg_recv_char, filedlg.cpp:584-673)."""
-        h = max(1, self._total_height() - 3)   # rows of list; C reserves 2
+        h = max(1, self._total_height() - 2)   # list rows; C reserves 2
         g = self._filedlg_g
         self._filedlg_g = False
         if key == ord("q"):
@@ -913,13 +1129,16 @@ class CgdbApp:
             self.filedlg.left = max(0, self.filedlg.left - 1)
         elif key in (ord("/"), ord("?")):
             self._search_target = "filedlg"
+            self._filedlg_search_origin = self.filedlg.sel
+            self.filedlg.message = ""
             self._start_command("/" if key == ord("/") else "?")
         elif key == ord("n"):
-            self._filedialog_search_repeat(True)
+            self._filedialog_search_repeat(self.filedlg.search_dir)
         elif key == ord("N"):
-            self._filedialog_search_repeat(False)
+            self._filedialog_search_repeat(not self.filedlg.search_dir)
         elif key == kc.CTRL_M:
-            # Enter opens the selection (if_show_file)
+            # Enter opens the selection (if_show_file); re-opening the
+            # current file keeps the cursor where it was, as in C
             name, fullname = self.filedlg.selected()
             self.set_focus(FOCUS_SOURCE)
             self.open_file(fullname or name)
@@ -941,38 +1160,46 @@ class CgdbApp:
         self.invalidate()
 
     def _do_filedlg_search(self, pattern, forward):
-        """`/` typed in the dialog (filedlg_search_regex)."""
+        """`/` typed in the dialog (filedlg_search_regex). Matching is
+        hard-coded case-insensitive -- C never consults :set ignorecase
+        here (filedlg.cpp:548) -- and an empty pattern replays the last
+        one in its original direction."""
         self._search_target = "filedlg"
-        if not pattern:
+        if not pattern and self.filedlg.search is None:
+            self.filedlg.message = "no previous search pattern"
             return
-        hit = self.filedlg.find(pattern, forward,
-                                bool(self.config.get("ignorecase")))
-        self.message = "" if hit is not None \
-            else "pattern not found: %s" % pattern
+        hit = self.filedlg.find(pattern, forward)
+        if hit is None and pattern:
+            self.filedlg.message = "pattern not found: %s" % pattern
+        else:
+            self.filedlg.message = ""
 
     def _filedialog_search_repeat(self, forward):
         if self.filedlg.search is None:
-            self.message = "no previous search pattern"
+            self.filedlg.message = "no previous search pattern"
             return
         hit = self.filedlg.find("", forward)
-        self.message = "" if hit is not None else "pattern not found"
+        self.filedlg.message = "" if hit is not None else "pattern not found"
 
     def _filedlg_text(self):
-        """The dialog screen (filedlg_display, filedlg.cpp:329-404).
+        """The dialog screen (filedlg_display, filedlg.cpp:329-427).
 
-        A centered label row, then the numbered list with '->' marking the
-        selection and '~' fillers past the end, vim-style. When the list is
-        shorter than the screen it is centered, as C does.
+        The label row, `height - 2` list rows -- C reserves a bottom
+        status row -- and that row last, where the dialog's messages live
+        in HLG_STATUS_BAR. The selected row is a bold line number plus the
+        `->` arrow (filedlg.cpp:404-412), ordinary rows get a bold `|`,
+        and `~` fills past the end. A list shorter than the screen is
+        block-centered, as C does.
         """
         fd = self.filedlg
         width = self._total_width()
-        rows = max(1, self._total_height() - 3)
+        rows = max(1, self._total_height() - 2)
         count = fd.count()
         if count < rows:
             start = (count - rows) // 2
         else:
             start = max(0, min(fd.sel - rows // 2, count - rows))
-        numw = max(2, len(str(max(count, 1))))
+        numw = max(1, len(str(max(count, 1))))
         avail = max(1, width - numw - 3)
 
         out = [("class:filedlg.label",
@@ -981,16 +1208,22 @@ class CgdbApp:
             i = start + r
             out.append(("", "\n"))
             if not (0 <= i < count):
-                filler = " " * numw + "~"
-                out.append(("class:filedlg.filler", filler))
+                out.append(("class:filedlg.filler",
+                            " " * (numw - 1) + "~" + " |"))
                 continue
             name = fd.files[i][0][fd.left:fd.left + avail]
-            cur = (i == fd.sel)
             num = "%*d" % (numw, i + 1)
-            if cur:
-                out.append(("class:filedlg.selected", num + " " + name))
+            if i == fd.sel:
+                out.append(("class:filedlg.selnum", num))
+                out.append(("class:filedlg.arrow", "->"))
+                out.append(("", name))
             else:
-                out.append(("class:filedlg", num + " " + name))
+                out.append(("class:filedlg", num))
+                out.append(("class:filedlg.selnum", " |"))
+                out.append(("", name))
+        msg = (fd.message or "")[:width]
+        out.append(("", "\n"))
+        out.append(("class:status", msg.ljust(width)))
         return out
 
     # =====================================================================
@@ -1002,12 +1235,38 @@ class CgdbApp:
         self.cmd_buffer.cursor_position = len(prefix)
         self._prev_focus = self.focus if self.focus != FOCUS_COMMAND \
             else FOCUS_SOURCE
+        if prefix in ("/", "?") and self._search_target == "source":
+            # orig_line_regex: where the cursor was when the search began
+            self.search_origin = self.view.cursor
         self.set_focus(FOCUS_COMMAND)
 
     def _end_command(self):
         self.set_focus(getattr(self, "_prev_focus", FOCUS_SOURCE))
 
     def _cancel_command(self):
+        """ESC on the command line: cancel and undo the search preview.
+
+        C restores the source cursor to orig_line_regex
+        (interface.cpp:1529-1543) and, for a regex typed in the GDB window,
+        puts the scroller back where it was (scr_disable_search(false));
+        a `:` line just closes. Focus returns to wherever the line was
+        opened from, which reproduces both of C's outcomes.
+        """
+        if self._search_target == "source" and self.search_origin is not None:
+            if self.src:
+                self.view.move_to(self.search_origin, len(self.src))
+            self.search_origin = None
+        elif self._search_target == "console":
+            saved = self._console_search_saved
+            if saved:
+                self.scroll.active, self.scroll.delta, self.scroll.row = \
+                    saved
+                self._console_search_saved = None
+        elif self._search_target == "filedlg":
+            origin = getattr(self, "_filedlg_search_origin", None)
+            if origin is not None:
+                self.filedlg.goto(origin)
+                self._filedlg_search_origin = None
         self.cmd_buffer.text = ""
         self._end_command()
 
@@ -1015,6 +1274,11 @@ class CgdbApp:
         """Enter on the `:` / `/` command line."""
         text = buff.text
         buff.reset()
+        if self.cmd_prefix and not text.startswith(self.cmd_prefix):
+            # the ':'/'/' itself was backspaced away: there is nothing to
+            # run. A bare `q` must never leak to gdb as a console command.
+            self._end_command()
+            return
         self._end_command()
         self.execute_command(text)
         self.invalidate()
@@ -1022,18 +1286,46 @@ class CgdbApp:
     def _on_cmd_text_changed(self, buff):
         """Live search preview: jump while the `/` pattern is being typed.
 
-        status_bar_regex_input jumps the source cursor on every character
-        and redraws; the buffer already types the pattern, so hooking
-        text_changed gives the same feel. Partial regexes simply fail to
-        compile and leave the cursor where it was.
+        status_bar_regex_input / gdb_input_regex_input /
+        filedlg_capture_regex jump on every character and redraw; the
+        buffer already types the pattern, so hooking text_changed gives the
+        same feel. Partial regexes simply fail to compile and leave the
+        view where it was. The source window, the console and the file
+        dialog all get it.
         """
         text = buff.text
-        if len(text) >= 2 and text[0] in "/?" \
-                and self._search_target == "source" and self.src:
-            self.view.search_in(self.src, text[1:],
-                                forward=(text[0] == "/"),
+        if self.focus == FOCUS_COMMAND and self.cmd_prefix \
+                and len(text) < len(self.cmd_prefix):
+            # backspacing over the ':' itself closes the command line, like
+            # C's empty-line backspace (interface.cpp:1087-1096) -- the
+            # prefix is never part of the editable text there
+            self._cancel_command()
+            return
+        if len(text) < 2 or text[0] not in "/?":
+            return
+        forward = (text[0] == "/")
+        pattern = text[1:]
+        if self._search_target == "source" and self.src:
+            self.view.search_in(self.src, pattern,
+                                forward=forward,
                                 ignorecase=bool(self.config.get(
                                     "ignorecase")))
+        elif self._search_target == "console":
+            try:
+                rx = re.compile(pattern, re.IGNORECASE
+                                if bool(self.config.get("ignorecase")) else 0)
+            except re.error:
+                return
+            hit = self.console.search(rx, *self._console_search_origin(),
+                                      forward=forward,
+                                      wrapscan=bool(self.config.get(
+                                          "wrapscan")))
+            if hit is not None:
+                self._goto_console_row(*hit)
+        elif self._search_target == "filedlg":
+            hit = self.filedlg.find(pattern, forward, live=True)
+            if hit is not None:
+                self.filedlg.sel = hit
 
     def _command_key(self, key):
         """Only keys the Buffer does not own reach here (F-keys, Ctrl-L).
@@ -1066,7 +1358,9 @@ class CgdbApp:
             self.message = "no source file"
             return
         if not pattern:
-            self.message = "empty search pattern"
+            # `/` + Enter repeats the last pattern in the direction the
+            # search line was opened with (interface.cpp:1008-1017)
+            self._repeat_search(forward, len(self.src))
             return
         self.search_forward = forward
         hit = self.view.search_in(self.src, pattern, forward=forward,
@@ -1078,26 +1372,48 @@ class CgdbApp:
 
         C captures the regex inside the scroller (gdb_input_regex_input)
         with the status bar as echo; here the status command line holds
-        the pattern and Enter jumps. The hit lands at the top of the
-        visible region, in scroll mode.
+        the pattern and Enter jumps. An empty pattern repeats the last one
+        in its original direction (`/` + Enter, interface.cpp:1008-1017);
+        the scan starts at the scroll cursor so a second match on the same
+        row is reachable, and wraps when `wrapscan` is on. C highlights
+        the match with HLG_INCSEARCH while typing -- live jumping is here,
+        the highlight remains on the gap list.
         """
         self._search_target = "console"
+        wrapscan = bool(self.config.get("wrapscan"))
         if not pattern:
-            return
+            if self._console_search is None:
+                self.message = "no previous search pattern"
+                return
+            pattern = self._console_search.pattern
+            forward = self._console_search_dir
         try:
             rx = re.compile(pattern, re.IGNORECASE
                             if bool(self.config.get("ignorecase")) else 0)
         except re.error as e:
             self.message = "bad pattern: %s" % e
             return
-        hit = self.console.search(rx, None, forward)
+        hit = self.console.search(rx, *self._console_search_origin(),
+                                  forward=forward, wrapscan=wrapscan)
         if hit is None:
             self.message = "pattern not found: %s" % pattern
             return
         self._console_search = rx
-        self._console_search_row = hit
-        self._goto_console_row(hit)
+        self._console_search_dir = forward
+        self._console_search_row, self._console_search_col = hit
+        self._goto_console_row(*hit)
         self.message = ""
+
+    def _console_search_origin(self):
+        """The (row, col) a console search starts scanning from: the scroll
+        cursor's absolute position (scroller.cpp:319-329)."""
+        h = self._console_height()
+        if not self.scroll.active:
+            self.scroll.enter(self.console.max_delta(h),
+                              row=self._console_cursor_row())
+        total = self.console.line_count()
+        row = total - self.scroll.delta - h + self.scroll.row
+        return (max(0, min(row, total - 1)), self.scroll.col)
 
     def _console_search_next(self, forward):
         """n/N in the GDB window's scroll mode (scr_search_next)."""
@@ -1105,23 +1421,40 @@ class CgdbApp:
             self.message = "no previous search pattern"
             return
         hit = self.console.search(self._console_search,
-                                  self._console_search_row, forward)
+                                  self._console_search_row,
+                                  self._console_search_col,
+                                  forward=forward,
+                                  wrapscan=bool(self.config.get("wrapscan")))
         if hit is None:
             self.message = "pattern not found"
             return
-        self._console_search_row = hit
-        self._goto_console_row(hit)
+        self._console_search_row, self._console_search_col = hit
+        self._goto_console_row(*hit)
         self.message = ""
 
-    def _goto_console_row(self, row):
-        """Position the console so `row` is the top visible row."""
+    def _goto_console_row(self, row, col=0):
+        """Put the hit row under the scroll cursor.
+
+        The hit lands at the top of the window when there is room below;
+        when it is inside the last `h` rows the view stays parked at the
+        bottom and the cursor moves onto the hit's row instead -- that is
+        where the next search continues from, so the cursor must actually
+        sit on it."""
         h = self._console_height()
+        total = self.console.line_count()
         if not self.scroll.active:
-            self.scroll.enter(self.console.max_delta(h))
-        self.scroll.delta = max(
-            0, min(self.console.line_count() - h - row,
-                   self.console.max_delta(h)))
-        self.scroll.row = 0
+            self.scroll.enter(self.console.max_delta(h),
+                              row=self._console_cursor_row())
+        row = max(0, min(row, max(0, total - 1)))
+        delta = total - h - row
+        if delta < 0:
+            delta = 0
+            self.scroll.row = max(0, min(h - 1, row - (total - h)))
+        else:
+            self.scroll.delta = min(delta, self.console.max_delta(h))
+            self.scroll.row = 0
+        self.scroll.delta = delta
+        self.scroll.col = min(col, max(0, self._gdb_width() - 1))
 
     def _do_colon(self, body):
         """Dispatch one `:` command.
@@ -1133,29 +1466,35 @@ class CgdbApp:
         """
         if not body:
             return
+        # command names are case-sensitive in C (the lexer keywords and the
+        # bsearch over commands[] both use strcmp); values stay case-blind
+        # because every value parser uses strcasecmp
         parts = body.split(None, 1)
-        cmd = parts[0].lower()
+        cmd = parts[0]
         arg = parts[1].strip() if len(parts) > 1 else ""
-        if cmd in ("q", "quit", "q!"):
+        if cmd in ("q", "quit"):
             self.quit()
             return
-        if cmd in ("h", "help"):
+        if cmd == "help":
             self.show_help()
             return
         # NUMBER: `:123` jumps to a line, `:+N` / `:-N` scroll by N
-        # (command_parse_string's NUMBER case). C clears the counter on
-        # anything that is not a digit; `+` / `-` alone are not numbers.
-        if cmd.isdigit() or (cmd[1:].isdigit() and cmd[0] in "+-"):
-            total = len(self.src) if self.src else 0
+        # (command_parse_string's NUMBER case). The lexer's NUMBER token is
+        # `[+-]?{D}+` followed by whatever -- the trailing junk is ignored,
+        # and `+` / `-` alone are not numbers.
+        m = re.match(r"^([+-]?\d+)", cmd)
+        if m and (cmd[0].isdigit() or cmd[0] in "+-"):
             if not self.src:
-                self.message = "no source file"
-                return
-            if cmd[0] == "+":
-                self.view.move_to(self.view.cursor + int(cmd[1:]), total)
-            elif cmd[0] == "-":
-                self.view.move_to(self.view.cursor - int(cmd[1:]), total)
+                return          # C's clamp_line is silent without a file
+            num = m.group(1)
+            if num[0] == "+":
+                self.view.move_to(self.view.cursor + int(num[1:]), len(self.src))
+            elif num[0] == "-":
+                self.view.move_to(self.view.cursor - int(num[1:]), len(self.src))
             else:
-                self.view.move_to(int(cmd) - 1, total)
+                self.view.move_to(int(num) - 1, len(self.src))
+            return
+        if cmd in ("+", "-"):
             return
         if cmd in _TGDB_COMMANDS:
             target = _TGDB_COMMANDS[cmd]
@@ -1169,9 +1508,10 @@ class CgdbApp:
             self.set_focus(FOCUS_GDB)
             return
         if cmd == "focus":
-            if arg == "cgdb":
+            low = arg.lower()
+            if low == "cgdb":
                 self.set_focus(FOCUS_SOURCE)
-            elif arg == "gdb":
+            elif low == "gdb":
                 self.set_focus(FOCUS_GDB)
             else:
                 self.message = "usage: :focus cgdb|gdb"
@@ -1191,8 +1531,8 @@ class CgdbApp:
             # C stubs this out too (command_do_bang returns 0)
             return
         if cmd == "syntax":
-            # command_parse_syntax: bare `:syntax` reports, `<lang>` forces
-            # -- the same value `:set syntax=` holds
+            # command_parse_syntax: bare `:syntax` reports, `<lang>` forces,
+            # `on`/`yes` highlight with the *detected* language
             if not arg:
                 forced = getattr(self.src, "_forced_lexer", None) \
                     if self.src else None
@@ -1207,14 +1547,14 @@ class CgdbApp:
             self._applied_syntax = None     # force (re)apply
             if self._apply_syntax_option():
                 self.message = "syntax: %s" % (
-                    "auto" if arg in ("", "unknown") else arg)
+                    "auto" if arg in ("", "unknown", "on", "yes") else arg)
             return
         if cmd in ("shell", "sh"):
             self._do_shell()
             return
         if cmd == "set":
             try:
-                result = self.config.execute("set " + arg if arg else "set")
+                result = self.config.apply_set(arg)
                 if isinstance(result, list):
                     self.message = "  ".join(result)
                 else:
@@ -1240,7 +1580,7 @@ class CgdbApp:
             self.console.clear()
             self.message = ""
             return
-        self.message = "unknown command: %s" % cmd
+        self.message = "Unknown command: %s" % body
 
     def _do_map(self, arg, insert):
         fields = arg.split(None, 1)
@@ -1251,7 +1591,7 @@ class CgdbApp:
         try:
             target = self.imap_set if insert else self.map_set
             target.add(lhs, rhs)
-            self.mapctx.set_map_set(self.map_set)
+            self._sync_map_set()
             self.message = "mapped %s -> %s" % (lhs, rhs)
         except ValueError as e:
             self.message = str(e)
@@ -1259,7 +1599,7 @@ class CgdbApp:
     def _do_unmap(self, arg, insert):
         target = self.imap_set if insert else self.map_set
         if target.remove(arg.strip()):
-            self.mapctx.set_map_set(self.map_set)
+            self._sync_map_set()
             self.message = "unmapped %s" % arg.strip()
         else:
             self.message = "no such mapping: %s" % arg.strip()
@@ -1277,12 +1617,14 @@ class CgdbApp:
 
     def _apply_syntax_option(self):
         """:set syntax=<lang> forces the lexer of the current file
-        (if_highlight_sviewer); ""/"unknown" returns to detection.
+        (if_highlight_sviewer); ""/"unknown" returns to detection, and
+        "on"/"yes" mean highlighting on with *detected* language
+        (command_parse_syntax: they never name a lexer).
         Returns False (and sets a message) for an unknown language."""
         value = str(self.config.get("syntax") or "")
         if value == self._applied_syntax:
             return True
-        forced = None if value in ("", "unknown") else value
+        forced = None if value in ("", "unknown", "on", "yes") else value
         if self.src:
             try:
                 self.src.force_lexer(forced)
@@ -1312,6 +1654,16 @@ class CgdbApp:
                 subprocess.call(shell)
             except OSError as e:
                 self.message = "shell unavailable (%s)" % e
+                return
+            # run_shell_command waits for one ENTER before handing the
+            # terminal back (cgdb.cpp:185-219), so the shell's last screen
+            # is not instantly erased by the redraw
+            try:
+                sys.stdout.write("\nHit ENTER to continue...")
+                sys.stdout.flush()
+                sys.stdin.readline()
+            except OSError:
+                pass
 
         run_in_terminal(spawn)
 
@@ -1383,6 +1735,14 @@ class CgdbApp:
         total = self._total_height()
         self.view.resize(max(1, total - 12))
         self._apply_split()
+        # keep the inferior's terminal size in step with the GDB pane
+        # (tgdb_resize_console -> TIOCSWINSZ on the shared pty); the
+        # Windows pipe tty has no size, so only the pty path reacts
+        if self.tty is not None:
+            try:
+                self.tty.resize(self._console_height(), self._gdb_width())
+            except Exception:
+                pass
 
     # =====================================================================
     # Split geometry (interface.cpp:560-752, 1789-1795)
@@ -1529,12 +1889,32 @@ class CgdbApp:
         self.window_shift = int(half * (mark / 2.0))
         self._apply_split()
 
+    def _sync_map_set(self):
+        """Point the mapping engine at the set the current focus uses
+        (cgdb.cpp:427-432: source -> :map, GDB -> :imap, dialog and
+        command line -> cleared)."""
+        target = {FOCUS_SOURCE: self.map_set,
+                  FOCUS_GDB: self.imap_set}.get(self.focus, self._empty_set)
+        if self.mapctx.map_set is not target:
+            self.mapctx.set_map_set(target)
+
     def set_focus(self, which):
         self.focus = which
-        target = {FOCUS_SOURCE: self.source_window,
-                  FOCUS_GDB: self.edit_window,
-                  FOCUS_COMMAND: self.cmdline_window,
-                  FOCUS_FILEDLG: self.filedlg_window}[which]
+        # cgdb swaps the active map set with the focus: without this a
+        # `:map q ...` would hijack the file dialog's q key.
+        self._sync_map_set()
+        # In GDB focus with scroll mode on, the console window is the
+        # focused control -- that is what makes prompt_toolkit draw the
+        # scroll cursor on it; otherwise the edit line keeps the focus (and
+        # its own cursor). cgdb switches the scroller's cursor visibility,
+        # which is the same distinction expressed differently.
+        if which == FOCUS_GDB and self.scroll.active:
+            target = self.console_window
+        else:
+            target = {FOCUS_SOURCE: self.source_window,
+                      FOCUS_GDB: self.edit_window,
+                      FOCUS_COMMAND: self.cmdline_window,
+                      FOCUS_FILEDLG: self.filedlg_window}[which]
         # The dialog replaces the whole screen, so crossing its boundary
         # needs a new layout tree; ordinary focus moves stay in one tree.
         was_dialog = self._filedlg_active
@@ -1566,12 +1946,22 @@ class CgdbApp:
     # Rendering
     # =====================================================================
     def _source_text(self):
+        """One frame of the source pane (source_display, sources.cpp:760-1058).
+
+        Per line: `lineno │ marker text`, lwidth = digits of the line count
+        (no minimum). Breakpoints have no character of their own -- they
+        color the line NUMBER, red for enabled and yellow for disabled,
+        ahead of the executing (green) and selected (white) line numbers.
+        The bar column shows a mark char, the arrow styles' `├`, or the
+        plain `│` (bold while this pane is focused). The marker column is
+        `>` (shortarrow) or `────>` / a block that reaches to the line's
+        first non-blank (longarrow / block); the `highlight` styles paint
+        the whole line. Past EOF the rows are `~` lines, and a file shorter
+        than the window is block-centered -- the top line is *derived* from
+        the cursor each frame (sources.cpp:837-847), which is what keeps
+        the cursor line vertically centered like the C version.
+        """
         width = self._source_width()
-        # Both panes have layout-determined heights (weighted D()), so the
-        # previous frame's render_info is a stable answer and there is no
-        # content/height circularity. Emit exactly the visible rows: padding to
-        # a fixed budget would push the real lines out of the window, because
-        # prompt_toolkit displays formatted text from the top.
         h = self._source_height()
         self.view.height = h
         if self.src is None:
@@ -1579,43 +1969,109 @@ class CgdbApp:
                          " open one with :open <path>, or start debugging\n"
                          " F5 run   F8 next   F10 step   :q quit")]
         total = len(self.src)
-        self.view.ensure_visible()
-        numw = max(4, len(str(total)) + 1)
+        if total == 0:
+            return [("", " CGDB (Python) -- empty source file")]
+        top = self.view.top_line(total, h)
+        self.view.top = top
+        lwidth = len(str(total))
         tabstop = int(self.config.get("tabstop"))
         showmarks = bool(self.config.get("showmarks"))
-        gutter_w = 1 + numw + 2 + 1
-        avail = max(0, width - gutter_w)
+        eld = str(self.config.get("executinglinedisplay"))
+        sld = str(self.config.get("selectedlinedisplay"))
+        gutter = lwidth + 2
+        avail = max(0, width - gutter)
+        focused = (self.focus == FOCUS_SOURCE)
+        # cap the horizontal scroll at the longest line (sources.cpp:1091-1110)
+        max_left = max(0, self.src.display_max_width(tabstop) - avail + 6)
+        left = min(self.view.left, max_left)
+        self.view.left = left
+        exe_line_no = None
+        if self.exec_line and self._same_file(self.exec_line[0],
+                                              self.src.path):
+            exe_line_no = self.exec_line[1] - 1
 
         out = []
-        for i in range(self.view.top, min(self.view.top + h, total)):
+        for r in range(h):
+            line = top + r
             if out:
                 out.append(("", "\n"))
-            lineno = i + 1
-            cur = (i == self.view.cursor)
-            sel = "class:selected-line " if cur else ""
-            is_exec = bool(self.exec_line and self.exec_line[1] == lineno
-                           and self._same_file(self.exec_line[0],
-                                               self.src.path))
-            bps = self.breakpoints.at(self.src.path, lineno)
-            out.append((sel + "class:breakpoint", "B" if bps else " "))
-            out.append((sel + ("class:line-number.current" if cur
-                               else "class:line-number"),
-                        "%*d" % (numw, lineno)))
-            out.append((sel + "class:exec-arrow", "=>" if is_exec else "  "))
-            mark = None
-            for ch, ln in self.view.marks.items():
-                if ln == i:
-                    mark = ch
-                    break
-            if mark and showmarks:
-                out.append((sel + "class:breakpoint", mark))
-            else:
-                out.append((sel, " "))
+            if line < 0 or line >= total:
+                out.append(("class:line-number", " " * (lwidth - 1) + "~"))
+                out.append(("class:vline-focus" if focused
+                            else "class:vline", "│"))
+                out.append(("", " "))
+                continue
+            lineno = line + 1
+            is_sel = (line == self.view.cursor)
+            is_exe = (line == exe_line_no)
+            raw = self.src.line(line)
+            leading = len(raw) - len(raw.lstrip(" \t"))
 
-            text = self.src.line(i)
-            toks = self.src.tokens_for_line(i)
+            # --- line number cell: breakpoint color wins, then exe, sel ---
+            bp = self.breakpoints.line_status(self.src.path, lineno)
+            if bp == "enabled":
+                numcls = "class:breakpoint"
+            elif bp == "disabled":
+                numcls = "class:breakpoint.disabled"
+            elif is_exe:
+                numcls = "class:line-number.executing"
+            elif is_sel:
+                numcls = "class:line-number.current"
+            else:
+                numcls = "class:line-number"
+            out.append((numcls, "%*d" % (lwidth, lineno)))
+
+            # --- which display style governs this line (exe wins over sel) --
+            if is_exe:
+                style, arrow_cls = eld, "class:exec-arrow"
+                block_cls, hl_cls = "class:exec-block", \
+                    "class:exec-line-highlight"
+            elif is_sel:
+                style, arrow_cls = sld, "class:sel-arrow"
+                block_cls, hl_cls = "class:sel-block", "class:selected-line"
+            else:
+                style = None
+
+            # --- bar column: mark > arrow-style LTEE > plain VLINE --------
+            mark = None
+            if showmarks:
+                for ch, ln in self.view.marks.items():
+                    if ln == line:
+                        mark = ch
+                        break
+            if mark is not None:
+                out.append(("class:mark", mark))
+            elif is_exe and style in ("shortarrow", "longarrow"):
+                out.append((arrow_cls, "├"))
+            elif is_sel and style in ("shortarrow", "longarrow"):
+                out.append((arrow_cls, "├"))
+            else:
+                out.append(("class:vline-focus" if focused
+                            else "class:vline", "│"))
+
+            # --- marker column; longarrow/block reach over the leading ws --
+            colskip = 0
+            if style == "shortarrow":
+                out.append((arrow_cls, ">"))
+            elif style == "longarrow":
+                n = max(0, leading - (left + 1))
+                out.append((arrow_cls, "─" * n + ">"))
+                colskip = n
+            elif style == "block":
+                n = max(0, leading - (left + 1))
+                out.append(("", " " * n))
+                out.append((block_cls, " "))
+                colskip = n
+            elif style == "highlight":
+                out.append((hl_cls, " "))
+            else:
+                out.append(("", " "))
+
+            # --- text -------------------------------------------------------
+            line_cls = hl_cls if style == "highlight" else ""
+            eff_left = left + colskip
+            toks = self.src.tokens_for_line(line)
             col = 0
-            left = self.view.left
             if toks:
                 for tok, val in toks:
                     if col >= avail:
@@ -1623,24 +2079,43 @@ class CgdbApp:
                     val = val.expandtabs(tabstop)
                     if not val:
                         continue
-                    if left:
-                        if len(val) <= left:
-                            left -= len(val)
+                    if eff_left:
+                        if len(val) <= eff_left:
+                            eff_left -= len(val)
                             continue
-                        val = val[left:]
-                        left = 0
+                        val = val[eff_left:]
+                        eff_left = 0
                     room = avail - col
-                    out.append((sel + style_for_token(tok), val[:room]))
+                    out.append((line_cls + style_for_token(tok), val[:room]))
                     col += len(val[:room])
             else:
-                body = text.expandtabs(tabstop)
-                body = body[self.view.left:self.view.left + avail]
-                out.append((sel, body))
+                body = raw.expandtabs(tabstop)[left + colskip:
+                                               left + colskip + avail]
+                out.append((line_cls, body))
                 col = len(body)
-            if cur and col < avail:
-                # cgdb paints the whole current line, not just its text
-                out.append((sel, " " * (avail - col)))
+            if line_cls and col < avail:
+                # the highlight styles paint the whole row, not just the text
+                out.append((line_cls, " " * (avail - col)))
+            if is_sel:
+                # a written cell for the terminal cursor to sit on --
+                # curses leaves it right after the last character
+                # (swin_curs_set + the final wrefresh in source_display)
+                if col < avail:
+                    out.append(("", " "))
+                self._cursor_cell = (r, gutter + min(col, avail - 1))
         return out
+
+    def _source_cursor_pos(self):
+        """Cursor at the end of the selected line (sources.cpp:831 + the
+        final focus refresh in interface.cpp). The cell itself is written
+        by _source_text and recorded there, because prompt_toolkit can
+        only place a cursor on a cell that exists."""
+        if self.src is None or not len(self.src) or self.focus != FOCUS_SOURCE:
+            return None
+        cell = getattr(self, "_cursor_cell", None)
+        if cell is None:
+            return None
+        return Point(x=cell[1], y=cell[0])
 
     @staticmethod
     def _same_file(a, b):
@@ -1661,44 +2136,100 @@ class CgdbApp:
             self.console.resize(live)
         h = self._console_height()
         delta = self.scroll.delta if self.scroll.active else 0
-        # exactly h rows, top-padded, so the newest output sits at the bottom
-        # of the pane the way a terminal would. Rows are shifted left by the
-        # scroll-mode horizontal offset (scr_left).
-        left = self.console_left if self.scroll.active else 0
-        lines = self.console.visible_lines(h, delta)
+        # up to h rows, filled from the top like a real terminal (vterm
+        # writes from row 0): sparse output leaves the bottom blank, the
+        # current line is the last one, exactly as a terminal looks.
+        rows = self.console.visible_lines(h, delta)
         out = []
-        for i, ln in enumerate(lines):
+        for i, ln in enumerate(rows):
             if i:
                 out.append(("", "\n"))
-            out.append(("class:console", ln[left:] if left else ln))
-        if self.scroll.active:
-            out.append(("class:status", " " + self.scroll.status(
-                self.console.max_delta(h))))
+            if i == 0 and self.scroll.active:
+                # scroller.cpp:632-644: [delta/scrollback] overlays the
+                # RIGHT edge of the first row while scroll mode is on
+                status = self.scroll.status(self.console.max_delta(h))
+                cut = max(0, live - len(status))
+                pad = max(0, cut - len(ln))
+                out.append(("class:console", ln[:cut] + " " * pad))
+                out.append(("class:scroll-status", status))
+            else:
+                out.append(("class:console", ln))
         return out
 
+    def _console_cursor_pos(self):
+        """The scroll-mode cursor, drawn on the console window while it is
+        the focused GDB control (scroller.cpp:587-593). The column is
+        clamped onto the row -- prompt_toolkit can only place a cursor on
+        a written cell."""
+        if not self.scroll.active:
+            return None
+        h = self._console_height()
+        rows = self.console.visible_lines(h, self.scroll.delta)
+        r = self.scroll.row
+        if not 0 <= r < len(rows):
+            return None
+        col = min(self.scroll.col, len(rows[r]))
+        return Point(x=col, y=r)
+
     def _status_text(self):
-        parts = []
-        focus_name = {FOCUS_SOURCE: "CGDB", FOCUS_GDB: "GDB",
-                      FOCUS_COMMAND: "CMD"}[self.focus]
-        parts.append(("class:status.focus", " %s " % focus_name))
-        if self.src:
-            pos = "%d/%d" % (self.view.cursor + 1, len(self.src))
-            parts.append(("class:status", " %s  %s " % (self.src.name, pos)))
-        else:
-            parts.append(("class:status", " no file "))
-        if self.exec_line:
-            parts.append(("class:status", " line %d " % self.exec_line[1]))
-        if self.running_inferior:
-            parts.append(("class:status.focus", " RUNNING "))
+        """The status row in C's shape (update_status_win, interface.cpp:429-478).
+
+        The content is the current file's full path, or a pending message
+        replacing the whole row until the next key (if_display_message);
+        over-long content shows its tail behind a `>`. The `*` the C source
+        paints for GDB focus is dead code there -- if_display_message
+        repaints the full row right after it -- and the official cgdb
+        shows none either (measured), so neither does this.
+        """
+        width = max(1, self._source_width())
         if self.message:
-            parts.append(("class:command", " %s" % self.message))
-        return parts
+            text = self.message
+        elif self.src:
+            text = self.src.path
+        else:
+            text = ""
+        if len(text) > width:
+            text = ">" + text[len(text) - width + 1:]
+        return [("class:status", text)]
+
+    def _help_text(self):
+        lines = [
+            "CGDB (Python) -- key reference",
+            "",
+            "ESC    switch to the source window      i / s    switch to the GDB window (s = scroll mode)",
+            "j k    move (with a count prefix)         h l     scroll the source columns",
+            "Ctrl-D/U, Ctrl-F/B, PageUp/Down           gg / G  top / bottom (G with a count goes to the line)",
+            "m<ch>  set mark a-z (same line: remove)   '<ch>   jump to mark; '' back; '. the executing line",
+            "/ ?    search forward / backward          n N     next / previous match",
+            "space  toggle breakpoint at the cursor    t       temporary breakpoint",
+            "F5     run    F6 continue    F7 finish    F8 next    F10 step",
+            "u      run until the cursor line          o       open the file dialog",
+            "Ctrl-W toggle split orientation           = - + _ resize the split",
+            ":      command line (:set, :map, :q ...)  Ctrl-L  redraw",
+            "Ctrl-C interrupt the inferior             q here  close this help",
+            "",
+            "press q to exit help",
+        ]
+        out = []
+        for i, text in enumerate(lines):
+            if i:
+                out.append(("", "\n"))
+            cls = "class:filedlg.label" if i in (0, len(lines) - 1) else ""
+            out.append((cls, text))
+        return out
 
     def show_help(self):
-        self.message = ("F5 run  F6 continue  F7 finish  F8 next  F10 step  "
-                        "ESC source  i gdb  space breakpoint  / search  "
-                        ": command  Ctrl-W split  = - + _ resize  "
-                        "Ctrl-L redraw")
+        """:help / F1 -- the full-screen key reference.
+
+        C swaps the whole screen for the tgdb help file; this port shows
+        its own reference page the same way (q closes).
+        """
+        self._help_active = True
+        self._rebuild_layout()
+
+    def _close_help(self):
+        self._help_active = False
+        self._rebuild_layout()
 
     # =====================================================================
     # GDB interaction
@@ -1794,7 +2325,6 @@ class CgdbApp:
 
     def _on_stopped(self, payload):
         self.running_inferior = False
-        reason = (payload or {}).get("reason", "")
         frame = (payload or {}).get("frame") or {}
         if isinstance(frame, list):
             frame = frame[0] if frame else {}
@@ -1807,8 +2337,6 @@ class CgdbApp:
         if fullname and line:
             self.exec_line = (fullname, line)
             self.goto_file_line(fullname, line)
-        if reason:
-            self.message = "stopped: %s" % reason
         self.refresh_breakpoints()
         self.invalidate()
 
@@ -1816,6 +2344,24 @@ class CgdbApp:
         if cls in ("breakpoint-created", "breakpoint-modified",
                    "breakpoint-deleted"):
             if self.breakpoints.absorb_async(cls, payload):
+                self.invalidate()
+        elif cls == "thread-selected":
+            # switching threads moves the source position too: C treats
+            # =thread-selected exactly like *stopped and runs it through
+            # source_position_changed (tgdb.cpp:486-504); `thread 2` typed
+            # at the GDB window produces only this record.
+            frame = (payload or {}).get("frame") or {}
+            if isinstance(frame, list):
+                frame = frame[0] if frame else {}
+            fullname = frame.get("fullname")
+            line = frame.get("line")
+            try:
+                line = int(line) if line is not None else None
+            except (TypeError, ValueError):
+                line = None
+            if fullname and line:
+                self.exec_line = (fullname, line)
+                self.goto_file_line(fullname, line)
                 self.invalidate()
         elif cls == "thread-group-exited":
             self.running_inferior = False
@@ -1863,14 +2409,17 @@ class CgdbApp:
 
     def send_console_command(self, text):
         """Run a user-typed gdb command and echo it into the console."""
-        self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
         if not self.gdb or not self.gdb.running:
+            self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
             self.console.add_text("cgdb: gdb is not running\n")
             return
         if self.running_inferior and self.tty is not None:
-            # the inferior owns the terminal; forward raw input to it
+            # the inferior owns the terminal; the input goes to it raw and
+            # is echoed without a (gdb) prompt -- the prompt belongs to
+            # gdb, which is not reading input while the inferior runs
             self.tty.write(text + "\n")
             return
+        self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
         threading.Thread(target=self._console_command_worker, args=(text,),
                          daemon=True).start()
 
@@ -1911,9 +2460,11 @@ class CgdbApp:
         self.invalidate()
 
     def gdb_run(self):
+        # C's F5 is TGDB_RUN, unconditionally: while the inferior runs the
+        # command queues and restarts it once gdb is back in charge. Break
+        # in first so a running inferior actually sees the run.
         if self.running_inferior:
-            self.gdb_continue()
-            return
+            self.interrupt()
         self._run_async("-exec-run")
 
     def gdb_continue(self):
@@ -1928,17 +2479,28 @@ class CgdbApp:
     def gdb_finish(self):
         self._run_async("-exec-finish")
 
-    def gdb_until(self, line=None):
-        if line:
-            self._run_async('-exec-until %d' % line)
-        else:
-            self._run_async("-exec-until")
+    def gdb_until(self, path=None, line=None):
+        """`u`: run until the displayed file's line.
+
+        tgdb passes path AND line (tgdb_request_until_line); when the
+        source window shows some other file than the current frame, an
+        `-exec-until N` would silently target the frame's file, so the
+        cross-file case goes through the console spelling gdb expects.
+        """
+        if not path or not line or (self.exec_line and
+                                    self._same_file(self.exec_line[0], path)):
+            self._run_async("-exec-until %d" % (line or 0))
+            return
+        self._run_async('-interpreter-exec console %s'
+                        % mi.quote('until "%s":%d' % (path, line)))
 
     def gdb_up(self):
-        self._run_async("-exec-up")
+        # MI has no -exec-up/-exec-down; the console commands are what
+        # tgdb sends for both (tgdb.cpp:836-838)
+        self._run_async('-interpreter-exec console %s' % mi.quote("up"))
 
     def gdb_down(self):
-        self._run_async("-exec-down")
+        self._run_async('-interpreter-exec console %s' % mi.quote("down"))
 
     def interrupt(self):
         if self.gdb:
@@ -2012,6 +2574,16 @@ class CgdbApp:
         path = os.path.expanduser(path)
         if not os.path.isabs(path):
             path = os.path.abspath(path)
+        # re-opening the current buffer keeps the view: `:e` re-reads only
+        # when the file changed on disk, and choosing the already-open file
+        # from the dialog leaves the cursor exactly where it was
+        # (source_set_exec_line / source_reload, sources.cpp:1112-1181)
+        if self.src and self._same_file(self.src.path, path):
+            self._reload_if_changed()
+            if line:
+                self.view.move_to(line - 1, len(self.src))
+            self.invalidate()
+            return
         if not os.path.exists(path):
             self.message = "no such file: %s" % path
             return
@@ -2020,21 +2592,44 @@ class CgdbApp:
         except OSError as e:
             self.message = "cannot read %s: %s" % (path, e)
             return
-        self.src.ensure_highlighted()
-        self.view.top = 0
+        self.src.ensure_highlighted(
+            on_done=lambda _f: self._call_on_ui_thread(self.invalidate))
         self.view.left = 0
+        self.view.marks = {}
         # a :set syntax=<lang> from before this file was open applies now
         self._applied_syntax = None
         self._apply_syntax_option()
         self.view.cursor = max(0, (line or 1) - 1)
-        self.view.ensure_visible()
         self.console.resize(self._gdb_width())
         self.message = "%s (%d lines, %s)" % (self.src.name, len(self.src),
                                               self.src.encoding)
         self.invalidate()
 
+    def _reload_if_changed(self, force=False):
+        """source_reload: re-read the current file when its mtime moved
+        (autosourcereload runs on every stop; `:e` checks the same dirty
+        test), keeping the cursor where it was (sources.cpp:1363-1400)."""
+        if not self.src:
+            return
+        if not force and not (bool(self.config.get("autosourcereload"))
+                              and self.src.changed_on_disk()):
+            return
+        try:
+            fresh = SourceFile(self.src.path)
+        except OSError:
+            return
+        cursor = self.view.cursor
+        self.src = fresh
+        self.src.ensure_highlighted(
+            on_done=lambda _f: self._call_on_ui_thread(self.invalidate))
+        self.view.move_to(min(cursor, max(0, len(self.src) - 1)),
+                          len(self.src))
+        self._applied_syntax = None
+        self._apply_syntax_option()
+
     def goto_file_line(self, path, line):
         if self.src and self._same_file(self.src.path, path):
+            self._reload_if_changed()
             self.view.move_to(line - 1, len(self.src))
             self.invalidate()
             return
@@ -2065,6 +2660,7 @@ class CgdbApp:
     def run(self):
         ok = self.start_gdb()
         self.relayout()
+        self.run_rc_commands()
         if not ok:
             self.message = "gdb did not start; :q to quit"
         try:
@@ -2075,3 +2671,25 @@ class CgdbApp:
             if self.gdb:
                 self.gdb.stop()
         return 0
+
+    def run_rc_commands(self):
+        """Replay the rc file's command lines.
+
+        command_parse_file runs after kui and tgdb exist but before the
+        first frame, so rc `map`/`set`/`:start` all take effect; errors are
+        reported per line and parsing continues (cgdbrc.cpp:1101-1134).
+        """
+        for lineno, line in self.rc_lines:
+            self.message = ""
+            try:
+                self._do_colon(line)
+            except Exception as e:
+                self.console.add_text(
+                    "Error parsing line %d: %s\n" % (lineno, e))
+                continue
+            # an unknown command is a parse failure in C's rc path too
+            if self.message.startswith("Unknown command"):
+                self.console.add_text(
+                    "Error parsing line %d: %s\n" % (lineno, self.message))
+        self.message = ""
+        self.rc_lines = []

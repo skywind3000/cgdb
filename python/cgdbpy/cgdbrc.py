@@ -50,10 +50,13 @@ class Option:
 
 
 # (name, abbreviation, kind, default, allowed values or None)
+# arrowstyle is the deprecated alias of executinglinedisplay: C's
+# command_set_arrow_style writes CGDBRC_EXECUTING_LINE_DISPLAY and rejects
+# "block" (cgdbrc.cpp:419-435), which the choices here mirror.
 _SPEC = [
     ("arrowstyle", "as", STRING, LINE_DISPLAY_SHORT_ARROW,
      (LINE_DISPLAY_SHORT_ARROW, LINE_DISPLAY_LONG_ARROW,
-      LINE_DISPLAY_HIGHLIGHT, LINE_DISPLAY_BLOCK)),
+      LINE_DISPLAY_HIGHLIGHT)),
     ("autosourcereload", "asr", BOOL, 1, None),
     ("cgdbmodekey", "cgdbmodekey", STRING, "esc", None),
     ("color", "color", BOOL, 1, None),
@@ -102,14 +105,18 @@ class Config:
 
     # --- lookup -----------------------------------------------------------
     def resolve(self, token):
-        """Find an option by full name or abbreviation."""
-        t = token.lower()
-        if t in self._opts:
-            return self._opts[t]
-        if t in self._by_abbrev:
-            return self._by_abbrev[t]
+        """Find an option by full name or abbreviation.
+
+        Case-sensitive, like C's strcmp/bsearch over the option table; only
+        the unambiguous-prefix convenience (vim's `set ignore`) is an
+        addition on top.
+        """
+        if token in self._opts:
+            return self._opts[token]
+        if token in self._by_abbrev:
+            return self._by_abbrev[token]
         # vim allows unambiguous prefixes of the full name
-        hits = [o for n, o in self._opts.items() if n.startswith(t)]
+        hits = [o for n, o in self._opts.items() if n.startswith(token)]
         if len(hits) == 1:
             return hits[0]
         return None
@@ -131,27 +138,63 @@ class Config:
 
     # --- mutation ---------------------------------------------------------
     def set(self, name, value=None):
-        """`:set name=value`. A missing value means 1 for bool/int options."""
+        """``:set name`` / ``:set name=value`` / ``:set noname``.
+
+        The `no` prefix is C's way of clearing a boolean (cgdbrc.cpp:910-915)
+        and only a boolean -- `set notabstop` is an error there. Values are
+        compared case-insensitively, because every C value parser uses
+        strcasecmp; option *names* are case-sensitive, because the C table
+        lookups use strcmp.
+        """
+        name = name.strip()
+        no_prefix = False
+        if name.startswith("no") and len(name) > 2:
+            stripped = name[2:]
+            if self.resolve(stripped) is not None:
+                o_probe = self.resolve(stripped)
+                if o_probe.kind != BOOL:
+                    raise ConfigError(
+                        "cannot use 'no' prefix with non-boolean %s"
+                        % o_probe.name)
+                name = stripped
+                no_prefix = True
         o = self.resolve(name)
         if o is None:
             raise ConfigError("unknown option: %s" % name)
+        if no_prefix:
+            if o.kind != BOOL:
+                raise ConfigError(
+                    "cannot use 'no' prefix with non-boolean %s" % o.name)
+            value = 0
         if value is None:
-            value = 1 if o.kind in (BOOL, INT) else ""
+            # no value given: a boolean turns on; int/string options report
+            # their current value instead of being clobbered (C errors on
+            # `set tabstop` -- showing the value is friendlier and cannot
+            # break the rendering the way tabstop=1 would)
+            if o.kind == BOOL:
+                value = 1
+            else:
+                return o.value
         if o.kind == BOOL:
             new = self._to_bool(value, o)
         elif o.kind == INT:
             new = self._to_int(value, o)
         else:
-            new = str(value)
-            if o.choices and new.lower() not in o.choices:
+            new = str(value).strip().lower()
+            if o.choices and new not in o.choices:
                 raise ConfigError(
                     "invalid value '%s' for %s (expected one of: %s)"
                     % (value, o.name, ", ".join(o.choices)))
-            new = new.lower()
         old = o.value
         o.value = new
         if o.on_change and new != old:
             o.on_change(o.name, new, old)
+        # arrowstyle is the deprecated alias: writing it also writes
+        # executinglinedisplay (command_set_arrow_style)
+        if o.name == "arrowstyle" and new != old:
+            self._opts["executinglinedisplay"].value = new
+        if o.name == "executinglinedisplay":
+            self._opts["arrowstyle"].value = new
         return new
 
     def _to_bool(self, value, o):
@@ -185,45 +228,59 @@ class Config:
         return [self.describe(n) for n in self.names()]
 
     # --- rc file ----------------------------------------------------------
-    def load_file(self, path):
-        """Parse a cgdbrc file. Unknown lines raise ConfigError."""
-        errors = []
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for lineno, raw in enumerate(f, 1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    self.execute(line)
-                except ConfigError as e:
-                    errors.append("%s:%d: %s" % (path, lineno, e))
-        return errors
+    def apply_set(self, arg):
+        """Parse and apply one `set` argument (command_parse_set).
 
-    def execute(self, line):
-        """Execute one `:` command line (without the leading colon)."""
-        line = line.strip()
-        if not line:
-            return None
-        parts = line.split(None, 1)
-        cmd = parts[0].lower()
-        rest = parts[1] if len(parts) > 1 else ""
-        if cmd == "set":
-            return self._do_set(rest)
-        raise ConfigError("not a config command: %s" % line)
-
-    def _do_set(self, arg):
+        Returns the new/current value, or the option dump for a bare
+        `set` / `set all`; raises ConfigError on anything C would reject.
+        """
         arg = arg.strip()
-        if not arg:
-            return self.dump()
-        if arg == "all":
+        if not arg or arg == "all":
             return self.dump()
         if "=" in arg:
             name, value = arg.split("=", 1)
             return self.set(name.strip(), value.strip())
-        # `:set foo` with no value: bool/int -> 1, string -> show current
-        o = self.resolve(arg)
-        if o is None:
-            raise ConfigError("unknown option: %s" % arg)
-        if o.kind == STRING:
-            return o.value
         return self.set(arg)
+
+
+def read_rc_commands(path):
+    """Read a cgdbrc file into (lineno, command) pairs.
+
+    command_parse_file (cgdbrc.cpp:1101-1134) feeds every line to the full
+    command parser, so the rc file is a command language, not a `set`-only
+    config: `map`, `imap`, `syntax`, `focus`, line numbers, everything a
+    `:` line accepts. The lexer rules carried over here: `#` starts a
+    comment anywhere on the line, a trailing backslash joins lines, and a
+    leading `:` on a command is optional. Errors are the caller's business
+    -- C reports "Error parsing line N" and keeps going.
+    """
+    commands = []
+    pending = ""
+    start_line = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw_lines = f.readlines()
+    except OSError:
+        return commands
+    for lineno, raw in enumerate(raw_lines, 1):
+        line = raw.rstrip("\r\n")
+        if pending:
+            line = pending + line
+        if line.rstrip().endswith("\\"):
+            pending = line.rstrip()[:-1] + " "
+            if not start_line:
+                start_line = lineno
+            continue
+        pending = ""
+        start_line = start_line or lineno
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            start_line = 0
+            continue
+        if line.startswith(":"):
+            line = line[1:].strip()
+        commands.append((start_line, line))
+        start_line = 0
+    if pending:
+        commands.append((start_line or 1, pending.strip()))
+    return commands

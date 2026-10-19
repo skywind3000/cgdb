@@ -80,10 +80,10 @@ def parse_args(argv):
         if a == "--":
             opts["gdb_args"] = list(argv[i + 1:])
             break
-        if a == "--version":
+        if a == "--version" or a == "-v":
             print("CGDB (Python) %s" % VERSION)
             raise SystemExit(0)
-        if a == "--help":
+        if a == "--help" or a == "-h":
             print(USAGE)
             raise SystemExit(0)
         if a == "-d":
@@ -131,7 +131,7 @@ def main(argv=None):
 
     try:
         from cgdbpy.app import CgdbApp
-        from cgdbpy.cgdbrc import Config
+        from cgdbpy.cgdbrc import Config, read_rc_commands
     except ImportError as e:
         sys.stderr.write("cgdb: missing dependency: %s\n" % e)
         sys.stderr.write("Install with: pip install prompt_toolkit pygments\n")
@@ -140,13 +140,36 @@ def main(argv=None):
     config = Config()
     if opts["color"] is False:
         config.set("color", 0)
-    _load_rc(config)
+    # apply the rc's `set` lines right away so layout options shape the
+    # first frame; the remaining commands are replayed by the app once gdb
+    # is running (CgdbApp.run_rc_commands)
+    rc_lines = _load_rc()
+    for _lineno, _line in rc_lines:
+        if _line.split(None, 1)[0].lower() == "set":
+            try:
+                config.apply_set(_line.split(None, 1)[1])
+            except Exception:
+                pass
 
-    app = CgdbApp(gdb_path=opts["gdb"], gdb_args=opts["gdb_args"],
-                  config=config, source_path=opts["source"])
-    if opts["wait"]:
-        _wait_for_debugger()
-    return app.run()
+    try:
+        app = CgdbApp(gdb_path=opts["gdb"], gdb_args=opts["gdb_args"],
+                      config=config, source_path=opts["source"],
+                      rc_lines=rc_lines)
+        if opts["wait"]:
+            _wait_for_debugger()
+        return app.run()
+    except Exception as e:
+        # a full-screen TUI needs a real console; running under a pipe
+        # (mintty/cygwin without winpty, a service) dies inside
+        # prompt_toolkit with a traceback that names neither the fix nor
+        # the cause -- say it once, plainly
+        if "console" in type(e).__name__.lower() or "console" in str(e).lower():
+            sys.stderr.write(
+                "cgdb: no usable Windows console for the interface (%s)\n"
+                "Run cgdb from a console, or through winpty under mintty.\n"
+                % e)
+            return 1
+        raise
 
 
 def _executable_exists(path):
@@ -187,21 +210,20 @@ def _cgdb_home_dir():
     return os.path.join(home, ".cgdb")
 
 
-def _load_rc(config):
-    """Load <cgdb home>/cgdbrc, mirroring parse_cgdbrc_file (cgdb.cpp:244).
+def _load_rc():
+    """Read <cgdb home>/cgdbrc, mirroring parse_cgdbrc_file (cgdb.cpp:244).
 
-    That single file is all the C version reads -- not ~/.cgdbrc, and
-    not a per-project rc in the current directory.
+    That single file is all the C version reads -- not ~/.cgdbrc, and not a
+    per-project rc in the current directory. The rc file is a full `:`
+    command language (map/imap/syntax/set/...), so the lines are returned
+    for the app to replay once gdb is up; `set` lines mutate the config
+    immediately below so layout options apply to the first frame.
     """
+    from cgdbpy.cgdbrc import read_rc_commands
     path = os.path.join(_cgdb_home_dir(), "cgdbrc")
     if not os.path.exists(path):
-        return
-    try:
-        errors = config.load_file(path)
-    except OSError:
-        return
-    for e in errors:
-        sys.stderr.write("cgdb: %s\n" % e)
+        return []
+    return read_rc_commands(path)
 
 
 def _wait_for_debugger():
