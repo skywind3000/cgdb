@@ -81,7 +81,8 @@ class Request:
 class GdbClient:
     """Drives one gdb child process.
 
-    Callbacks (all optional, all invoked on the reader thread):
+    Callbacks (all optional, all invoked on the `gdb-mi-dispatch` thread -- see
+    doc/python_specs.md §2.2 for why that is not the reader thread):
       on_console(text)     ~ stream records: text meant for the user
       on_log(text)         & stream records: gdb's own echo
       on_target(text)      @ stream records: the inferior's output
@@ -117,6 +118,30 @@ class GdbClient:
         self.stats = {"bytes": 0, "lines": 0, "records": 0, "parse_errors": 0}
 
     # --- lifecycle --------------------------------------------------------
+    def _child_env(self):
+        """Environment for the gdb child, with PYTHONHOME removed.
+
+        A vendor gdb usually embeds its own CPython and resolves that
+        interpreter's stdlib from PYTHONHOME. When PYTHONHOME points at an
+        unrelated Python -- easy to arrange, since cgdb.py is itself a Python
+        program and its users tend to have one configured -- gdb dies during
+        startup with
+
+            Python initialization failed: Failed to import encodings module
+            <gdb>: warning: Python failed to initialize with PYTHONHOME set.
+            <gdb>/../etc/gdbinit:1: Error in sourced command file:
+            Python not initialized
+
+        and every command after that fails. Reproduced byte-for-byte against
+        mingw32 gdb 17.1 with PYTHONHOME=C:\\Share\\Python311. gdb's own advice
+        is `set python ignore-environment on`, but dropping the variable works
+        on every gdb version and cannot break anything: the child has its own
+        prefix, so PYTHONHOME is never the right answer for it.
+        """
+        env = dict(os.environ if self.env is None else self.env)
+        env.pop("PYTHONHOME", None)
+        return env
+
     def start(self):
         """Spawn gdb. Raises GdbError with a usable message on failure.
 
@@ -136,7 +161,7 @@ class GdbClient:
                 stderr=subprocess.STDOUT,
                 bufsize=0,
                 cwd=self.cwd,
-                env=self.env,
+                env=self._child_env(),
                 creationflags=creationflags,
             )
         except OSError as e:

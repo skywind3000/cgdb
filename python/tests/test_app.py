@@ -6,6 +6,7 @@ gdb is exercised separately in test_gdb_integration.py.
 """
 
 import os
+import sys
 import tempfile
 
 import pytest
@@ -143,8 +144,68 @@ def srcfile():
     os.unlink(path)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="win32 console output path")
+def test_console_output_reports_the_true_width(monkeypatch, srcfile):
+    """The layout must know the console's real width, or the last column of
+    every pane is dead space.
+
+    Win32Output.get_size() reports one column less than the console: it reads
+    the visible width off the 0-based closed interval as `Right - Left`, then
+    caps at `dwSize.X - 1` on top ("we avoid the right margin"). The renderer
+    never paints beyond the reported width, so the separator bar stopped one
+    cell short of the right edge -- visible against cgdb, which paints the
+    whole row. _console_output() must widen the size back to the truth.
+    """
+    from prompt_toolkit.output.win32 import Win32Output
+    from prompt_toolkit.output.windows10 import Windows10_Output
+
+    class Info:
+        class srWindow:
+            Left, Right, Top, Bottom = 0, 119, 0, 29
+
+        class dwSize:
+            X, Y = 120, 900
+
+        class dwCursorPosition:
+            X, Y = 0, 0
+
+    class FakeWin32(Win32Output):
+        """Enough of a Win32Output for the Renderer to be built against it.
+
+        The console-buffer calls are stubbed because pytest's stdout is not a
+        Windows console; Renderer.__init__ calls scroll_buffer_to_prompt
+        unconditionally, so that one has to exist and do nothing.
+        """
+
+        def __init__(self):
+            pass
+
+        def get_win32_screen_buffer_info(self):
+            return Info()
+
+        def scroll_buffer_to_prompt(self):
+            pass
+
+    # constructing a real Windows10_Output needs a console screen buffer;
+    # under pytest stdout is a pipe, so neuter the one query the constructor
+    # makes and swap in the fake afterwards
+    monkeypatch.setattr(Win32Output, "get_win32_screen_buffer_info",
+                        lambda self: None)
+    out = Windows10_Output(sys.stdout)
+    out.win32_output = FakeWin32()
+    monkeypatch.setattr("prompt_toolkit.output.create_output",
+                        lambda: out)
+
+    a = CgdbApp(config=Config(), source_path=srcfile,
+                client_factory=lambda *args: FakeGdb(),
+                tty_factory=lambda on_output: FakeTty(on_output))
+    assert a.app.output.get_size().columns == 120
+    assert a.app.output.get_size().rows == 30
+
+
 @pytest.fixture
-def app(srcfile):
+def bare_app(srcfile):
+    """A CgdbApp over a fake gdb, in cgdb's real startup state (GDB focus)."""
     fake = {}
 
     def factory(callbacks, gdb_path, gdb_args):
@@ -161,6 +222,19 @@ def app(srcfile):
     a.start_gdb()
     a._fake = fake
     return a
+
+
+@pytest.fixture
+def app(bare_app):
+    """bare_app with the focus a user gets by pressing ESC.
+
+    cgdb starts in the GDB window (interface.cpp:139), but most of these tests
+    drive source-window keys. Switching focus in the fixture keeps that
+    one-step removed from what they assert; the tests that care about the
+    startup state itself ask for bare_app.
+    """
+    bare_app.set_focus(FOCUS_SOURCE)
+    return bare_app
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +336,12 @@ def test_breakpoints_refreshed_at_startup(app):
     assert any(c.startswith("-break-info") for c in app._fake["gdb"].commands)
 
 
-def test_initial_focus_is_source(app):
-    assert app.focus == FOCUS_SOURCE
+def test_initial_focus_is_the_gdb_window(bare_app):
+    # interface.cpp:139 -- `static enum Focus focus = GDB`. Starting in the
+    # source window means the user's first keystrokes go nowhere visible,
+    # which reads as "the program is broken".
+    assert bare_app.focus == FOCUS_GDB
+    assert bare_app.app.layout.current_control is bare_app.edit_window.content
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +584,30 @@ def test_gdb_exit_is_reported(app):
     assert "gdb exited" in app.message
 
 
+def test_gdb_exit_takes_cgdb_down_with_it(app):
+    """Once gdb is gone there is nothing left to drive, so cgdb goes too.
+
+    EOF on the MI channel ends the C version's main_loop (cgdb.cpp:760-772).
+    """
+    assert app._gdb_ready, "start_gdb() should have marked gdb ready"
+    app._fake["gdb"].callbacks["on_exit"](0)
+    assert app._quitting
+    assert app._fake["gdb"].stopped
+
+
+def test_gdb_dying_during_startup_stays_up_to_show_why(app):
+    """A gdb that dies before it was usable must leave its error on screen.
+
+    prompt_toolkit restores the alternate screen on exit, so quitting here
+    would erase the only explanation the user has. This is the same reasoning
+    as the spawn-failure path in start_gdb().
+    """
+    app._gdb_ready = False
+    app._fake["gdb"].callbacks["on_exit"](1)
+    assert not app._quitting
+    assert "gdb exited" in "".join(t for _, t in app._console_text())
+
+
 # ---------------------------------------------------------------------------
 # command line
 # ---------------------------------------------------------------------------
@@ -513,6 +615,24 @@ def test_colon_enters_command_mode(app):
     app.dispatch(ord(":"))
     assert app.focus == FOCUS_COMMAND
     assert app.cmd_buffer.text == ":"
+
+
+def test_colon_in_gdb_focus_belongs_to_gdb(bare_app):
+    """In the GDB window `:` is just another character for gdb.
+
+    gdb_input() passes everything except PageUp and Ctrl-L straight through
+    (`default: result = 1` -- "this tells the input to go to active GDB
+    command", interface.cpp:996-1000). cgdb's `:` only exists in the source
+    window, which ESC reaches. Getting this backwards either steals `:` from a
+    gdb command line or swallows ordinary typing.
+    """
+    assert bare_app.focus == FOCUS_GDB
+    # the catch-all binding is filtered off, so prompt_toolkit's Buffer takes
+    # the keystroke instead of dispatch() ever seeing it
+    assert bare_app._buffer_owns_keys()
+    bare_app.dispatch(ord(":"))
+    assert bare_app.focus == FOCUS_GDB
+    assert bare_app.cmd_buffer.text == ""
 
 
 def test_set_command_applies(app):
@@ -540,6 +660,41 @@ def test_open_command_loads_a_file(app, srcfile):
 def test_open_command_with_a_line(app, srcfile):
     app.execute_command(":open %s:6" % srcfile)
     assert app.view.cursor == 5
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters are a Windows thing")
+def test_split_file_line_survives_windows_drive_letters(tmp_path):
+    """`:` is both the line separator and the drive separator.
+
+    A plain rpartition(":") reads `C:\\dir\\f.c` as file "C", and reads a
+    directory whose last component is numeric as a request for that line.
+    """
+    numeric = tmp_path / "123"
+    numeric.write_text("x\n")
+    split = CgdbApp._split_file_line
+
+    # an existing path wins outright, even when it ends in digits
+    assert split(str(numeric)) == (str(numeric), None)
+    # a real :line suffix still works, with either separator
+    assert split(str(numeric) + ":7") == (str(numeric), 7)
+    assert split("C:\\nope\\f.c:7") == ("C:\\nope\\f.c", 7)
+    assert split("C:/nope/f.c:7") == ("C:/nope/f.c", 7)
+    # a bare drive-letter path must not be cut at the drive colon
+    assert split("C:\\nope\\f.c") == ("C:\\nope\\f.c", None)
+    assert split("C:\\dir with space\\f.c:12") == ("C:\\dir with space\\f.c",
+                                                   12)
+    # and a plain number is a relative path, not a line number
+    assert split("42") == ("42", None)
+
+
+def test_split_file_line_on_posix_paths(tmp_path):
+    f = tmp_path / "f.c"
+    f.write_text("x\n")
+    split = CgdbApp._split_file_line
+    assert split(str(f)) == (str(f), None)
+    assert split(str(f) + ":9") == (str(f), 9)
+    assert split("/nope/f.c:9") == ("/nope/f.c", 9)
+    assert split("/nope/f.c") == ("/nope/f.c", None)
 
 
 def test_open_missing_file(app):
@@ -786,6 +941,64 @@ def test_status_rendering_shows_gdb_focus(app):
     app.focus = FOCUS_GDB
     joined = "".join(t for _, t in app._status_text())
     assert "GDB" in joined
+
+
+def render_window(window, cols=80, rows=1):
+    """Render one Window into a prompt_toolkit Screen and return it.
+
+    Going through write_to_screen rather than reading _status_text() is the
+    only way to see what lands in the cells past the end of the text, which is
+    exactly what "the bar stops halfway across the screen" is about.
+    """
+    from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+    from prompt_toolkit.layout.screen import Screen, WritePosition
+
+    screen = Screen()
+    window.write_to_screen(screen, MouseHandlers(),
+                           WritePosition(0, 0, cols, rows),
+                           parent_style="", erase_bg=True, z_index=None)
+    return screen
+
+
+def test_status_bar_background_spans_the_full_width(app):
+    """The bar must be painted to the right edge, not just under its text.
+
+    cgdb writes WIDTH spaces under HLG_STATUS_BAR before drawing the text
+    (interface.cpp:446-451). A bar that stops where the filename ends looks
+    broken on any terminal wider than the message.
+    """
+    screen = render_window(app.status_window, cols=80)
+    row = screen.data_buffer[0]
+    text = "".join(row[c].char for c in range(80)).rstrip()
+    assert 0 < len(text) < 80, "test needs a bar shorter than the window"
+    for c in range(len(text), 80):
+        assert "class:status" in row[c].style, (
+            "column %d, past the end of the text, has no status background: "
+            "char=%r style=%r" % (c, row[c].char, row[c].style))
+
+
+def test_command_line_occupies_the_status_row(app):
+    """`:` replaces the middle status bar, not the bottom gdb edit line.
+
+    cgdb draws cur_sbc into status_win (interface.cpp:459-472). Row order is
+    asserted structurally because the rendered position is what the user sees.
+    """
+    from prompt_toolkit.layout.containers import ConditionalContainer
+
+    kids = app.root.children
+    assert [k.content if isinstance(k, ConditionalContainer) else k
+            for k in kids] == [app.source_window, app.status_window,
+                               app.cmdline_window, app.console_window,
+                               app.edit_window]
+
+    status_cc, cmd_cc = kids[1], kids[2]
+    app.set_focus(FOCUS_SOURCE)
+    assert status_cc.filter() and not cmd_cc.filter()
+    app.set_focus(FOCUS_COMMAND)
+    assert cmd_cc.filter() and not status_cc.filter()
+    assert app.app.layout.current_control is app.cmdline_control
+    # the gdb edit line never moves
+    assert kids[-1] is app.edit_window
 
 
 # ---------------------------------------------------------------------------

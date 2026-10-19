@@ -97,9 +97,10 @@ def target():
 class Cgdb:
     """One cgdb.py session in a ConPTY."""
 
-    def __init__(self, target, extra=()):
+    def __init__(self, target, extra=(), env=None):
         self.target = target
         self.extra = list(extra)
+        self.env = env
         self.session = None
 
     def argv(self):
@@ -108,7 +109,7 @@ class Cgdb:
 
     def __enter__(self):
         self.session = ConPtySession(self.argv(), rows=ROWS, cols=COLS,
-                                     cwd=ROOT).__enter__()
+                                     cwd=ROOT, env=self.env).__enter__()
         return self
 
     def __exit__(self, *a):
@@ -156,12 +157,40 @@ class Cgdb:
                 out.append((i, line))
         return out
 
-    def status_line(self):
+    def status_row(self):
+        """Row index of the status bar -- the row between the two panes.
+
+        cgdb draws the `:` / `/` command line into this same row
+        (interface.cpp:459-472), so a test that cares *where* the user is
+        typing needs the index, not just the text.
+        """
         for i in range(self.screen.rows):
             line = self.screen.line(i)
             if "target.c" in line and ("CGDB" in line or "GDB" in line):
-                return line.strip()
-        return ""
+                return i
+        return None
+
+    def status_line(self):
+        i = self.status_row()
+        return self.screen.line(i).strip() if i is not None else ""
+
+    def to_gdb(self):
+        """Ensure the GDB window has focus, whatever the current state.
+
+        Idempotent on purpose: cgdb starts in the GDB window, so a test that
+        blindly sent `i` would type the letter into the edit line.
+        """
+        if self.focus() != "GDB":
+            self.send("i")
+            assert self.wait_focus("GDB", timeout=10), self.status_line()
+        self.settle(0.3)
+
+    def to_source(self):
+        """Ensure the source window has focus (what ESC gets a user)."""
+        if self.focus() != "CGDB":
+            self.key("esc")
+            assert self.wait_focus("CGDB", timeout=10), self.status_line()
+        self.settle(0.3)
 
     def focus(self):
         """The focus token from the status line: CGDB / GDB / CMD or ''.
@@ -236,7 +265,9 @@ def test_startup_shows_source_status_and_prompt(target):
         assert "int compute(int n)" in t
         assert "(gdb)" in t
         st = c.status_line()
-        assert st.startswith("CGDB"), st
+        # cgdb starts in the GDB window (interface.cpp:139) so commands can be
+        # typed straight away
+        assert st.startswith("GDB"), st
         assert "1/" in st
         assert c.session.parse_errors == []
 
@@ -252,6 +283,31 @@ def test_line_numbers_are_rendered(target):
         assert nums[:4] == ["1", "2", "3", "4"], nums
 
 
+@needs_gdb
+def test_pythonhome_in_our_env_does_not_break_gdb(target):
+    """A PYTHONHOME we inherit must not reach gdb.
+
+    Vendor gdb builds embed their own CPython and resolve its stdlib from
+    PYTHONHOME, so an unrelated value kills gdb during startup with
+    "Python initialization failed: Failed to import encodings module" and every
+    command after it. cgdb.py is itself a Python program, so its users are
+    exactly the people who have PYTHONHOME set.
+    """
+    env = dict(os.environ)
+    env["PYTHONHOME"] = os.path.dirname(os.path.dirname(PY))
+    with Cgdb(target, ["-q"], env=env) as c:
+        assert c.wait("(gdb)", timeout=30), c.text()
+        c.settle(0.8)
+        t = c.text()
+        assert "encodings module" not in t, t
+        assert "Python not initialized" not in t, t
+        # absence of the message is not enough -- prove gdb's embedded Python
+        # actually runs
+        c.to_gdb()
+        c.type_cmd("python print(6 * 7)")
+        assert c.wait("42", timeout=20), c.text()
+
+
 # ---------------------------------------------------------------------------
 # focus
 # ---------------------------------------------------------------------------
@@ -260,15 +316,15 @@ def test_focus_switch_i_and_esc(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("target.c", timeout=30)
         c.settle(0.8)
-        assert c.focus() == "CGDB", c.status_line()
-
-        c.send("i")
-        assert c.wait_focus("GDB", timeout=10), c.status_line()
+        assert c.focus() == "GDB", c.status_line()
 
         c.key("esc")
         # ESC needs ttimeoutlen (100 ms) to be released by prompt_toolkit's
         # VT parser; allow generously but assert it is not the old 500 ms bug
         assert c.wait_focus("CGDB", timeout=5), c.status_line()
+
+        c.send("i")
+        assert c.wait_focus("GDB", timeout=10), c.status_line()
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +335,7 @@ def test_gdb_command_is_echoed_and_answered(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         c.type_cmd("show language")
         assert c.wait("show language", timeout=15), c.text()
         # gdb 17.1 wording: `The current source language is "auto; currently c".`
@@ -294,8 +349,7 @@ def test_break_run_stop_marks_the_source(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         c.type_cmd("break main")
         assert c.wait("Breakpoint 1", timeout=20), c.text()
 
@@ -315,8 +369,7 @@ def test_next_advances_the_executing_line(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         c.type_cmd("break compute")
         assert c.wait("Breakpoint 1", timeout=20)
         c.type_cmd("run")
@@ -343,8 +396,7 @@ def test_inferior_output_is_shown(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         c.type_cmd("run")
         assert c.wait("MARKER result=42", timeout=40), c.text()
 
@@ -354,8 +406,7 @@ def test_continue_after_break_runs_to_exit(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         c.type_cmd("break main")
         assert c.wait("Breakpoint 1", timeout=20)
         c.type_cmd("run")
@@ -381,6 +432,7 @@ def test_space_toggles_a_breakpoint_marker(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("int compute", timeout=30)
         c.settle(0.8)
+        c.to_source()
         assert marked_rows(c) == [], "breakpoints present before any were set"
 
         def cursor_line():
@@ -431,6 +483,7 @@ def test_slash_search_moves_the_cursor(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("int compute", timeout=30)
         c.settle(0.8)
+        c.to_source()
         assert "1/" in c.status_line()
         c.send("/main")
         c.settle(0.4)
@@ -447,6 +500,7 @@ def test_G_and_gg_navigate(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("int compute", timeout=30)
         c.settle(0.8)
+        c.to_source()
         c.send("G")
         c.settle(0.8)
         st_last = c.status_line()
@@ -465,8 +519,7 @@ def test_pageup_enters_console_scroll_mode(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         # make some scrollback
         for _ in range(6):
             c.type_cmd("echo line\\n")
@@ -485,6 +538,7 @@ def test_set_command_reports_on_the_status_line(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("target.c", timeout=30)
         c.settle(0.8)
+        c.to_source()
         c.send(":set tabstop=4")
         c.settle(0.4)
         c.key("enter")
@@ -500,6 +554,9 @@ def test_unknown_colon_command_reports_an_error(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("target.c", timeout=30)
         c.settle(0.8)
+        # `:` is cgdb's only in the source window; in the GDB window it is just
+        # another character for gdb (interface.cpp:996-1000)
+        c.to_source()
         c.send(":nosuchcommand")
         c.settle(0.4)
         c.key("enter")
@@ -507,10 +564,44 @@ def test_unknown_colon_command_reports_an_error(target):
 
 
 @needs_gdb
+def test_command_line_lives_on_the_status_row(target):
+    """`:` is typed on the middle status bar, and the bar is restored after.
+
+    cgdb draws cur_sbc into status_win (interface.cpp:459-472) -- the row
+    between the two panes, not the bottom edit line. Two separate things go
+    wrong if this is missed: the prompt appears at the foot of the screen, and
+    stale status text survives past the end of the shorter command (erasing it
+    needs ECH, `CSI n X`, which the harness in conpty.py must implement).
+    """
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("target.c", timeout=30)
+        c.settle(0.8)
+        row = c.status_row()
+        assert row is not None, c.text()
+        bottom = c.screen.rows - 1
+
+        c.to_source()
+        c.send(":set tabstop=4")
+        c.settle(0.6)
+        assert c.screen.line(row).startswith(":set tabstop=4"), \
+            repr(c.screen.line(row))
+        assert "(gdb)" in c.screen.line(bottom), \
+            "command line landed on the bottom row: %r" % c.screen.line(bottom)
+
+        c.key("enter")
+        c.settle(1.0)
+        line = c.screen.line(row)
+        assert not line.lstrip().startswith(":"), \
+            "command text survived on the status bar: %r" % line
+        assert "target.c" in line, repr(line)
+
+
+@needs_gdb
 def test_quit_exits_cleanly(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("target.c", timeout=30)
         c.settle(0.8)
+        c.to_source()
         c.send(":q")
         c.settle(0.3)
         c.key("enter")
@@ -521,13 +612,31 @@ def test_quit_exits_cleanly(target):
 
 
 @needs_gdb
+def test_gdb_exit_takes_cgdb_down_with_it(target):
+    """`exit` typed at gdb must end cgdb too.
+
+    EOF on the MI channel makes tgdb_process() fail, which ends main_loop() and
+    the program (cgdb.cpp:760-772). A cgdb that outlives its gdb leaves the
+    user staring at a UI that can no longer do anything.
+    """
+    with Cgdb(target, ["-q"]) as c:
+        assert c.wait("(gdb)", timeout=30), c.text()
+        c.settle(0.5)
+        c.to_gdb()
+        c.type_cmd("exit")
+        end = time.time() + 20
+        while time.time() < end and not c.exited():
+            time.sleep(0.2)
+        assert c.exited(), "cgdb.py outlived gdb:\n%s" % c.text()
+
+
+@needs_gdb
 def test_quit_after_a_debug_session(target):
     """:q must work with a live inferior and a breakpoint set."""
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.4)
+        c.to_gdb()
         c.type_cmd("break main")
         assert c.wait("Breakpoint 1", timeout=20)
         c.type_cmd("run")
@@ -553,8 +662,7 @@ def test_no_vt_parse_errors_during_a_session(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
-        c.send("i")
-        c.settle(0.3)
+        c.to_gdb()
         c.type_cmd("break main")
         c.wait("Breakpoint 1", timeout=20)
         c.type_cmd("run")
@@ -577,8 +685,7 @@ def test_key_latency_is_not_the_500ms_escape_bug(target):
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("target.c", timeout=30)
         c.settle(1.0)
-        c.send("i")
-        assert c.wait_focus("GDB", timeout=10)
+        c.to_gdb()
         t0 = time.time()
         c.key("esc")
         ok = c.wait_focus("CGDB", timeout=10)

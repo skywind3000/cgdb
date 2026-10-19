@@ -170,6 +170,21 @@ inferior 的 tty 单独给（`-gdb-set inferior-tty`），否则它的 stdout �
     大文件走后台线程。
     测试：`test_source.py::test_windowed_lexing_is_demonstrably_wrong`。
 
+11. **启动时必须剔除 `PYTHONHOME` 再 spawn gdb。**
+    vendor gdb 内嵌自己的 CPython 并用 `PYTHONHOME` 找 stdlib；指到无关
+    解释器时 gdb 启动报 `Python initialization failed`，之后命令全错。
+    cgdb.py 的用户恰好最可能配了这个变量。见 `gdbclient.py` 的
+    `_child_env()` 和
+    `e2e/test_e2e.py::test_pythonhome_in_our_env_does_not_break_gdb`。
+
+12. **ptk 在 Windows 上把终端宽度少报一列，右边缘永远画不到。**
+    `Win32Output.get_size()` 用 `srWindow.Right - srWindow.Left`（0 基
+    闭区间，天然少 1）再减 1 封顶，分隔栏/状态条会在最右边缺一格。
+    `app.py:_console_output()` 把它补回真实宽度；全屏渲染期间 autowrap
+    是关着的，写最后一列不会滚屏。验证要读控制台属性
+    （`ReadConsoleOutputW`），VT 抓包会被 ConPTY 再序列化骗过。
+    测试：`test_app.py::test_console_output_reports_the_true_width`。
+
 ## 测试
 
 ```bash

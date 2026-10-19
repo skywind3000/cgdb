@@ -196,6 +196,15 @@ class VTScreen:
                     self.grid[self.r][cc] = " "
             else:
                 self.grid[self.r] = [" "] * self.cols
+        elif final == "X":
+            # ECH: erase `n` characters at the cursor, cursor does not move.
+            # prompt_toolkit emits this instead of writing spaces when a row
+            # gets shorter -- e.g. when the status bar is replaced by a shorter
+            # `:` command line. Dropping it left the old text on screen and made
+            # the swap look like a rendering bug in cgdb.
+            n = ps[0] if ps and ps[0] else 1
+            for cc in range(self.c, min(self.cols, self.c + n)):
+                self.grid[self.r][cc] = " "
         elif final == "L":
             n = ps[0] if ps else 1
             for _ in range(n):

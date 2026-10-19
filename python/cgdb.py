@@ -133,7 +133,11 @@ def main(argv=None):
 
 
 def _executable_exists(path):
-    if os.path.sep in path or (os.name == "nt" and ":" in path):
+    # dirname() rather than `os.path.sep in path`: on Windows a debugger may be
+    # given as `D:\Dev\mingw32\bin\gdb.exe`, `D:/Dev/mingw32/bin/gdb.exe` or
+    # the drive-relative `C:gdb.exe`, and only the first contains os.path.sep.
+    # Any of them is a path, not a bare name to look up on PATH.
+    if os.path.dirname(path):
         return os.path.exists(path)
     for d in os.environ.get("PATH", "").split(os.pathsep):
         if not d:

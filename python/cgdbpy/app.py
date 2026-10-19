@@ -6,11 +6,15 @@ and a `:` / `/` command line that replaces the status line while active.
     +------------------------------------------+
     | source pane (line numbers, bp marks)     |
     +------------------------------------------+
-    | status line                              |
+    | status line  <- the : and / command line |
     +------------------------------------------+
     | gdb console scrollback                   |
+    +------------------------------------------+
     | (gdb) <edit line>                        |
     +------------------------------------------+
+
+Focus starts in the GDB window, as in the C version, so gdb commands can be
+typed straight away.
 
 Two deliberate deviations from the C version, both recorded in
 doc/python_specs.md (§3.9 and §16.1):
@@ -32,6 +36,7 @@ import threading
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
@@ -141,11 +146,18 @@ class CgdbApp:
                  source_path=None, client_factory=None, tty_factory=None,
                  output=None):
         self.config = config or Config()
-        self.focus = FOCUS_SOURCE
+        # cgdb starts in the GDB window (interface.cpp:139,
+        # `static enum Focus focus = GDB`), so the user can type gdb commands
+        # immediately without pressing `i` first.
+        self.focus = FOCUS_GDB
         self.last_key = 0
         self.message = ""
         self.running_inferior = False
         self.gdb_alive = False
+        # set once start_gdb() completes; gates the "follow gdb down" exit so a
+        # gdb that dies during startup leaves its error on screen
+        self._gdb_ready = False
+        self._quitting = False
 
         # --- console ------------------------------------------------------
         self.console = ConsoleModel(width=80,
@@ -204,6 +216,46 @@ class CgdbApp:
     # =====================================================================
     # UI construction
     # =====================================================================
+    def _console_output(self):
+        """Build the prompt_toolkit output at the console's *true* width.
+
+        Win32Output.get_size() reports one column less than the console: it
+        computes the visible width as `srWindow.Right - srWindow.Left` -- a
+        0-based closed interval, so that is one short -- and then caps it at
+        `dwSize.X - 1` on top ("We avoid the right margin, windows will wrap
+        otherwise", a guard from the era of writing through the GDI console
+        API). For this full-screen app the shortfall is a column of dead space
+        on the right edge of every pane: the status bar/separator visibly
+        stops one cell short, where cgdb paints the whole row (interface.cpp
+        writes WIDTH spaces under HLG_STATUS_BAR). Rendering runs with
+        autowrap disabled for the whole lifetime of a full-screen Application
+        (the renderer turns it off on the first frame and only restores it
+        when the app is done), so painting the last column cannot scroll.
+        """
+        if self._output is not None:
+            return self._output
+        from prompt_toolkit.output import create_output
+        out = create_output()
+        if sys.platform != "win32":
+            return out
+        try:
+            from prompt_toolkit.output.windows10 import Windows10_Output
+        except ImportError:
+            return out
+        if not isinstance(out, Windows10_Output):
+            return out
+        win = out.win32_output
+
+        def full_width_get_size():
+            info = win.get_win32_screen_buffer_info()
+            columns = min(info.dwSize.X, info.srWindow.Right -
+                          info.srWindow.Left + 1)
+            return Size(rows=info.srWindow.Bottom - info.srWindow.Top + 1,
+                        columns=columns)
+
+        win.get_size = full_width_get_size
+        return out
+
     def _build_ui(self):
         # focusable=True on the source pane: without it Layout.focus() refuses
         # the window and ESC silently fails to leave the GDB pane.
@@ -217,7 +269,13 @@ class CgdbApp:
         self.source_window = Window(self.source_control, wrap_lines=False,
                                     always_hide_cursor=True,
                                     height=D(weight=1, preferred=0.6))
-        self.status_window = Window(self.status_control, height=1)
+        # Window(style=...) is prepended to every cell of the window including
+        # the blank ones past the end of the text, which is what paints the bar
+        # all the way to the right edge. cgdb gets the same effect by writing
+        # WIDTH spaces under HLG_STATUS_BAR before the text
+        # (interface.cpp:446-451).
+        self.status_window = Window(self.status_control, height=1,
+                                    style="class:status")
         self.console_window = Window(self.console_control, wrap_lines=False,
                                      always_hide_cursor=True,
                                      height=D(weight=1, preferred=0.4))
@@ -228,31 +286,33 @@ class CgdbApp:
                     lambda: [("class:console.prompt", GDB_PROMPT)])]),
             height=1, wrap_lines=False)
         self.cmdline_window = Window(self.cmdline_control, height=1,
-                                     wrap_lines=False)
+                                     wrap_lines=False, style="class:status")
 
-        # The command line replaces the gdb edit line while active. Using
+        # The `:` / `/` command line *is* the status bar in cgdb: it replaces
+        # the middle row, not the bottom edit line. update_status_win() draws
+        # cur_sbc into status_win (interface.cpp:459-472). Using
         # ConditionalContainer rather than swapping HSplit.children keeps
         # prompt_toolkit's layout cache consistent.
         in_command = Condition(lambda: self.focus == FOCUS_COMMAND)
         self.root = HSplit([
             self.source_window,
-            self.status_window,
-            self.console_window,
-            ConditionalContainer(self.edit_window, filter=~in_command),
+            ConditionalContainer(self.status_window, filter=~in_command),
             ConditionalContainer(self.cmdline_window, filter=in_command),
+            self.console_window,
+            self.edit_window,
         ])
 
         self.kb = self._build_keybindings()
         self.style = build_style(bool(self.config.get("color")))
 
         self.app = Application(
-            layout=Layout(self.root, focused_element=self.source_window),
+            layout=Layout(self.root, focused_element=self.edit_window),
             key_bindings=self.kb,
             full_screen=True,
             style=self.style,
             mouse_support=False,
             erase_when_done=False,
-            output=self._output,
+            output=self._console_output(),
         )
         self._apply_ttimeoutlen()
 
@@ -577,9 +637,12 @@ class CgdbApp:
         if key == kc.ESC:
             self.set_focus(FOCUS_SOURCE)
             return
-        if key == ord(":"):
-            self._start_command(":")
-            return
+        # Everything else belongs to gdb. gdb_input() says the same thing with
+        # `default: result = 1` -- "this tells the input to go to active GDB
+        # command" (interface.cpp:996-1000) -- so `:` and `/` are only cgdb's
+        # once ESC has moved the focus to the source window. Ordinary keys
+        # never even reach this method: _buffer_owns_keys() keeps the
+        # catch-all binding off while the edit line has focus.
 
     # =====================================================================
     # Command line
@@ -667,10 +730,8 @@ class CgdbApp:
             if not arg:
                 self.message = "usage: :open <file>[:line]"
                 return
-            path, _, ln = arg.rpartition(":")
-            if not path or not ln.isdigit():
-                path, ln = arg, None
-            self.open_file(path, int(ln) if ln else None)
+            path, ln = self._split_file_line(arg)
+            self.open_file(path, ln)
             return
         if cmd == "map":
             self._do_map(arg, insert=False)
@@ -836,8 +897,8 @@ class CgdbApp:
 
             text = self.src.line(i)
             toks = self.src.tokens_for_line(i)
+            col = 0
             if toks:
-                col = 0
                 for tok, val in toks:
                     if col >= avail:
                         break
@@ -846,9 +907,14 @@ class CgdbApp:
                         continue
                     room = avail - col
                     out.append((sel + style_for_token(tok), val[:room]))
-                    col += len(val)
+                    col += len(val[:room])
             else:
-                out.append((sel, text.expandtabs(tabstop)[:avail]))
+                body = text.expandtabs(tabstop)[:avail]
+                out.append((sel, body))
+                col = len(body)
+            if cur and col < avail:
+                # cgdb paints the whole current line, not just its text
+                out.append((sel, " " * (avail - col)))
         return out
 
     @staticmethod
@@ -948,6 +1014,7 @@ class CgdbApp:
             self._on_console("cgdb: inferior tty unavailable (%s); "
                              "program output may interleave with MI\n" % e)
         self.refresh_breakpoints()
+        self._gdb_ready = True
         return True
 
     def _on_console(self, text):
@@ -1008,6 +1075,28 @@ class CgdbApp:
         self.console.add_text("\ncgdb: gdb exited (code %s)\n" % (code,))
         self.message = "gdb exited"
         self.invalidate()
+        if not self._gdb_ready:
+            # gdb died during startup. Stay up: prompt_toolkit restores the
+            # alternate screen on exit, so quitting now would erase the only
+            # explanation the user has. This mirrors the spawn-failure path in
+            # start_gdb(), which also keeps the UI alive to show the message.
+            return
+        # Otherwise cgdb follows gdb down: EOF from the MI channel makes
+        # tgdb_process() fail, which ends main_loop() and the program
+        # (cgdb.cpp:760-772). This callback runs on the reader thread and
+        # Application.exit() resolves an asyncio future, which is not
+        # thread-safe, so hand it to the UI loop.
+        self._call_on_ui_thread(self.quit)
+
+    def _call_on_ui_thread(self, fn):
+        loop = getattr(self.app, "loop", None) if self.app else None
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(fn)
+                return
+            except RuntimeError:
+                pass
+        fn()
 
     # --- commands ---------------------------------------------------------
     def _safe_call(self, command, timeout=15.0):
@@ -1148,6 +1237,23 @@ class CgdbApp:
             self.refresh_breakpoints()
 
     # --- source files -----------------------------------------------------
+    @staticmethod
+    def _split_file_line(arg):
+        """Split a `path[:line]` argument into (path, line-or-None).
+
+        Ambiguous on Windows, where `:` is also the drive separator: a plain
+        rpartition(":") reads `C:\\dir\\f.c` as file "C" and turns a directory
+        whose last component is numeric (`C:\\dir\\123`) into a request for its
+        line 123. Trust the filesystem first -- if the whole argument exists it
+        is a path -- and only then try the suffix.
+        """
+        if os.path.exists(arg):
+            return arg, None
+        head, sep, tail = arg.rpartition(":")
+        if sep and head and tail.isdigit():
+            return head, int(tail)
+        return arg, None
+
     def open_file(self, path, line=None):
         if not path:
             return

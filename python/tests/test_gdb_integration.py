@@ -231,6 +231,34 @@ def test_missing_gdb_fails_fast_and_visibly():
     assert "definitely-not-a-debugger-xyz" in msg
 
 
+def test_child_env_drops_pythonhome(monkeypatch):
+    """gdb embeds its own CPython; our PYTHONHOME must not reach it.
+
+    A vendor gdb resolves its embedded interpreter's stdlib from PYTHONHOME, so
+    a value pointing at an unrelated Python makes gdb die during startup with
+    "Python initialization failed: Failed to import encodings module" plus
+    "Error in sourced command file: Python not initialized" from its gdbinit --
+    reproduced byte-for-byte against mingw32 gdb 17.1. cgdb.py is itself a
+    Python program, so its users are exactly the people who have one set.
+    """
+    monkeypatch.setenv("PYTHONHOME", r"C:\Share\Python311")
+    monkeypatch.setenv("CGDBPY_MARKER", "kept")
+    env = GdbClient()._child_env()
+    assert "PYTHONHOME" not in env
+    # everything else passes through untouched
+    assert env["CGDBPY_MARKER"] == "kept"
+    assert env.get("PATH") == os.environ.get("PATH")
+
+
+def test_child_env_drops_pythonhome_from_an_explicit_env(monkeypatch):
+    monkeypatch.delenv("PYTHONHOME", raising=False)
+    c = GdbClient(env={"PYTHONHOME": "/usr", "HOME": "/home/u"})
+    env = c._child_env()
+    assert env == {"HOME": "/home/u"}
+    # the caller's dict must not be mutated
+    assert c.env == {"PYTHONHOME": "/usr", "HOME": "/home/u"}
+
+
 # ---------------------------------------------------------------------------
 # basic MI commands
 # ---------------------------------------------------------------------------
@@ -284,9 +312,22 @@ def test_error_result_is_not_a_parse_error(session):
 
 @needs_gdb
 def test_console_command_routes_through_interpreter_exec(session):
+    """A human gdb command must come back as MI stream records we can route.
+
+    call() returns the moment the reader thread pairs the ^done record, while
+    the ~"..." stream records still have to travel through the dispatch queue,
+    so wait for them instead of asserting on a race. The old assertion had an
+    `or session.console_text()` escape hatch that let any non-empty output
+    pass, which is how the race stayed hidden.
+    """
+    before = session.console_text()
     r = session.call('-interpreter-exec console %s' % mi.quote("show version"))
     assert r.cls == "done"
-    assert "GNU gdb" in session.console_text() or session.console_text()
+    end = time.time() + 10
+    while time.time() < end and session.console_text() == before:
+        time.sleep(0.02)
+    text = session.console_text()
+    assert "GNU gdb" in text, repr(text[:400])
 
 
 @needs_gdb
