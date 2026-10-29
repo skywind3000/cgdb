@@ -1524,22 +1524,28 @@ def test_source_rendering_marks_breakpoints(app):
 
 
 def test_source_rendering_marks_the_exec_line(app, srcfile):
-    # default executinglinedisplay=longarrow: `├` in the bar column and a
-    # `────>` that reaches to the first non-blank column
+    # default executinglinedisplay=longarrow: `│` in the bar column (the
+    # same glyph as the plain bar, just colored) and an ASCII `---->` that
+    # reaches to the first non-blank column
     app.exec_line = (srcfile, 5)
     app.view.height = 10
     text = app._source_text()
-    assert any(t == "├" for _, t in text)
-    assert any(">" in t and "─" in t for _, t in text)
+    arrows = [t for s, t in text
+              if s in ("class:exec-arrow", "class:sel-arrow")]
+    assert "│" in arrows
+    assert any(t.endswith(">") and t[:-1] and set(t[:-1]) == {"-"}
+               for t in arrows)
     # the executing line number is green, the selected one white/bold
     assert any(s.strip() == "class:line-number.executing" for s, t in text
                if t.strip().isdigit())
 
-    # shortarrow keeps the `├` bar but the marker collapses to `>`
+    # shortarrow keeps the `│` bar but the marker collapses to `>`
     app.config.set("eld", "shortarrow")
     text = app._source_text()
-    assert any(t == ">" for _, t in text)
-    assert not any("─" in t for _, t in text)
+    arrows = [t for s, t in text
+              if s in ("class:exec-arrow", "class:sel-arrow")]
+    assert ">" in arrows
+    assert not any(len(t) > 1 for t in arrows)
 
     # highlight paints the whole line instead
     app.config.set("eld", "highlight")

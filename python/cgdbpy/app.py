@@ -1993,14 +1993,18 @@ class CgdbApp:
         (no minimum). Breakpoints have no character of their own -- they
         color the line NUMBER, red for enabled and yellow for disabled,
         ahead of the executing (green) and selected (white) line numbers.
-        The bar column shows a mark char, the arrow styles' `├`, or the
-        plain `│` (bold while this pane is focused). The marker column is
-        `>` (shortarrow) or `────>` / a block that reaches to the line's
-        first non-blank (longarrow / block); the `highlight` styles paint
-        the whole line. Past EOF the rows are `~` lines, and a file shorter
-        than the window is block-centered -- the top line is *derived* from
-        the cursor each frame (sources.cpp:837-847), which is what keeps
-        the cursor line vertically centered like the C version.
+        The bar column shows a mark char, the arrow styles' `│` (colored,
+        but the SAME glyph as the plain `│` so the column stays aligned
+        across fonts), or the plain `│` (bold while this pane is focused).
+        The marker column is `>` (shortarrow) or `---->` / a block that
+        reaches to the line's first non-blank (longarrow / block) -- the
+        dashes are ASCII, unlike C's `─`, because box-drawing glyphs and
+        ASCII text mix badly in some Windows fonts/codepages. The
+        `highlight` styles paint the whole line. Past EOF the rows are `~`
+        lines, and a file shorter than the window is block-centered -- the
+        top line is *derived* from the cursor each frame
+        (sources.cpp:837-847), which is what keeps the cursor line
+        vertically centered like the C version.
         """
         width = self._source_width()
         h = self._source_height()
@@ -2083,9 +2087,9 @@ class CgdbApp:
             if mark is not None:
                 out.append(("class:mark", mark))
             elif is_exe and style in ("shortarrow", "longarrow"):
-                out.append((arrow_cls, "├"))
+                out.append((arrow_cls, "│"))
             elif is_sel and style in ("shortarrow", "longarrow"):
-                out.append((arrow_cls, "├"))
+                out.append((arrow_cls, "│"))
             else:
                 out.append(("class:vline-focus" if focused
                             else "class:vline", "│"))
@@ -2096,7 +2100,7 @@ class CgdbApp:
                 out.append((arrow_cls, ">"))
             elif style == "longarrow":
                 n = max(0, leading - (left + 1))
-                out.append((arrow_cls, "─" * n + ">"))
+                out.append((arrow_cls, "-" * n + ">"))
                 colskip = n
             elif style == "block":
                 n = max(0, leading - (left + 1))

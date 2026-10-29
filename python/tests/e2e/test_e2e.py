@@ -35,6 +35,10 @@ PY = sys.executable
 
 ROWS, COLS = 32, 100
 
+# the executing line's long arrow: `│` bar (same glyph as every other
+# row's bar, just colored) + ASCII `---->` marker -- see app._source_text
+EXEC_ARROW_RE = re.compile(r"│-+>")
+
 TARGET_SRC = """#include <stdio.h>
 
 int compute(int n) {
@@ -292,10 +296,20 @@ class Cgdb:
                 vcol = m.end() - 1
                 break
         if vcol is not None:
+            # The vline-focus style bolds the WHOLE bar column; the
+            # executing line's arrow style is bold too, and since the
+            # arrow's bar is the same `│` glyph as the plain bar, a single
+            # bold `│` row no longer proves source focus (that exact
+            # confusion made to_source() skip its ESC and swallow F8/F6).
+            # Require several bold bars: the executing line can only ever
+            # contribute one.
+            bold_bars = 0
             for r in range(status):
                 if self.screen.grid[r][vcol] == "│" \
                         and self.screen.bold_grid[r][vcol]:
-                    return "CGDB"
+                    bold_bars += 1
+                    if bold_bars >= 2:
+                        return "CGDB"
         if not self.screen.cursor_visible:
             return ""          # hidden with no bold bar: intermediate
         r = self.screen.r
@@ -501,10 +515,11 @@ def test_break_run_stop_marks_the_source(target):
         c.settle(1.0)
 
         t = c.text()
-        # the executing line is the long arrow (`├────>`); the breakpoint
-        # itself is the line number's colour, which a text dump cannot
-        # see -- the marker itself is asserted by the toggle test below
-        assert "├" in t, t
+        # the executing line is the long arrow (`│---->` -- see
+        # _source_text); the breakpoint itself is the line number's
+        # colour, which a text dump cannot see -- the marker itself is
+        # asserted by the toggle test below
+        assert EXEC_ARROW_RE.search(t), t
 
 
 @needs_gdb
@@ -521,7 +536,7 @@ def test_next_advances_the_executing_line(target):
 
         def arrow_row():
             for i in range(c.screen.rows):
-                if "├" in c.screen.line(i):
+                if EXEC_ARROW_RE.search(c.screen.line(i)):
                     return i, c.screen.line(i)
             return -1, ""
 
