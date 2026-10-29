@@ -982,6 +982,11 @@ ptk Buffer，到达该分支的只可能是映射展开）——`<cr>`=`validate
   （缩进处反色块），但 block 标记与行尾的硬件光标并排会被读成
   "两个光标"，且 block 不随 h/l 滚动而硬件光标会（用户实测反馈）；
   C 的形态保留为 `:set sld=block`。
+  **执行行与选中行同行时**：标记（箭头、行号色）由执行行赢（C 的
+  覆盖序），但整行背景由选中行赢——光标条就是本窗格的光标（系统
+  光标已隐藏，见下条），被执行样式覆盖会让光标整行"消失"（用户
+  实测反馈，2026-10-29 修复，回归见
+  `test_source_rendering_marks_the_exec_line` 末段）。
   `executinglinedisplay`/`selectedlinedisplay`/`arrowstyle`（弃用别名，
   不接受 `block`）全部接线。
 - 文件尾 `~` 行；mark 画在竖线列（HLG_MARK，白粗）。

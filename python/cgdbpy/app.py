@@ -2095,12 +2095,19 @@ class CgdbApp:
                             else "class:vline", "│"))
 
             # --- marker column; longarrow/block reach over the leading ws --
+            # When the cursor sits on the executing line, the exe style owns
+            # the markers but the selected-line background must still cover
+            # the arrow cells (ptk merges classes split on spaces), or the
+            # bar would start only right of "-->" instead of running the
+            # whole row like every other selected line.
+            arrow_bg = " class:selected-line" if (is_sel and
+                                                  sld == "highlight") else ""
             colskip = 0
             if style == "shortarrow":
-                out.append((arrow_cls, ">"))
+                out.append((arrow_cls + arrow_bg, ">"))
             elif style == "longarrow":
                 n = max(0, leading - (left + 1))
-                out.append((arrow_cls, "-" * n + ">"))
+                out.append((arrow_cls + arrow_bg, "-" * n + ">"))
                 colskip = n
             elif style == "block":
                 n = max(0, leading - (left + 1))
@@ -2113,7 +2120,18 @@ class CgdbApp:
                 out.append(("", " "))
 
             # --- text -------------------------------------------------------
-            line_cls = hl_cls if style == "highlight" else ""
+            # The cursor bar IS the cursor in this pane (the system cursor
+            # is hidden while it has focus), so the selected-line background
+            # must survive even when the exec style owns this row's markers
+            # (exe wins the branch above) -- without this the cursor goes
+            # invisible whenever it lands on the executing line. The exec
+            # line-highlight only paints when the row is NOT selected.
+            if is_sel and sld == "highlight":
+                line_cls = "class:selected-line"
+            elif style == "highlight":
+                line_cls = hl_cls
+            else:
+                line_cls = ""
             # ptk concatenates class names by SPLITTING ON SPACES: without
             # the separator "class:selected-lineclass:kw" parses as one
             # unknown class and the whole style (fg and bg) is lost

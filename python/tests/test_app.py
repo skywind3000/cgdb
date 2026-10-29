@@ -1531,7 +1531,7 @@ def test_source_rendering_marks_the_exec_line(app, srcfile):
     app.view.height = 10
     text = app._source_text()
     arrows = [t for s, t in text
-              if s in ("class:exec-arrow", "class:sel-arrow")]
+              if "exec-arrow" in s or "sel-arrow" in s]
     assert "│" in arrows
     assert any(t.endswith(">") and t[:-1] and set(t[:-1]) == {"-"}
                for t in arrows)
@@ -1543,7 +1543,7 @@ def test_source_rendering_marks_the_exec_line(app, srcfile):
     app.config.set("eld", "shortarrow")
     text = app._source_text()
     arrows = [t for s, t in text
-              if s in ("class:exec-arrow", "class:sel-arrow")]
+              if "exec-arrow" in s or "sel-arrow" in s]
     assert ">" in arrows
     assert not any(len(t) > 1 for t in arrows)
 
@@ -1551,6 +1551,23 @@ def test_source_rendering_marks_the_exec_line(app, srcfile):
     app.config.set("eld", "highlight")
     text = app._source_text()
     assert any("exec-line-highlight" in s for s, _ in text)
+
+    # cursor ON the executing line: the cursor bar (this pane's cursor --
+    # the system one is hidden) must show while the arrow markers stay
+    app.config.set("eld", "longarrow")
+    app.view.cursor = 4
+    text = app._source_text()
+    arrows = [t for s, t in text
+              if "exec-arrow" in s or "sel-arrow" in s]
+    assert "│" in arrows
+    assert any(t.endswith(">") and t[:-1] and set(t[:-1]) == {"-"}
+               for t in arrows)
+    # the bar runs the whole row: the arrow cells carry the selected-line
+    # background too (not just the text right of "-->"), the way every
+    # other selected line is painted
+    assert any("exec-arrow" in s and "selected-line" in s and t.endswith(">")
+               for s, t in text)
+    assert any("selected-line" in s for s, t in text)
 
 
 def test_source_rendering_shows_marks(app):
