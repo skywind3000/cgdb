@@ -1,16 +1,19 @@
 """The inferior's terminal.
 
-gdb must be told where the debugged program's tty is, otherwise the inferior's
-stdout lands in the MI pipe and corrupts the record stream -- the C port
-verified this experimentally (doc/win_specs.md §4, E2a).
+gdb must be told where the debugged program's terminal is, otherwise the
+inferior's stdout lands in the MI pipe and corrupts the record stream -- the
+C port verified this experimentally (doc/win_specs.md §4, E2a).
 
 POSIX: a pty pair; gdb gets the slave name, we read the master.
-Windows: a named pipe; gdb gets `\\\\.\\pipe\\<name>`.
 
-The Windows path uses overlapped I/O on purpose. win_specs.md §7.2 records the
-trap: on a *synchronous* named pipe, a reader thread parked in ReadFile makes a
-WriteFile on the same handle deadlock. Both directions are therefore issued as
-OVERLAPPED operations with their own events.
+Windows: gdb gets `new-console on`. The inferior is not wired to cgdb at
+all: console-subsystem programs get their own visible console window
+(the Visual Studio convention, adopted from the seer-windows port),
+where scanf/ANSI/Ctrl-C are handled natively by conhost;
+GUI-subsystem programs get no window. PoC-verified on gdb 17.1
+(.tmp/poc-newcon): the MI stream stays clean, the popup works for
+interactive stdin, and the CTRL_BREAK interrupt path keeps working when
+the inferior owns a separate console.
 """
 
 import os
@@ -19,30 +22,25 @@ import threading
 
 
 class InferiorTty:
-    """Base interface: start() returns the device name to hand to gdb."""
+    """Base interface: start() prepares the terminal for gdb."""
 
     def start(self):
         raise NotImplementedError
 
-    def gdb_argument(self):
-        """The exact text to put on the MI command line.
-
-        This must be inserted **unquoted**. `-gdb-set inferior-tty` takes a raw
-        filename, not an MI c-string: wrapping it in double quotes makes gdb
-        reply `^done` and then silently fail to open the device, so the
-        inferior's stdout leaks into the MI pipe as unparseable lines. Measured
-        on gdb 17.1 -- quoted raw-backslash, quoted forward-slash and quoted
-        `mi.quote()` forms all fail; both unquoted forms work. The C port says
-        the same thing at tgdb.cpp:1990 ("Raw backslashes survive the MI
-        argument parser").
-        """
+    def mi_command(self):
+        """The full MI command that configures the inferior's terminal."""
         raise NotImplementedError
 
-    def mi_command(self):
-        """The full MI command that points gdb at this tty."""
+    def verify_command(self):
+        """The MI command whose ^done payload proves the setting took."""
+        raise NotImplementedError
+
+    def verify_ok(self, payload):
+        """True when the verify_command() payload confirms the setting."""
         raise NotImplementedError
 
     def write(self, data):
+        """Deliver bytes to the inferior's stdin. Returns success."""
         raise NotImplementedError
 
     def close(self):
@@ -69,12 +67,19 @@ class PtyInferiorTty(InferiorTty):
         self._thread.start()
         return self.name
 
-    def gdb_argument(self):
-        return self.name
-
     def mi_command(self):
-        # the C port uses -inferior-tty-set on POSIX (tgdb.cpp:1995)
-        return "-inferior-tty-set %s" % self.gdb_argument()
+        # the C port uses -inferior-tty-set on POSIX (tgdb.cpp). The device
+        # path must be inserted **unquoted**: `-inferior-tty-set` takes a
+        # raw filename, not an MI c-string (see gdb_argument() history:
+        # quoting made gdb reply ^done and silently fail to open the pty).
+        return "-inferior-tty-set %s" % self.name
+
+    def verify_command(self):
+        return "-inferior-tty-show"
+
+    def verify_ok(self, payload):
+        got = (payload or {}).get("inferior_tty", "")
+        return self.name in got or got in self.name
 
     def _read_loop(self):
         while self._alive:
@@ -122,155 +127,40 @@ class PtyInferiorTty(InferiorTty):
         self.master = self.slave = -1
 
 
-if sys.platform == "win32":
-    import ctypes
-    from ctypes import wintypes
+class NewConsoleTty(InferiorTty):
+    """Windows: the inferior gets its own console window (gdb
+    ``new-console on``); cgdb is not part of its I/O path at all."""
 
-    k32 = ctypes.windll.kernel32
-
-    PIPE_ACCESS_DUPLEX = 0x00000003
-    FILE_FLAG_OVERLAPPED = 0x40000000
-    PIPE_TYPE_BYTE = 0x00000000
-    PIPE_READMODE_BYTE = 0x00000000
-    PIPE_WAIT = 0x00000000
-    ERROR_IO_PENDING = 997
-    ERROR_BROKEN_PIPE = 109
-    GENERIC_READ = 0x80000000
-    GENERIC_WRITE = 0x40000000
-    OPEN_EXISTING = 3
-    INFINITE = 0xFFFFFFFF
-
-    class OVERLAPPED(ctypes.Structure):
-        _fields_ = [
-            ("Internal", ctypes.POINTER(ctypes.c_ulong)),
-            ("InternalHigh", ctypes.POINTER(ctypes.c_ulong)),
-            ("Offset", wintypes.DWORD),
-            ("OffsetHigh", wintypes.DWORD),
-            ("hEvent", wintypes.HANDLE),
-        ]
-
-    k32.CreateNamedPipeW.restype = wintypes.HANDLE
-    k32.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
-                                     wintypes.DWORD, wintypes.DWORD,
-                                     wintypes.DWORD, wintypes.DWORD,
-                                     wintypes.DWORD, ctypes.c_void_p]
-    k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE,
-                                     ctypes.POINTER(OVERLAPPED)]
-    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-                             ctypes.POINTER(wintypes.DWORD),
-                             ctypes.POINTER(OVERLAPPED)]
-    k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-                              ctypes.POINTER(wintypes.DWORD),
-                              ctypes.POINTER(OVERLAPPED)]
-
-
-class PipeInferiorTty(InferiorTty):
-    """Windows named-pipe inferior tty with overlapped read and write."""
-
-    BUFSIZE = 65536
-
-    def __init__(self, on_output, name=None):
-        self.on_output = on_output
-        self.name = name or ("cgdbpy_inf_%d" % os.getpid())
-        self.path = "\\\\.\\pipe\\%s" % self.name
-        self.handle = None
-        self._alive = False
-        self._connected = False
-        self._thread = None
+    def __init__(self, on_output):
+        self.on_output = on_output  # never fires: output goes to the window
 
     def start(self):
-        self.handle = k32.CreateNamedPipeW(
-            self.path,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1, self.BUFSIZE, self.BUFSIZE, 0, None)
-        if self.handle == wintypes.HANDLE(-1).value or not self.handle:
-            raise OSError("CreateNamedPipeW failed: %d" % k32.GetLastError())
-        self._alive = True
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="inferior-pipe")
-        self._thread.start()
-        return self.path
-
-    def gdb_argument(self):
-        # Raw backslashes, unquoted -- see InferiorTty.gdb_argument().
-        return self.path
+        return ""
 
     def mi_command(self):
-        # the C port uses -gdb-set inferior-tty on Windows (tgdb.cpp:1992)
-        return "-gdb-set inferior-tty %s" % self.gdb_argument()
+        return "-gdb-set new-console on"
 
-    def _run(self):
-        ov = OVERLAPPED()
-        ov.hEvent = k32.CreateEventW(None, True, False, None)
-        rc = k32.ConnectNamedPipe(self.handle, ctypes.byref(ov))
-        if not rc:
-            err = k32.GetLastError()
-            if err == ERROR_IO_PENDING:
-                k32.WaitForSingleObject(ov.hEvent, INFINITE)
-            elif err != 535:        # ERROR_PIPE_CONNECTED
-                k32.CloseHandle(ov.hEvent)
-                return
-        self._connected = True
-        k32.ResetEvent(ov.hEvent)
-        buf = ctypes.create_string_buffer(self.BUFSIZE)
-        while self._alive:
-            got = wintypes.DWORD(0)
-            ok = k32.ReadFile(self.handle, buf, self.BUFSIZE,
-                              ctypes.byref(got), ctypes.byref(ov))
-            if not ok:
-                err = k32.GetLastError()
-                if err != ERROR_IO_PENDING:
-                    break
-                if k32.WaitForSingleObject(ov.hEvent, 200) != 0:
-                    continue
-                if not k32.GetOverlappedResult(self.handle,
-                                               ctypes.byref(ov),
-                                               ctypes.byref(got), False):
-                    break
-            n = got.value
-            if n == 0:
-                break
-            try:
-                self.on_output(buf.raw[:n])
-            except Exception:
-                pass
-        k32.CloseHandle(ov.hEvent)
+    def verify_command(self):
+        return "-gdb-show new-console"
+
+    def verify_ok(self, payload):
+        return (payload or {}).get("value") == "on"
 
     def write(self, data):
-        if not self._connected or not self._alive:
-            return False
-        if isinstance(data, str):
-            data = data.encode("utf-8", "replace")
-        if not data:
-            return True
-        ov = OVERLAPPED()
-        ov.hEvent = k32.CreateEventW(None, True, False, None)
-        written = wintypes.DWORD(0)
-        buf = ctypes.create_string_buffer(data, len(data))
-        ok = k32.WriteFile(self.handle, buf, len(data), ctypes.byref(written),
-                           ctypes.byref(ov))
-        if not ok and k32.GetLastError() == ERROR_IO_PENDING:
-            k32.WaitForSingleObject(ov.hEvent, 5000)
-            ok = k32.GetOverlappedResult(self.handle, ctypes.byref(ov),
-                                         ctypes.byref(written), False)
-        k32.CloseHandle(ov.hEvent)
-        return bool(ok)
+        # The inferior reads from its own console window; there is no
+        # cgdb-side stdin to feed (keys typed into cgdb while the inferior
+        # runs are dropped, like the C port drops them).
+        return False
+
+    def resize(self, rows, cols):
+        pass
 
     def close(self):
-        self._alive = False
-        if self.handle:
-            try:
-                k32.CancelIo(self.handle)
-                k32.DisconnectNamedPipe(self.handle)
-                k32.CloseHandle(self.handle)
-            except Exception:
-                pass
-            self.handle = None
+        pass
 
 
 def create(on_output):
-    """Platform-appropriate inferior tty."""
+    """Platform-appropriate inferior terminal."""
     if sys.platform == "win32":
-        return PipeInferiorTty(on_output)
+        return NewConsoleTty(on_output)
     return PtyInferiorTty(on_output)

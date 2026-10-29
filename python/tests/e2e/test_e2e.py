@@ -415,7 +415,11 @@ def test_startup_opens_the_debuggees_main_source(target):
         c.type_cmd("break main")
         assert c.wait("Breakpoint 1", timeout=15), c.text()
         c.type_cmd("run")
-        assert c.wait("MARKER", timeout=30), c.text()
+        c.settle(2.5)
+        # the inferior's output goes to its own console window; what proves
+        # the run completed is gdb answering commands again
+        c.type_cmd("echo after-run\\n")
+        assert c.wait("after-run", timeout=20), c.text()
 
 
 @needs_gdb
@@ -532,13 +536,27 @@ def test_next_advances_the_executing_line(target):
 
 
 @needs_gdb
-def test_inferior_output_is_shown(target):
+def test_inferior_runs_in_its_own_console(target):
+    """run: the inferior's I/O belongs to its own console window (gdb
+    "new-console on", the Visual Studio convention). Its output must not
+    land on cgdb's screen, and the session must answer commands again
+    after the program exits (MI reports the exit, not gdb's console
+    channel -- there is no "[Inferior ... exited]" text to wait for)."""
     with Cgdb(target, ["-q"]) as c:
         assert c.wait("(gdb)", timeout=30)
         c.settle(0.5)
         c.to_gdb()
         c.type_cmd("run")
-        assert c.wait("MARKER result=42", timeout=40), c.text()
+        c.settle(2.5)
+        # needle is the computed value, not "MARKER result=" -- the source
+        # window legitimately shows the printf("MARKER result=%d") literal
+        assert "MARKER result=42" not in c.text(), (
+            "inferior output leaked onto cgdb's screen (it belongs to the "
+            "new-console popup): %r" % c.text()[:300])
+        # gdb has the prompt back: a queued echo answers once the inferior
+        # (which finished in its own window) is gone
+        c.type_cmd("echo alive-after-run\\n")
+        assert c.wait("alive-after-run", timeout=20), c.text()
 
 
 @needs_gdb
@@ -553,7 +571,13 @@ def test_continue_after_break_runs_to_exit(target):
         assert c.wait("hit Breakpoint 1", timeout=40)
         c.to_source()                    # F-keys only fire from source focus
         c.key("f6")                      # continue
-        assert c.wait("MARKER result=42", timeout=40), c.text()
+        c.settle(2.5)
+        # the inferior finishes in its own console window; cgdb never sees
+        # the program's stdout, only gdb's own reports
+        assert "MARKER result=42" not in c.text(), c.text()[:300]
+        c.to_gdb()
+        c.type_cmd("echo after-continue\\n")
+        assert c.wait("after-continue", timeout=20), c.text()
 
 
 # ---------------------------------------------------------------------------

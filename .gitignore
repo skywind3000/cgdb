@@ -30,6 +30,14 @@ configure.ac~
 configure~
 VERSION
 
+# the win32 port ships hand-written versions of these; without the
+# negations the bare patterns above silently ignore them (that is how
+# win32/Makefile, win32/config.h and win32/cgdb_custom_config.h were
+# lost from the working tree -- see doc/win_specs.md section 12)
+!win32/Makefile
+!win32/config.h
+!win32/cgdb_custom_config.h
+
 doc/cgdb.1
 doc/cgdb.info
 doc/cgdb.txt

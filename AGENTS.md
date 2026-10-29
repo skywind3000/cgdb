@@ -150,11 +150,16 @@ pkill -f tgdb_driver; pkill -f "new-ui mi"
 Linux 回归 198 项全绿。**实施规格、全部踩坑记录和测试报告见 `doc/win_specs.md`（必读）**；
 可行性论证见 `doc/porting-feasibility.md`。影响使用的硬结论：
 
-- **最低系统基线：Windows 10 1809（build 17763）+**（ConPTY 下限；实际只在
-  inferior 终端间接依赖，主 UI 只要 VT 输入模式，1607+）。
+- **最低系统基线：Windows 10 1607+**（主 UI 只要 VT 输入模式；inferior
+  弹的是系统默认控制台，不依赖 ConPTY）。
 - **GDB 的 `new-ui mi` 双通道在原生 Windows GDB 上不可用**（GDB 17.1 实测致命）。
   实际架构是 `gdb --interpreter=mi` 走匿名管道（VS Code 同款），GDB 窗口由
   tgdb 内嵌的行编辑器合成（历史/光标编辑/ESC 键序列都有，无 Tab 补全）。
+- **被调试程序弹独立控制台窗口（VS 惯例）**：tgdb 启动时发
+  `-gdb-set new-console on`，console 程序弹可见窗口（scanf/ANSI/Ctrl-C
+  由 conhost 原生处理）、GUI 程序不弹；cgdb 不参与 inferior 的 I/O，
+  inferior 输出不进 cgdb 屏幕（2026-10-29 改版，原命名管道方案已退役，
+  见 `doc/win_specs.md` §12）。
 - GDB 用 `D:\Dev\mingw32\bin\gdb.exe`（32 位，只能调 32 位 inferior；
   换 64 位 gdb 用 `-d` 指定即可，cgdb 本身跨位数）。
 - **curses 用 PDCurses-wincon 静态链接**（mingw32 自带，真彩 + CJK 实测通过）。
@@ -184,13 +189,16 @@ python testsuite/win32/run_tests.py     # 96 项，CLI/焦点/状态条/调试/�
 覆盖说明：按键用逐字节带间隔发送（真实打字节奏，每个键都产生
 KEY_DOWN/KEY_UP 记录对——`testsuite/win32/README.md` 有完整矩阵）。
 其中「状态条 `:` 后静置」是 KEY_UP 幽灵信号崩溃的回归用例。
+**注意**：new-console 改版（2026-10-29）后，凡断言「inferior 输出进
+GDB 窗」的用例需要同步改写（输出现在去弹窗），改法参照
+`doc/win_specs.md` §12 末段与 python e2e 的同名改版。
 
 ### 关键实现事实（改代码前必知）
 
 - **所有 Windows 差异都收在 `#ifdef _WIN32` 里**，Linux 构建零改动
   （回归 198/198 验证过）。平台设施集中在 `lib/util/console_win.*`
   （控制台模式/VT 输入/尺寸轮询）和 `lib/util/process_win.*`
-  （gdb 管道 + inferior 命名管道 + 读线程）。
+  （gdb 管道 + 中断）。inferior 不接线（new-console 弹窗，见上）。
 - **匿名管道读句柄在本机 WaitForSingleObject 不可靠**（空管道也返回就绪）：
   io 层一律 PeekNamedPipe 轮询；主循环不能把 MI 管道放进等待集。
 - **CRT read() 在信号化空管道上会永久阻塞**：io_read/io_writen 走 ReadFile/
@@ -201,8 +209,8 @@ KEY_DOWN/KEY_UP 记录对——`testsuite/win32/README.md` 有完整矩阵）。
   排完记录就返回 0，被 kui 的 findkey 当成 -1，按 ':' 进状态条后松键即
   静默退出——KEY_UP 记录是每键必有的）。主循环的用户输入门禁统一走
   io_data_ready(0,0)，别信裸 WaitForMultipleObjects 结果。
-- **同步命名管道上读线程常驻 ReadFile 时，主线程 WriteFile 同句柄会死锁**：
-  inferior 管道全部重叠 I/O。
+- ~~同步命名管道读写死锁：inferior 管道全部重叠 I/O~~（随 inferior 管道
+  方案退役，历史陷阱记录在 `doc/win_specs.md` §7.2/§12）。
 - **构建必须用 `-iquote` 引项目头**：`-I lib/util` 会让 CRT 的 `<io.h>`
   被 cgdb 的 `lib/util/io.h` 遮蔽（mingw `<unistd.h>` 会引入 `<io.h>`）。
 - swin 属性编码：PDCurses 宽字符 chtype 是 64 位，颜色位在 bit 44+；

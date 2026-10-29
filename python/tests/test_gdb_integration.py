@@ -142,7 +142,8 @@ class Session:
         self.client.start()
         if self.tty is not None:
             self.tty.start()
-            # unquoted -- see InferiorTty.gdb_argument()
+            # pty path unquoted -- see PtyInferiorTty.mi_command(); on
+            # Windows this sends "-gdb-set new-console on" instead
             self.client.call(self.tty.mi_command(), timeout=15)
         return self
 
@@ -590,14 +591,19 @@ def test_breakpoint_delete(target):
 
 
 # ---------------------------------------------------------------------------
-# inferior tty: the reason win_specs.md §4 E2a exists
+# inferior terminal: the reason win_specs.md §4 E2a exists
 # ---------------------------------------------------------------------------
 @needs_gdb
 @needs_cc
 def test_inferior_output_does_not_corrupt_the_mi_stream(target, tty_session):
-    """Without `set inferior-tty` the program's stdout lands in the MI pipe and
-    produces parse errors. With it, the MI stream stays clean and the output
-    arrives on the tty we handed gdb."""
+    """Without a separate terminal the program's stdout lands in the MI pipe
+    and produces parse errors. With it, the MI stream stays clean.
+
+    POSIX: the output arrives on the pty we handed gdb. Windows: the
+    inferior owns its own console window (gdb "new-console on"), so the
+    output belongs to that window and must not reach any cgdb-side
+    callback either.
+    """
     s = tty_session
     s.call("-file-exec-and-symbols %s" % mi.quote(target["exe"]))
     s.call("-break-insert main")
@@ -613,11 +619,19 @@ def test_inferior_output_does_not_corrupt_the_mi_stream(target, tty_session):
         "MI stream was corrupted: %d parse errors"
         % s.client.stats["parse_errors"])
     out = s.target_text() + s.console_text()
-    assert "start n=" in out, "inferior stdout never arrived: %r" % out[:200]
-    assert "result=" in out
+    if sys.platform == "win32":
+        assert "start n=" not in out, (
+            "inferior output leaked into cgdb-side channels (it belongs "
+            "to the new-console popup): %r" % out[:200])
+    else:
+        assert "start n=" in out, "inferior stdout never arrived: %r" % out[:200]
+        assert "result=" in out
 
 
 @needs_gdb
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX inferior-tty device name; Windows uses "
+                           "new-console")
 @needs_cc
 def test_inferior_tty_device_name_is_usable(target, tty_session):
     s = tty_session
@@ -628,6 +642,28 @@ def test_inferior_tty_device_name_is_usable(target, tty_session):
 
 @needs_gdb
 @needs_cc
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="win32 new-console inferior terminal")
+def test_windows_new_console_inferior_terminal(target, tty_session):
+    """Windows: the inferior's terminal is gdb's "new-console on" -- the
+    Visual Studio convention. The setting must be accepted (and reported
+    back on), and NewConsoleTty itself carries no cgdb-side I/O."""
+    from cgdbpy.inferior_tty import NewConsoleTty
+
+    s = tty_session
+    assert isinstance(s.tty, NewConsoleTty)
+    r = s.call("-gdb-show new-console")
+    assert r.cls == "done", r.payload
+    assert (r.payload or {}).get("value") == "on", r.payload
+    # nothing to feed from cgdb: write() reports "not delivered"
+    assert s.tty.write("x") is False
+
+
+@needs_gdb
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="the inferior-tty quoting trap is a pipe-era "
+                           "Windows trap; Windows now uses new-console")
+@needs_cc
 def test_inferior_tty_must_not_be_quoted(target):
     """Regression test for a silent-failure trap.
 
@@ -637,8 +673,8 @@ def test_inferior_tty_must_not_be_quoted(target):
     lines. Measured on gdb 17.1: quoted raw-backslash, quoted forward-slash and
     quoted mi.quote() forms all fail; both unquoted forms work.
 
-    The C port encodes the same rule at tgdb.cpp:1990 ("Raw backslashes
-    survive the MI argument parser").
+    The C port encodes the same rule at tgdb.cpp ("Raw backslashes survive
+    the MI argument parser").
     """
     from cgdbpy.inferior_tty import create
 
@@ -660,7 +696,7 @@ def test_inferior_tty_must_not_be_quoted(target):
         mi.parse_line = spy
         try:
             c.start()
-            arg = tty.gdb_argument()
+            arg = tty.name
             cmd = "-gdb-set inferior-tty %s" % (mi.quote(arg) if quote_it
                                                 else arg)
             r = c.call(cmd, timeout=15)

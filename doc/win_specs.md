@@ -37,7 +37,7 @@
 | curses 后端 | PDCurses 4.4 wincon，**静态链接**（`-lpdcurses_wincon -lwinmm`） | 真彩 24 位 SGR + UTF-8/CJK + 控制台 API 码页免疫，M0 全实测通过 |
 | curses 头文件 | 根目录 `pdcurses.h` 包装（`PDC_WIDE` + `PDC_FORCE_UTF8` + 后缀符号映射） | 裸 `pdcurses/curses.h` 链接失败（`endwin_x64_4400` 后缀符号） |
 | GDB 通道 | `gdb --nw -q -ex "set pagination off" -ex "set confirm off" --interpreter=mi` 匿名管道 | new-ui 死亡（上游 bug），MI-over-pipes 是 VS Code 同款成熟形态 |
-| inferior 终端 | `-gdb-set inferior-tty \\.\pipe\cgdb_inf_<pid>` 命名管道 + 读线程 | M0 实测：MI 流干净、inferior 输出进管道、原始反斜杠路径可用 |
+| inferior 终端 | `-gdb-set new-console on`：inferior 弹独立控制台窗口（VS 惯例） | 采纳 seer-windows D1/D4；PoC 实测：MI 流干净、弹窗 scanf 原生可用、CTRL_BREAK 中断不受影响；管道方案（inferior-tty 命名管道）已退役（见 §11） |
 | 中断（^C） | gdb 与 cgdb 共享控制台 + `CREATE_NEW_PROCESS_GROUP` + `GenerateConsoleCtrlEvent(CTRL_BREAK, gdbpid)` | M0 实测：gdb 注入 DbgBreakPoint 线程，`*stopped` 到达，之后仍可应答 |
 | 用户输入 | 控制台 `ENABLE_VIRTUAL_TERMINAL_INPUT`，kui 按字节流解析 ESC 序列 | kui 有 47 条硬编码 VT 绑定兜底（无 termcap 也可用）；ConPTY 注入的序列原样读回（实测） |
 | resize | 主循环 100ms 轮询 `GetConsoleScreenBufferInfo` | 无需 SIGWINCH/管道；PDCurses `resize_term` 负责重建 |
@@ -69,12 +69,12 @@
 ┌────────────▼──────────────────────────────────────┐
 │ gdb --nw -q --interpreter=mi                        │
 │  (共享 cgdb 控制台 + 独立进程组 → CTRL_BREAK 可达)  │
-│  inferior: -gdb-set inferior-tty \\.\pipe\...      │
+│  inferior: -gdb-set new-console on (独立弹窗)      │
 └───────────────────────────────────────────────────┘
 
 主循环 (cgdb.cpp win 版):
-  WaitForMultipleObjects[控制台输入, MI读管道, 停机Event, inferior管道Event]
-  + 100ms 超时轮询 (控制台尺寸变化→if_resize_term; gdb存活→quit)
+  WaitForMultipleObjects[控制台输入, 停机Event]
+  + 50ms 超时轮询 (MI管道 PeekNamedPipe; 控制台尺寸变化→if_resize_term; gdb存活→quit)
 ```
 
 ## 4. M0 开工实验记录（全部通过）
@@ -245,9 +245,8 @@ quick-edit 选择模式），输出加 VT 处理位；原始模式只保存一�
 （stderr 并入 stdout 管道）+ `CREATE_NEW_PROCESS_GROUP`（共享本控制台，
 使 CTRL_BREAK 可达）；`_open_osfhandle` 把两端转成 CRT fd。
 `win_interrupt_debugger`：`GenerateConsoleCtrlEvent(CTRL_BREAK, pid)`。
-`win_inferior_tty_create`：`\\.\pipe\cgdb_inf_<pid>` 双工命名管道 +
-读线程（ConnectNamedPipe 阻塞等待 gdb 在 inferior 启动时连入；ReadFile
-循环把字节塞进临界区保护的缓冲并 SetEvent；管道断开 err=109 即 EOF）。
+inferior 不接线：tgdb 启动时排队 `-gdb-set new-console on`（见 §11），
+console 子系统程序弹独立窗口、GUI 子系统不弹（PE 头决定）。
 
 ### 6.5 其他
 
@@ -305,7 +304,8 @@ MI 记录路由（gdbwire 回调内的 win 分支）：
    原始句柄（顺带绕开文本模式 CRLF 翻译；`_open_osfhandle` 加
    `_O_BINARY` 双保险）。`ERROR_BROKEN_PIPE` → 返回 0（EOF，对应
    Linux 的 EIO→0 映射）。
-3. **命名管道同步句柄的读/写串行化死锁**：inferior 管道读线程常驻
+3. **命名管道同步句柄的读/写串行化死锁**（管道时代陷阱，随 §11 的
+   new-console 改版退役，留档）：inferior 管道读线程常驻
    ReadFile 时，主线程向同一句柄 WriteFile（forwarding 用户键入）永久
    阻塞。
    **修复**：inferior 管道 `FILE_FLAG_OVERLAPPED` + 读线程 GetOverlappedResult
@@ -391,8 +391,8 @@ vterm 依赖 100% 藏在 scroller.cpp 内、interface.cpp 只调 `scr_*` API—�
   `"\n" + 输出 + 重画`（readline 风格）；
 - prompt 回调合成 `"(gdb) "`（gdbwire 会把字面量提示符从流里消费掉，
   显示层必须自己补）；
-- inferior 运行期间（未在提示符且管道已连接）：用户键入原样转发进
-  inferior 管道并本地回显（Linux pty 的同款行为）；
+- inferior 运行期间（非提示符状态）：按键丢弃——inferior 的 I/O 在它
+  自己的控制台窗口里（§11），^C 在 cgdb.cpp 层被拦截走中断路径；
 - 命令历史 100 条，方向键翻阅。
 
 ## 9. 输入链路
@@ -451,7 +451,7 @@ vterm 依赖 100% 藏在 scroller.cpp 内、interface.cpp 只调 `scr_*` API—�
 
 | 场景 | 检查项 |
 |---|---|
-| 主流程 | gdb 提示符出现、源码窗显示代码、行号渲染、状态条、`b main` 输出、源码窗断点标记、`run` 后 inferior 输出（经命名管道）进 GDB 窗、停回提示符、`next` 单步、方向键历史召回、ESC+`:q` 干净退出（exit 0） |
+| 主流程 | gdb 提示符出现、源码窗显示代码、行号渲染、状态条、`b main` 输出、源码窗断点标记、`run` 后 inferior 输出**不**出现在 GDB 窗（在弹窗里，MI 流干净）、停回提示符、`next` 单步、方向键历史召回、ESC+`:q` 干净退出（exit 0） |
 | resize | 130 列扩张无崩溃、会话存活、缩回 100 列正常、干净退出 |
 | CRLF+CJK | CRLF 源文件正常显示、CJK 注释（你好世界）正确渲染、干净退出 |
 | ^C 中断 | m0_sleep 运行中 ^C 产生 *stopped、gdb 继续应答命令、干净退出 |
@@ -518,9 +518,10 @@ Windows 移植对 Linux 侧零破坏（所有改动都在 `#ifdef _WIN32` 内）
 6. **`new-ui` 上游修复后的回切**：传输层已隔离在
    tgdb.cpp 的 #ifdef 段内，若上游 gdb 修好 new-ui，MI-over-pipes
    与双通道可共存选择。
-7. **inferior 交互式全屏程序**：inferior 的 tty 是管道不是终端，全屏
-   交互（vim 类）不可用；行交互（scanf/printf）正常。ConPTY 劣势终
-   端是后续增强方向。
+7. **inferior 交互**：inferior 在自己的控制台窗口里跑（§11），全屏
+   交互（vim 类）、scanf、CJK 键入全部原生可用——比 Linux 内嵌 pty 路线
+   还省事。代价：inferior 输出不显示在 cgdb 屏幕内（在弹窗里）；程序
+   退出即关窗，临终输出看不到（VS 同款行为）。
 8. **`Unknown command` 消息不可见**（上游行为，非移植差异）：`:` 敲
    未知命令时 `if_run_command` 画的错误消息会被随后的 `if_draw()` 在
    doupdate 之前覆盖（Linux 上 pty 实测同样不可见）。会话无损，命令
@@ -532,10 +533,68 @@ Windows 移植对 Linux 侧零破坏（所有改动都在 `#ifdef _WIN32` 内）
 
 | 项 | 位置 |
 |---|---|
-| 构建 | `win32/Makefile`（+ `win32/config.h`、`win32/cgdb_custom_config.h`、`win32/generated/`、`win32/regen-lexers.sh`） |
+| 构建 | `win32/Makefile`（+ `win32/config.h`、`win32/cgdb_custom_config.h`、`win32/generated/`、`win32/regen-lexers.sh`；注意这三项被上游 `.gitignore` 的 autotools 规则误伤，需显式入库，见 §12） |
 | 平台层 | `lib/util/console_win.*`、`lib/util/process_win.*`、io/terminal/sys_win/fs_util/sys_util 的 win 分支 |
 | tgdb 传输 | tgdb.cpp/tgdb.h 的 win 分支（含行编辑器） |
 | UI | `cgdb/scroller_win.cpp`、interface.cpp/cgdb.cpp 的 win 分支 |
 | 文档 | 本文件 + `doc/porting-feasibility.md`（可行性）+ `doc/reference.md`（架构） |
 | 测试 | `testsuite/win32/`（**96 项全覆盖套件，入库**）+ `.tmp/mi_driver.cpp`（MI 验收）+ `.tmp/e2e_cgdb.py`（E2E 23 项） |
 | 产物 | `.tmp/win-build/cgdb.exe`（6.6MB 全静态，仅依赖系统 DLL） |
+
+## 12. inferior 终端改版：new-console 弹窗（2026-10-29）
+
+**决策**：管道方案（`-gdb-set inferior-tty \\.\pipe\cgdb_inf_<pid>` 双工
+命名管道 + 读线程 + 按键转发）退役，改为 `-gdb-set new-console on`——
+被调试程序启动时弹出自己的独立控制台窗口（Visual Studio / VSCode /
+vim termdebug 的 Windows 惯例，方案采纳自 seer-windows 的 D1/D3/D4）。
+console 子系统程序弹可见窗口，GUI 子系统程序不弹（由 PE 头决定，无需
+探测）。Python 版（`python/cgdbpy`）同步改版，两侧行为一致。
+
+**动机**：管道不是终端——实测含 `scanf` 的程序无法正常交互（stdin 是
+管道、无回显、`\r` 语义错位），全屏程序与 CJK 键入同样不可用。弹窗里
+conhost 原生处理行编辑、回显、ANSI、Ctrl-C，这些问题全部消失。
+
+**PoC 实测**（`.tmp/poc-newcon/`，gdb 17.1 x86，驱动 `poc.py`，日志
+`poc-log.txt`）：
+
+| 项 | 结论 |
+|---|---|
+| `-gdb-set new-console on` | `^done`；`-gdb-show new-console` 回 `value="on"` |
+| 弹窗 scanf | inferior 的 stdin 是真 console（GetConsoleMode 成功）；WriteConsoleInput 注入 `42\r` → scanf 读到 → 程序写回 `GOT:42 TTY:1` |
+| MI 流纯净 | inferior 输出（PROMPT/GOT）不出现在任何 MI 记录 |
+| `CTRL_BREAK → gdb 进程组` | **依然有效**：inferior 在独立控制台时 gdb 收到事件并注入 DbgBreakPoint → `*stopped,signal-name="SIGTRAP"`（中断机制零改动） |
+| 同步模式 `-exec-interrupt` | 无效且挂死 gdb（与 seer D5 一致；`mi-async on` + `-exec-interrupt` 有效但不需要） |
+| `DebugBreakProcess(inferior)` | 本机 17.1 有效（备用数据点） |
+
+**代码改动**（2026-10-29，windows 分支）：
+
+- `tgdb.cpp` win 分支：`tgdb_start_gdb` 不再建管道，排队
+  `TGDB_REQUEST_TTY`（win 下命令串为 `-gdb-set new-console on`）；
+  `tgdb_win_editor_char` 在非提示符状态直接丢弃按键（原来转发进管道）；
+  删除 `win_tty`/`win_inf_used` 字段与 `tgdb_process_inferior` /
+  `tgdb_inferior_event_handle`（tgdb.h/cgdb.cpp 的调用点一并删除）。
+- `process_win.cpp/h`：删除 `win_inferior_tty_*` 全套（约 240 行），
+  只剩 gdb 启动 + 中断 + 存活查询。
+- 中断路径（`win_interrupt_debugger`）与 gdb 启动方式**零改动**。
+
+**测试同步**（重要——在另一台构建机上跑套件前必读）：
+
+- `testsuite/win32/` 中凡是断言「inferior 输出出现在 GDB 窗」的用例
+  （cases_debug 的 run/输出相关项）会失败：inferior 输出现在去弹窗了。
+  改法参照 python e2e 的同名改版
+  （`python/tests/e2e/test_e2e.py::test_inferior_runs_in_its_own_console`）：
+  断言输出**不**出现在 cgdb 屏幕 + 会话恢复应答（echo 探针）+ MI 干净。
+- ^C 中断用例应照常通过（中断机制未动）。
+- 弹窗在 ConPTY 宿主里照常弹出（cgdb 在 ConPTY 内、gdb 继承 ConPTY、
+  inferior 由 CREATE_NEW_CONSOLE 获得真实桌面窗口），程序退出即自动
+  关窗，测试无需清理。
+
+**构建系统备忘**：`win32/Makefile`、`win32/config.h`、
+`win32/cgdb_custom_config.h` 与根目录 `pdcurses.h` 包装此前被上游
+`.gitignore` 的 `Makefile`/`config.h`/`cgdb_custom_config.h` 无路径
+前缀规则**误伤**（全仓库任意目录同名都被忽略），从未进入版本库，
+且从工作区丢失——这就是它们只存在于另一台构建机上的原因。修复
+方式：`.gitignore` 加定向反排除（`!win32/Makefile` 等）后显式提交；
+Python 版改版（2026-10-29）在本机验证时因缺构建系统未重建 C 版二进制，
+上述 C 代码改动已通过 grep 全量核对（无残留引用），待构建机重编后
+按上段更新 testsuite/win32 断言。

@@ -110,12 +110,6 @@ struct tgdb {
     /* MI-over-pipes transport (see process_win.h) */
     struct win_process win_gdb;
 
-    /* The inferior's tty named pipe + reader thread */
-    struct win_inferior_tty win_tty;
-
-    /* True once the inferior tty request was issued */
-    int win_inf_used;
-
     /* True when gdb is at the MI prompt (between commands) */
     int win_at_prompt;
 
@@ -572,21 +566,13 @@ static int tgdb_win_editor_char(struct tgdb *tgdb, char ch)
     struct win_edit_state *e = &tgdb->win_edit;
     unsigned char c = (unsigned char) ch;
 
-    /* While the inferior is running, keystrokes become its stdin (the
-     * same thing the Linux pty does). */
-    if (!tgdb->win_at_prompt && tgdb->win_inf_used &&
-            win_inferior_tty_connected(&tgdb->win_tty)) {
-        char buf[1];
-        std::string echo;
-
-        buf[0] = ch;
-        if (win_inferior_tty_write(&tgdb->win_tty, buf, 1) != 1)
-            return -1;
-
-        echo.push_back(ch);
-        win_emit(tgdb, echo);
+    /* While gdb is busy (typically: the inferior is running) there is
+     * nothing to type into: the inferior does its I/O in its own
+     * console window ("new-console on"), so drop the key. ^C never
+     * gets here - cgdb.cpp intercepts it and interrupts through
+     * gdb's process group. */
+    if (!tgdb->win_at_prompt)
         return 0;
-    }
 
     if (!e->pending.empty() || c == 0x1b) {
         e->pending.push_back(ch);
@@ -1143,7 +1129,6 @@ static struct tgdb *initialize_tgdb_context(tgdb_callbacks callbacks)
     obj->win_gdb.stdout_fd = -1;
     obj->win_gdb.pid = 0;
     obj->win_gdb.h_process = NULL;
-    obj->win_inf_used = 0;
     obj->win_at_prompt = 0;
     win_edit_init(&obj->win_edit);
 #endif
@@ -1321,22 +1306,22 @@ int tgdb_start_gdb(struct tgdb *tgdb,
     tgdb->gdb_mi_ui_fd = tgdb->win_gdb.stdout_fd;
     tgdb->debugger_pid = (pid_t) tgdb->win_gdb.pid;
 
-    /* Create the inferior's tty pipe now so gdb can be told about it
-     * with the first queued commands (the name only matters once the
-     * inferior actually starts). */
-    if (win_inferior_tty_create(&tgdb->win_tty, tgdb->win_gdb.pid) == 0) {
+    /* The inferior is not wired to cgdb at all: it runs in its own
+     * console window (the Visual Studio convention). Queue the
+     * "set new-console on" request first so it is in effect before
+     * the program can start; console-subsystem inferiors then get a
+     * visible window from conhost (scanf/ANSI/Ctrl-C all native),
+     * GUI-subsystem inferiors get none. PoC-verified on gdb 17.1:
+     * the MI stream stays clean and the CTRL_BREAK interrupt path
+     * keeps working (doc/win_specs.md section 4). */
+    {
         tgdb_request_ptr request_ptr;
 
-        tgdb->win_inf_used = 1;
         request_ptr = (tgdb_request_ptr)
                 cgdb_malloc(sizeof(struct tgdb_request));
         request_ptr->header = TGDB_REQUEST_TTY;
-        request_ptr->choice.tty_command.slavename =
-                cgdb_strdup(tgdb->win_tty.name);
+        request_ptr->choice.tty_command.slavename = NULL;
         tgdb_run_or_queue_request(tgdb, request_ptr, true);
-    } else {
-        clog_error(CLOG_CGDB, "win_inferior_tty_create failed; inferior "
-                "output will pollute the MI channel");
     }
 
     /* On Windows there is a single channel: both descriptors alias the
@@ -1377,11 +1362,7 @@ int tgdb_shutdown(struct tgdb *tgdb)
 
 #ifdef _WIN32
     /* Closes the pipe fds (debugger_stdin/stdout alias them) and the
-     * process handle; stops the inferior reader thread. */
-    if (tgdb->win_inf_used) {
-        win_inferior_tty_destroy(&tgdb->win_tty);
-        tgdb->win_inf_used = 0;
-    }
+     * process handle. */
     win_process_destroy(&tgdb->win_gdb);
     tgdb->debugger_stdin = -1;
     tgdb->debugger_stdout = -1;
@@ -1620,8 +1601,9 @@ static void tgdb_unqueue_and_deliver_command(struct tgdb *tgdb)
 int tgdb_send_char(struct tgdb *tgdb, char c)
 {
 #ifdef _WIN32
-    /* The user's keystrokes feed the synthesized console (line editor,
-     * or raw forwarding to the inferior while it runs). */
+    /* The user's keystrokes feed the synthesized console's line
+     * editor (dropped while gdb is busy - the inferior has its own
+     * console window then). */
     return tgdb_win_editor_char(tgdb, c);
 #else
     if (io_write_byte(tgdb->debugger_stdin, c) == -1) {
@@ -1989,16 +1971,16 @@ int tgdb_get_gdb_command(struct tgdb *tgdb, tgdb_request_ptr request,
             break;
         case TGDB_REQUEST_TTY:
 #ifdef _WIN32
-            /* Raw backslashes survive the MI argument parser (M0 E2b). */
-            str = sys_aprintf("-gdb-set inferior-tty %s\n",
-                    request->choice.tty_command.slavename);
+            /* Windows has no tty device names: the inferior gets its
+             * own console window instead (see tgdb_start_gdb). */
+            command = "-gdb-set new-console on\n";
 #else
             str = sys_aprintf("-inferior-tty-set %s\n",
                     request->choice.tty_command.slavename);
-#endif
             command = str;
             free(str);
             str = NULL;
+#endif
             break;
         case TGDB_REQUEST_INFO_FRAME:
             command = "-stack-info-frame\n";
@@ -2088,31 +2070,6 @@ int tgdb_get_gdb_command(struct tgdb *tgdb, tgdb_request_ptr request,
 #ifdef _WIN32
 /* Windows main-loop helpers {{{ */
 
-/* Drain whatever the inferior wrote to its tty pipe and display it. */
-int tgdb_process_inferior(struct tgdb *tgdb)
-{
-    std::string out;
-    int n;
-
-    if (!tgdb->win_inf_used)
-        return 0;
-
-    n = win_inferior_tty_drain(&tgdb->win_tty, &out);
-    if (n > 0)
-        tgdb_win_output(tgdb, out);
-
-    return n;
-}
-
-/* Waitable event signaled when the inferior produced output. */
-void *tgdb_inferior_event_handle(struct tgdb *tgdb)
-{
-    if (!tgdb->win_inf_used)
-        return NULL;
-
-    return win_inferior_tty_event(&tgdb->win_tty);
-}
-
 /* 1 while gdb runs, 0 once it exited. */
 int tgdb_debugger_alive(struct tgdb *tgdb)
 {
@@ -2121,18 +2078,6 @@ int tgdb_debugger_alive(struct tgdb *tgdb)
 
 /* }}} */
 #else
-int tgdb_process_inferior(struct tgdb *tgdb)
-{
-    (void) tgdb;
-    return 0;
-}
-
-void *tgdb_inferior_event_handle(struct tgdb *tgdb)
-{
-    (void) tgdb;
-    return NULL;
-}
-
 int tgdb_debugger_alive(struct tgdb *tgdb)
 {
     (void) tgdb;

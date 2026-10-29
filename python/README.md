@@ -116,7 +116,7 @@ python/
   cgdbpy/
     mi.py                  GDB/MI 记录解析（对应 gdbwire.c 的 8193 行）
     gdbclient.py           gdb 子进程 + token 化请求/响应 + 回调分发
-    inferior_tty.py        inferior 的终端：Windows 命名管道 / POSIX pty
+    inferior_tty.py        inferior 的终端：Windows new-console 弹窗 / POSIX pty
     kui.py                 vim 式按键映射引擎（对应 lib/kui）
     keycodes.py            键值常量与 <...> 记法表（对应 kui_term.cpp）
     console.py             GDB 窗行模型（对应 scroller_win.cpp）
@@ -141,18 +141,23 @@ gdbclient（读线程解析 + 派发线程回调 + 泵线程发命令）
 app.py（prompt_toolkit 渲染）
 ```
 
-inferior 的 tty 单独给（`-gdb-set inferior-tty`），否则它的 stdout 会灌进 MI
-管道把记录流打乱 —— 这是 C 版 M0 阶段实测出来的（`win_specs.md` §4 E2a）。
+inferior 的终端要单独给，否则它的 stdout 会灌进 MI 管道把记录流打乱
+（`win_specs.md` §4 E2a，C 版 M0 实测）。POSIX 交给 gdb 一个 pty
+（`-inferior-tty-set`）；Windows 走 gdb 的 `new-console on`——被调试程序
+弹出自己的控制台窗口（Visual Studio 的惯例），scanf/ANSI/Ctrl-C 由 conhost
+原生处理，cgdb 不参与其 I/O。
 
 ## 改代码前必知的几个坑
 
 这些都是开发过程中实测踩到的，每一个都有对应的回归测试。
 
-1. **`-gdb-set inferior-tty` 的参数绝对不能加引号。**
+1. **`-inferior-tty-set` 的设备名不能加引号。**
    加了引号 gdb 会回 `^done`（假装成功）但实际没打开设备，inferior 输出直接
-   漏进 MI 管道。四种写法实测：不加引号的反斜杠和正斜杠都能用，加引号的三种
-   全废。见 `inferior_tty.py` 的 `gdb_argument()` 和
-   `test_gdb_integration.py::test_inferior_tty_must_not_be_quoted`。
+   漏进 MI 管道。四种写法实测（当时的 Windows 管道路线）：不加引号的反斜杠
+   和正斜杠都能用，加引号的三种全废。见 `inferior_tty.py` 的
+   `PtyInferiorTty.mi_command()` 和
+   `test_gdb_integration.py::test_inferior_tty_must_not_be_quoted`
+   （POSIX only；Windows 已改用 `new-console on`，无设备名可拼）。
 
 2. **`-break-insert` 的 location 必须把 `路径:行号` 整体作为一个 MI 字符串加引号。**
    `-break-insert -- "C:\dir\f.c":12`（只给路径加引号，也就是 C 版在 console
@@ -288,7 +293,8 @@ CGDBPY_MILOG=E:\path\mi.txt      # 每一行收发到的 MI 记录（带时间�
 | 行编辑 | gdb 自己的 readline | 手写（无 Tab 补全、无 Ctrl-R） | prompt_toolkit 原生（历史、词操作、kill ring） |
 | 语法高亮 | 8 个 flex 词法器 | 同左 | Pygments（语言覆盖广得多） |
 | 按键映射 | lib/kui | 同左 | `cgdbpy/kui.py`，198 项行为对齐 |
-| inferior 全屏程序 | 支持（pty） | 不支持（管道） | 不支持（管道） |
+| inferior 终端 | pty（内嵌） | new-console 弹窗（VS 惯例） | new-console 弹窗（VS 惯例） |
+| inferior 全屏程序 | 支持（pty） | 支持（弹窗是真终端） | 支持（弹窗是真终端） |
 | 启动 | ~8.5 ms | ~8.5 ms | ~260 ms |
 | 分发 | 单文件 | 6.6 MB 全静态单文件 | 需要解释器或打包 |
 
@@ -311,8 +317,9 @@ vim 键位、`/` 搜索）、**启动时自动打开调试对象的主源文件*
    C 版是 8.5ms。消不掉，只能权衡。
 2. **ESC 有约 100ms 延迟**，这是 VT 输入模式下区分 lone ESC 和转义序列的
    固有代价，C 版的 `ttimeoutlen` 默认值也是 100ms。
-3. **inferior 全屏程序不可用**（tty 是管道不是终端），行交互正常。
-   和 C 版 Windows 移植的限制一致。
+3. **inferior 的输出显示在弹窗里，不进 cgdb 屏幕**。Windows 上被调试程序
+   在自己的控制台窗口里跑（VS 惯例），scanf/全屏交互都发生在那个窗口；
+   cgdb 里能看到的只有 gdb 自己的报告。这是有意取舍，POSIX 侧仍是内嵌 pty。
 4. **GDB 窗没有 Tab 补全**。可以用
    `-interpreter-exec console "complete ..."` 实现，prompt_toolkit 的
    `Completer` 接口天生适配 —— 这是 Python 版可以超过 C 版 Windows 移植的地方，

@@ -1050,10 +1050,13 @@ class CgdbApp:
         if key == kc.ESC:
             self.set_focus(FOCUS_SOURCE)
             return
-        if self.running_inferior and self.tty is not None:
-            # the inferior owns the terminal: keys pass through byte-wise,
-            # exactly as C writes each key into the console pty
-            # (gdb_input's default -> result=1 -> tgdb_send_char)
+        if self.running_inferior:
+            # POSIX: the inferior owns the pty, keys pass through
+            # byte-wise, exactly as C writes each key into the console
+            # pty (gdb_input's default -> result=1 -> tgdb_send_char).
+            # Windows: the inferior owns its own console window; there
+            # is nothing to forward, so the key is dropped (C does the
+            # same).
             self._send_key_to_inferior(key)
             return
         # Keys that reach THIS branch while the edit line has focus can
@@ -1075,12 +1078,16 @@ class CgdbApp:
         # readline editing defaults stay owned by prompt_toolkit's bindings
 
     def _send_key_to_inferior(self, key):
-        """Byte-wise passthrough while the inferior runs.
+        """Byte-wise passthrough while the inferior runs (POSIX pty only).
 
         C writes each key into the console pty; its line discipline echoes
-        the input back. The inferior pipe here has no echo, so printable
-        keys and edits are echoed into the console model by hand.
+        the input back. The pty master here has no echo, so printable keys
+        and edits are echoed into the console model by hand. On Windows the
+        inferior reads from its own console window and write() is a no-op,
+        so nothing is echoed either.
         """
+        if self.tty is None:
+            return
         if key == kc.CTRL_M:
             ch = "\n"
         elif key == kc.CTRL_H:
@@ -1089,9 +1096,9 @@ class CgdbApp:
             ch = chr(key)
         else:
             return
-        self.tty.write(ch)
-        self.console.add_text(ch)
-        self.invalidate()
+        if self.tty.write(ch):
+            self.console.add_text(ch)
+            self.invalidate()
 
     # =====================================================================
     # File dialog (filedlg.cpp)
@@ -2309,27 +2316,31 @@ class CgdbApp:
             self.message = "gdb failed to start"
             return False
         self.gdb_alive = True
-        # give the inferior its own tty so its output does not corrupt the MI
-        # stream (win_specs.md §4 E2a)
+        # Give the inferior its own terminal so its output does not
+        # corrupt the MI stream (win_specs.md §4 E2a): a pty on POSIX,
+        # its own console window on Windows (gdb "new-console on", the
+        # Visual Studio convention -- the popup handles scanf/ANSI/
+        # Ctrl-C natively and the MI stream stays clean, PoC-verified
+        # on gdb 17.1; .tmp/poc-newcon).
         try:
             self.tty = (self._tty_factory(self._on_inferior_output)
                         if self._tty_factory else
                         create_inferior_tty(self._on_inferior_output))
             self.tty.start()
-            # The argument must NOT be quoted -- see InferiorTty.gdb_argument().
+            # The pty device path must NOT be quoted -- see
+            # PtyInferiorTty.mi_command().
             self.gdb.call(self.tty.mi_command(), timeout=10)
-            # gdb answers ^done even when it could not open the device, so
-            # verify rather than trust (this exact silent failure is what let
-            # inferior stdout corrupt the MI stream during development).
-            shown = self.gdb.call("-inferior-tty-show", timeout=10)
-            want = self.tty.gdb_argument()
-            got = (shown.payload or {}).get("inferior_tty", "")
-            if want not in got and got not in want:
-                raise GdbError("gdb did not accept the inferior tty "
-                               "(wanted %r, gdb has %r)" % (want, got))
+            # gdb answers ^done even when it could not apply the setting,
+            # so verify rather than trust (the silent-failure mode once
+            # let inferior stdout corrupt the MI stream during
+            # development).
+            shown = self.gdb.call(self.tty.verify_command(), timeout=10)
+            if not self.tty.verify_ok(shown.payload if shown else None):
+                raise GdbError("gdb did not accept the inferior terminal "
+                               "setting (%r)" % (shown and shown.payload))
         except Exception as e:
             self.tty = None
-            self._on_console("cgdb: inferior tty unavailable (%s); "
+            self._on_console("cgdb: inferior terminal unavailable (%s); "
                              "program output may interleave with MI\n" % e)
         # C asks gdb for the current location as soon as gdb is ready
         # (tgdb_request_current_location -> -file-list-exec-source-file);
@@ -2466,11 +2477,14 @@ class CgdbApp:
             self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
             self.console.add_text("cgdb: gdb is not running\n")
             return
-        if self.running_inferior and self.tty is not None:
-            # the inferior owns the terminal; the input goes to it raw and
-            # is echoed without a (gdb) prompt -- the prompt belongs to
-            # gdb, which is not reading input while the inferior runs
-            self.tty.write(text + "\n")
+        if self.running_inferior:
+            # POSIX: the inferior owns the pty; the input goes to it raw
+            # and is echoed without a (gdb) prompt -- the prompt belongs
+            # to gdb, which is not reading input while the inferior runs.
+            # Windows: the inferior reads its own console window, there is
+            # nothing to deliver (the line is not echoed either).
+            if self.tty is not None:
+                self.tty.write(text + "\n")
             return
         self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
         threading.Thread(target=self._console_command_worker, args=(text,),

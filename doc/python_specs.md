@@ -92,13 +92,14 @@ python -m pytest tests/ -q                                                      
            │ stdin/stdout 匿名管道                     │
            │                                          │
 ┌──────────▼──────────────────────────┐   ┌───────────▼──────────┐
-│ gdb --nw -q                         │   │ inferior tty         │
-│   -ex "set pagination off"          │   │  Win: 命名管道(重叠IO)│
+│ gdb --nw -q                         │   │ inferior terminal    │
+│   -ex "set pagination off"          │   │  Win: new-console 弹窗│
 │   -ex "set confirm off"             │   │  POSIX: pty          │
 │   --interpreter=mi                  │   │                      │
-│   <用户参数>                         │   │  ← 被调试程序的 stdout│
-└──────────┬──────────────────────────┘   └──────────────────────┘
-           │ -gdb-set inferior-tty <未加引号的设备名>
+│   <用户参数>                         │   │  ← 被调试程序的 I/O  │
+└──────────┬──────────────────────────┘   │    （Win: 不经过本   │
+           │ -gdb-set new-console on (Win) │    进程，见 §3.3）   │
+           │ -inferior-tty-set <pty> (POSIX)└──────────────────────┘
            └──────────────────────────────────────┘
 ```
 
@@ -116,7 +117,7 @@ python -m pytest tests/ -q                                                      
 | 读线程 | `gdb-mi-reader` | `read()` gdb stdout → `LineSplitter` → `parse_line` → **`_complete()` 配对请求** → 入队 `_events` | 调用用户回调 |
 | 派发线程 | `gdb-mi-dispatch` | 出队 → `_dispatch()` → 触发用户回调 | 无限制（可以阻塞调 `call()`） |
 | 泵线程 | `gdb-mi-pump` | 从 `_queue` 取命令写入 gdb stdin，**一次只允许一条在飞** | 轮询（见 §7.4） |
-| inferior 读线程 | `inferior-pipe` / `inferior-pty` | 读被调试程序输出 → `_on_inferior_output` | — |
+| inferior 读线程 | `inferior-pty`（POSIX only） | 读被调试程序输出 → `_on_inferior_output` | — |
 | 临时 worker | 无名 daemon | `_run_async()` / `send_console_command()` 派生，执行阻塞的 `call()` | 长期存活 |
 
 **为什么配对必须留在读线程**：`call()` 阻塞在 `req.done.wait()`，而 `done.set()`
@@ -262,38 +263,45 @@ C 版对应物：`lib/tgdb/tgdb.cpp` 的传输与命令队列部分。
 6. **`stop()` 之后 `_pump_loop` 要把残留请求全部置错并 `done.set()`**，
    否则等待方永久挂起。
 
-### 3.3 `cgdbpy/inferior_tty.py`（276 行）—— 被调试程序的终端
+### 3.3 `cgdbpy/inferior_tty.py`（160 行）—— 被调试程序的终端
 
-C 版对应物：`lib/util/process_win.cpp` 的 `win_inferior_tty_*` / `lib/util/pseudo.cpp`。
+C 版对应物：`lib/tgdb/tgdb.cpp` win 分支的 `TGDB_REQUEST_TTY` /
+`lib/util/pseudo.cpp`。
 
-| 类 | 行 | 平台 |
-|---|---:|---|
-| `InferiorTty` | 21 | 抽象基类 |
-| `PtyInferiorTty` | 52 | POSIX（`pty.openpty()`，`-inferior-tty-set`） |
-| `PipeInferiorTty` | 167 | Windows（命名管道，`-gdb-set inferior-tty`） |
-| `create(on_output)` | 272 | 平台分发 |
+| 类 | 平台 | 机制 |
+|---|---|---|
+| `InferiorTty` | 抽象基类 | `start()` / `mi_command()` / `verify_command()` / `verify_ok()` / `write()` |
+| `PtyInferiorTty` | POSIX | `pty.openpty()`，`-inferior-tty-set <slave 名>`（**不加引号**） |
+| `NewConsoleTty` | Windows | `-gdb-set new-console on`，inferior 弹独立控制台窗口 |
+| `create(on_output)` | 平台分发 | — |
 
 **不变量**
 
-1. ⚠️ **`gdb_argument()` 返回的字符串必须以「不加引号」的形式插进 MI 命令行。**
-   这是本项目最阴的坑：加引号后 gdb 回 `^done`（**假装成功**），
-   实际没打开设备，inferior 的 stdout 直接灌进 MI 管道变成 `PARSE_ERROR`。
-   实测四种写法：不加引号的反斜杠 / 不加引号的正斜杠 → 都能用；
-   加引号的三种（原始反斜杠、正斜杠、`mi.quote()`）→ 全废。
-   基类 docstring（`inferior_tty.py:27`）记录了完整实测结论。
-   回归测试：`test_gdb_integration.py::test_inferior_tty_must_not_be_quoted`
-   —— 它**同时断言不加引号能用、加引号仍然是坏的**，这样将来 gdb 修好了
-   这个测试会失败并提示你可以去掉 workaround。
-2. **Windows 侧必须用重叠 I/O。** 同步命名管道上读线程常驻 `ReadFile` 时，
-   主线程对同一句柄 `WriteFile` 会死锁（C 版 `win_specs.md` §7.2 实测）。
-   读、写各自带 `OVERLAPPED` + 独立 event。
-3. **`app.start_gdb()` 会校验 `-inferior-tty-show` 的返回值**（`app.py:906`）。
-   因为 `^done` 不可信（见第 1 条），必须回读确认。
+1. ⚠️ **POSIX 侧 `mi_command()` 的设备名必须以「不加引号」的形式插进 MI
+   命令行。** 加引号后 gdb 回 `^done`（**假装成功**），实际没打开设备，
+   inferior 的 stdout 直接灌进 MI 管道变成 `PARSE_ERROR`。实测四种写法
+   （管道时代，gdb 17.1）：不加引号的反斜杠 / 正斜杠 → 都能用；加引号的
+   三种 → 全废。回归测试：
+   `test_gdb_integration.py::test_inferior_tty_must_not_be_quoted`
+   （POSIX only）—— 它**同时断言不加引号能用、加引号仍然是坏的**。
+2. **Windows 侧 cgdb 不参与 inferior 的 I/O。** `new-console on` 让
+   console 子系统程序弹自己的 conhost 窗口（Visual Studio 惯例，
+   采纳自 seer-windows 的 D1/D4），scanf/ANSI/Ctrl-C 全部原生；
+   GUI 子系统程序不弹（PE 头决定，无需探测）。`write()` 返回 False，
+   `running_inferior` 期间 cgdb 侧按键被丢弃（C 版同款行为）。
+   PoC 实测（`.tmp/poc-newcon`，gdb 17.1 x86）：弹窗 scanf 往返
+   `GOT:42 TTY:1`、MI 流零污染、`CTRL_BREAK → gdb 进程组` 中断
+   依然有效（gdb 收到事件后注入 DbgBreakPoint 并报 `*stopped`）。
+3. **`app.start_gdb()` 会校验设置真的生效**（`verify_command()` /
+   `verify_ok()`：POSIX 回读 `-inferior-tty-show`，Windows 回读
+   `-gdb-show new-console` 的 `value=="on"`）。因为 `^done` 不可信
+   （见第 1 条），必须回读确认。
    → 如果你要改 tty 接线，这个校验是你的安全网，别删。
-4. 没有 inferior tty 会怎样：MI 流被污染。这是 C 版 M0 阶段的实验 E2a
-   （`win_specs.md` §4）确认过的，不是推测。
+4. 没有 inferior 终端设置会怎样：MI 流被污染（C 版 M0 实验 E2a，
+   `win_specs.md` §4）。
    测试：`test_gdb_integration.py::test_inferior_output_does_not_corrupt_the_mi_stream`
-   断言 `stats["parse_errors"] == 0` 且 inferior 输出确实到达。
+   断言 `stats["parse_errors"] == 0`，且 POSIX 下输出到达 pty / Windows
+   下输出**不**进 cgdb 侧通道（它在弹窗里）。
 
 ### 3.4 `cgdbpy/kui.py`（407 行）+ `keycodes.py`（326 行）—— 按键映射引擎
 
@@ -696,19 +704,22 @@ ptk 从**顶部**开始显示 formatted text；在顶部补空行会把真实内
 
 | 场景 | 错 | 对 |
 |---|---|---|
-| `-gdb-set inferior-tty` | `-gdb-set inferior-tty "\\.\pipe\x"` | `-gdb-set inferior-tty \\.\pipe\x`（**不加引号**） |
+| `-inferior-tty-set`（POSIX） | `-inferior-tty-set "/dev/pts/3"` | `-inferior-tty-set /dev/pts/3`（**不加引号**） |
 | `-break-insert` 位置 | `-break-insert -- "C:\d\f.c":12` | `-break-insert -- "C:\d\f.c:12"`（**整体一个字符串**） |
 
-第一条的错误表现是 `^done` + 静默失效（inferior 输出污染 MI 流）。
+第一条的错误表现是 `^done` + 静默失效（inferior 输出污染 MI 流）——
+管道时代的 Windows 实测结论，现随 new-console 路线退役为 POSIX 侧的
+拼写纪律。
 第二条的错误表现是 `^error,msg="Problem parsing arguments"`。
 
 注意第二条与 C 版**不同**：C 版在 console 侧用 `break "file":N`
 （`reference.md` §5.2），那条路走 gdb 自己的参数解析器，能work；
 走 MI 就不行。
 
-**测试**：`test_inferior_tty_must_not_be_quoted`、`test_breakpoint_location_quoting`、
-`test_breakpoint_in_a_path_with_spaces`。
-用 `mi.breakpoint_location()` 和 `InferiorTty.mi_command()`，别手拼。
+**测试**：`test_inferior_tty_must_not_be_quoted`（POSIX only）、
+`test_breakpoint_location_quoting`、`test_breakpoint_in_a_path_with_spaces`、
+`test_windows_new_console_inferior_terminal`。
+用 `mi.breakpoint_location()` 和 tty 的 `mi_command()`，别手拼。
 
 ### 7.3 ESC 延迟 500ms
 
@@ -1186,7 +1197,8 @@ Windows 侧的 Python 会把它解释成当前盘符下的 `\tmp\x.txt`，
    即使 `app.py` 没用它。它是 359 项 kui 测试的对象，也是 `basic.exp`
    198 项规格的一部分（见 §3.9）。
 2. **不要把高亮改成窗口化 lex**（§3.6，有反证测试）。
-3. **不要把 `-gdb-set inferior-tty` 的参数加上引号**（§7.2，会静默失效）。
+3. **不要把 `-inferior-tty-set` 的设备名加上引号**（§7.2，会静默失效）。
+   Windows 侧也别把 new-console 路线改回 inferior-tty 管道（§20）。
 4. **不要把 `-break-insert` 的位置改成只引路径**（§7.2，会报 parsing 错误）。
 5. **不要把 `Keys.Escape` 的 `eager=True` 去掉**（§3.9，会完全不触发）。
 6. **不要把 `ttimeoutlen` 调回 ptk 默认的 0.5**（§7.3，ESC 会变成 500ms）。
@@ -1352,11 +1364,13 @@ Windows 的 15.6 ms 定时器粒度与此无关（实测 `Event.wait` 请求 1 m
 ┌──────────────▼─────────────────────────────┐
 │ gdb --nw -q --interpreter=mi                │
 │  用户命令 → -interpreter-exec console "..."  │
-│  inferior → -gdb-set inferior-tty <pipe>    │
+│  inferior → Win: new-console on（弹窗）      │
+│           → POSIX: -inferior-tty-set <pty>  │
 └─────────────────────────────────────────────┘
 ```
 
-这就是 `windows` 分支 C 版的架构，也是 gdbgui 的架构
+这就是 `windows` 分支 C 版的架构（inferior 终端接线 2026-10-29 起为
+new-console，见 §20），也是 gdbgui 的架构
 （[gdbgui 用 pygdbmi 管理 gdb 子进程并解析输出](https://www.gdbgui.com/howitworks/)）。
 **能完整复现 cgdb 的交互模型**：上下分屏、ESC 切焦点、GDB 窗独立滚动、
 vim 按键映射、`:set` 配置。
@@ -1562,8 +1576,9 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
   CJK 键入会乱」。ptk 在 Windows 上走 `ReadConsoleInputW` 宽字符路径，
   **大概率不受影响，但未实测** —— 要支持 CJK 前先写个 E2E 验证。
 - **ConPTY 依赖仍在**：E2E 测试用 ConPTY（Win10 1809+）。但**运行时不依赖** ——
-  ptk 直接写控制台，inferior tty 用命名管道（古董级 API，无版本约束）。
-  这比 C 版好：C 版的 inferior 终端路线要 ConPTY。
+  ptk 直接写控制台，inferior 弹的是系统默认终端（`new-console`，古董级
+  语义，无版本约束）。两侧（C 版与 Python 版）的 inferior 终端现在同路
+  线，都不需要 ConPTY。
 
 ## 19. 什么情况下**不该**做 Python 版
 
@@ -1585,6 +1600,34 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
   更丰富的语法高亮），而这些在 C 里做代价很高
 
 如果这两条不成立，就不该做。§8 的未实现项清单基本就是第一条理由的展开。
+
+## 20. 决策修订：Windows inferior 终端改用 new-console 弹窗（2026-10-29）
+
+- 状态：已采纳（主人决策；PoC 实证）
+- 背景：管道方案把 inferior 的 stdio 接进 cgdb，行交互靠按键逐字节转发，
+  实测含 `scanf` 的程序无法正常交互；全屏程序、CJK 键入也全部不可用。
+  参照 seer-windows 的 D1/D3/D4（Windows 调试器惯例：不嵌虚拟终端，
+  inferior 弹自己的 conhost 窗口，VS / VSCode / vim termdebug 同款）。
+- 决策：Windows 侧 inferior 终端改为 `-gdb-set new-console on`，删除
+  `PipeInferiorTty` 与整个命名管道底层（含重叠 I/O 读线程）。
+  console 子系统程序弹可见窗口、GUI 子系统不弹（PE 头自动决定）。
+  `running_inferior` 期间 cgdb 侧按键丢弃（inferior 读自己的窗口）。
+  POSIX pty 路线不动。
+- PoC 佐证（`.tmp/poc-newcon`，gdb 17.1 x86，驱动日志 poc-log.txt）：
+  - 弹窗 scanf 往返：`WriteConsoleInput("42\r")` → inferior 写回
+    `GOT:42 TTY:1`（stdin 是真 console）；
+  - MI 流零污染（inferior 输出不出现在任何 MI 记录）；
+  - `CTRL_BREAK → gdb 进程组` 的中断路径在 inferior 独立控制台下
+    **依然有效**（gdb 注入 DbgBreakPoint → `*stopped`）——中断机制零改动；
+  - `-exec-interrupt` 同步模式无效（与 seer D5 一致，未采用）；
+    `mi-async on` + `-exec-interrupt` 有效但不需要。
+- 连带修改：`NewConsoleTty` 的 `write()` 返回 False 使 app 层的回显
+  自然短路（平台差异收敛在 tty 对象，`app.py` 不做 `sys.platform` 分支）。
+  测试更新：`test_gdb_integration.py` 加平台分支 + 新增
+  `test_windows_new_console_inferior_terminal`；e2e 中三个断言
+  inferior 输出上屏的用例改为「输出不泄漏 + 会话恢复响应」。
+- 代价：inferior 输出不再显示在 cgdb 屏幕（在弹窗里）；退出即关窗，
+  临终输出看不到（VS 同款行为）。换来：scanf/全屏/CJK 输入全部原生可用。
 
 ---
 

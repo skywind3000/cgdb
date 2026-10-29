@@ -833,27 +833,24 @@ static int main_loop(void)
 #ifdef _WIN32
     HANDLE console_in = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE stop_event = (HANDLE) win_stop_event_handle();
-    HANDLE wait_handles[3];
+    HANDLE wait_handles[2];
 
     /* Main (infinite) loop:
-     *   Waits on the console input handle (user input), the stop event
-     *   (console close/logoff) and the inferior output event. The MI
-     *   pipe is NOT waitable on Windows (io_data_ready polls it with
+     *   Waits on the console input handle (user input) and the stop
+     *   event (console close/logoff). The inferior does its I/O in
+     *   its own console window and is not wired in here. The MI pipe
+     *   is NOT waitable on Windows (io_data_ready polls it with
      *   PeekNamedPipe), and resize is polled through the console
      *   geometry, so the wait carries a short timeout. */
 
     for (;;) {
         DWORD count = 0;
-        void *inf_event;
         DWORD r;
         int rows, cols;
 
         wait_handles[count++] = console_in;
         if (stop_event)
             wait_handles[count++] = stop_event;
-        inf_event = tgdb_inferior_event_handle(tgdb);
-        if (inf_event)
-            wait_handles[count++] = (HANDLE) inf_event;
 
         r = WaitForMultipleObjects(count, wait_handles, FALSE, 50);
         if (r == WAIT_FAILED) {
@@ -877,14 +874,6 @@ static int main_loop(void)
                 continue;
             else if (val == -1)
                 return -1;
-        }
-
-        /* Inferior output (dedicated reader thread event) */
-        if (inf_event &&
-                ((count > 2 && r == WAIT_OBJECT_0 + 2) ||
-                 WaitForSingleObject((HANDLE) inf_event, 0) ==
-                        WAIT_OBJECT_0)) {
-            tgdb_process_inferior(tgdb);
         }
 
         /* MI pipe: poll, then process (the comment on ordering in the

@@ -118,11 +118,15 @@ class FakeTty:
         self.started = True
         return "\\\\.\\pipe\\faketty"
 
-    def gdb_argument(self):
-        return "\\\\.\\pipe\\faketty"
-
     def mi_command(self):
         return "-gdb-set inferior-tty \\\\.\\pipe\\faketty"
+
+    def verify_command(self):
+        return "-inferior-tty-show"
+
+    def verify_ok(self, payload):
+        got = (payload or {}).get("inferior_tty", "")
+        return "\\\\.\\pipe\\faketty" in got or got in "\\\\.\\pipe\\faketty"
 
     def write(self, data):
         self.written.append(data)
