@@ -726,8 +726,15 @@ def test_inferior_tty_must_not_be_quoted(target):
     # it, this assertion fires and the workaround can be dropped
     assert "start n=" not in quoted_text, (
         "gdb now accepts a quoted inferior-tty; the workaround can go")
-    assert quoted_bad, (
-        "quoted form neither worked nor leaked -- unexpected third behaviour")
+    if sys.platform == "win32":
+        assert quoted_bad, (
+            "quoted form neither worked nor leaked -- unexpected third "
+            "behaviour")
+    # gdb 15.1 (Linux) instead fails the run quietly: the device is never
+    # opened, no output is delivered anywhere, nothing leaks into MI.
+    # The leak-this-assertion-pins was measured on gdb 17.1 (mingw); the
+    # load-bearing guarantee above -- a quoted name delivers nothing --
+    # holds on both.
 
 
 # ---------------------------------------------------------------------------
@@ -830,3 +837,199 @@ def _pid_alive(pid):
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# The inferior's embedded terminal (POSIX pty + VT) -- python_specs.md §21.
+#
+# The probe inferior (tests/data/terminal_probe.c) emits the exact
+# sequences the C-version probe (/usr/bin/cgdb 0.8.0) was driven with, so
+# the assertions here are the same ones that passed against real cgdb.
+# ---------------------------------------------------------------------------
+PROBE_SRC_PATH = os.path.join(HERE, "data", "terminal_probe.c")
+
+posix_only = pytest.mark.skipif(sys.platform == "win32",
+                                reason="POSIX pty route")
+
+
+@pytest.fixture(scope="module")
+def vt_target():
+    if CC is None:
+        pytest.skip("no C compiler")
+    from cgdbpy.vt import InferiorScreen            # noqa: F401 (pyte check)
+    d = tempfile.mkdtemp(prefix="cgdbpy-vttest-")
+    src = os.path.join(d, "vtinf.c")
+    exe = os.path.join(d, "vtinf")
+    shutil.copyfile(PROBE_SRC_PATH, src)
+    r = subprocess.run([CC, "-g", "-O0", src, "-o", exe],
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0 or not os.path.exists(exe):
+        shutil.rmtree(d, ignore_errors=True)
+        pytest.skip("could not compile vt inferior: %s" % r.stderr[:400])
+    yield exe
+    shutil.rmtree(d, ignore_errors=True)
+
+
+class VtSession:
+    """gdb + the inferior pty + the VT it feeds: the app's exact shape."""
+
+    def __init__(self, exe):
+        from cgdbpy.vt import InferiorScreen
+        self.raw = bytearray()
+        self.vt = InferiorScreen(20, 80)
+        self.drained = []
+        self.stopped = []
+        self.tty = None
+        self.client = GdbClient(gdb_path=GDB, args=[exe], callbacks={
+            "on_stopped": lambda p: self.stopped.append(p),
+        })
+
+    def _on_output(self, data):
+        self.raw.extend(data)
+        self.vt.feed(data)
+
+    def _on_drain(self):
+        self.drained.append(self.vt.extract_lines())
+
+    def start(self):
+        from cgdbpy.inferior_tty import create
+        self.client.start()
+        self.tty = create(self._on_output, self._on_drain)
+        self.tty.start()
+        self.client.call(self.tty.mi_command(), timeout=15)
+        return self
+
+    def run(self):
+        self.client.send("-exec-run")
+
+    def screen_text(self):
+        return "\n".join(self.vt.all_row_texts())
+
+    def wait_for(self, pattern, timeout=15):
+        end = time.time() + timeout
+        while time.time() < end:
+            if pattern.encode() in bytes(self.raw):
+                return True
+            time.sleep(0.05)
+        return pattern.encode() in bytes(self.raw)
+
+    def wait_stopped(self, timeout=10):
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.stopped:
+                return self.stopped[0]
+            time.sleep(0.05)
+        return self.stopped[0] if self.stopped else None
+
+    def close(self):
+        try:
+            if self.client.running:
+                try:
+                    self.client.call("-gdb-exit", timeout=3)
+                except Exception:
+                    pass
+        finally:
+            self.client.stop(timeout=3)
+            if self.tty is not None:
+                self.tty.close()
+
+
+@pytest.fixture
+def vt_session(vt_target):
+    if sys.platform == "win32":
+        pytest.skip("POSIX pty route")
+    s = VtSession(vt_target)
+    try:
+        yield s.start()
+    finally:
+        s.close()
+
+
+@posix_only
+def test_inferior_vt_renders_colour_clear_and_position(vt_session):
+    # the same three facts the /usr/bin/cgdb probe established: colours
+    # render, \033[2J actually clears the pane, \033[3;10H positions
+    # absolutely at 0-based (2, 9)
+    s = vt_session
+    s.run()
+    assert s.wait_for("TYPE>")
+    screen = s.screen_text()
+    assert "normal" not in screen        # cleared away by \033[2J
+    assert "SCREEN-MODE" in screen
+    assert s.vt.row_text(2)[9] == "S"
+    styles = [style for style, _ in s.vt.row_fragments(2)]
+    assert any("fg:ansired" in st for st in styles)
+
+
+@posix_only
+def test_typed_keys_reach_the_inferior_with_one_echo(vt_session):
+    # the pty's line discipline is THE echo: exactly one echo comes back,
+    # so nothing may be echoed by hand (the old code double-echoed)
+    s = vt_session
+    s.run()
+    assert s.wait_for("TYPE>")
+    s.tty.write("hi\r")
+    assert s.wait_for("PAUSING")
+    raw = bytes(s.raw)
+    assert b"GOT:hi" in raw              # the program read the line
+    assert raw.count(b"hi") == 2         # line-discipline echo + GOT:hi
+    # CR travelled as \r and ICRNL made it \n for the program
+    assert b"TYPE>hi\r\n" in raw
+
+
+@posix_only
+def test_vintr_byte_stops_the_inferior(vt_session):
+    # C interrupts by writing the pty's VINTR byte into the master
+    # (tgdb_signal_notification); gdb puts the inferior in the slave's
+    # foreground process group, so ISIG delivers SIGINT to it
+    s = vt_session
+    s.run()
+    assert s.wait_for("TYPE>")
+    s.tty.write("go\r")                 # the inferior pauses after this line
+    assert s.wait_for("PAUSING")
+    s.tty.write(b"\x03")
+    stopped = s.wait_stopped()
+    assert stopped is not None
+    assert stopped.get("signal-name") == "SIGINT"
+
+
+@posix_only
+def test_request_flush_drains_the_pty(vt_session):
+    # on *stopped the app asks the reader to drain before gdb's report is
+    # appended; the mechanics: quiet pty -> on_drain -> done
+    s = vt_session
+    s.run()
+    assert s.wait_for("TYPE>")
+    s.tty.write("go\r")                 # the inferior pauses after this line
+    assert s.wait_for("PAUSING")
+    s.tty.write(b"\x03")
+    assert s.wait_stopped()
+    assert s.tty.request_flush(1.0)
+    assert s.drained and s.drained[0], "on_drain saw an empty screen"
+    assert "PAUSING" in "\n".join(s.drained[0])
+    # idempotent: a second flush sees an untouched screen (extract does
+    # not consume; the app's flatten is what resets)
+    n = len(s.drained)
+    assert s.tty.request_flush(1.0)
+    assert len(s.drained) == n + 1
+    assert s.drained[-1] == s.drained[0]
+
+
+@posix_only
+def test_resize_reaches_the_inferior(vt_session):
+    # the resize chain: TIOCSWINSZ on the master -> SIGWINCH to the
+    # foreground process group (probed working on the standalone wiring;
+    # this pins it for the tty object the app uses)
+    s = vt_session
+    s.run()
+    assert s.wait_for("TYPE>")
+    s.tty.write("go\r")                 # the inferior pauses after this line
+    assert s.wait_for("PAUSING")
+    s.tty.resize(15, 60)
+    assert s.wait_for("WINCH-SEEN")
+
+
+@posix_only
+def test_embedded_flag_marks_the_pty_route(vt_session):
+    # the app branches on tty.embedded instead of sys.platform
+    assert vt_session.tty.embedded is True

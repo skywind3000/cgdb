@@ -285,6 +285,55 @@ class ConsoleModel:
         self._pending = bytearray()
 
 
+class RowListView:
+    """A ConsoleModel-shaped view over a plain list of text rows.
+
+    The GDB window's scroll mode and console search are written against
+    ConsoleModel's row interface; while the inferior runs they must work
+    on the VT screen's rows instead (C has one vterm for both, here the
+    two row sources share this interface). Rows are indexed like
+    ConsoleModel's: 0 is the oldest, the last row is the newest.
+    """
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def line_count(self):
+        return len(self.rows)
+
+    def visible_lines(self, height, delta=0):
+        end = len(self.rows) - delta
+        start = max(0, end - height)
+        return self.rows[start:end]
+
+    def max_delta(self, height):
+        return max(0, len(self.rows) - height)
+
+    def search(self, rx, start_row=None, start_col=0, forward=True,
+               wrapscan=True):
+        """(row, col) of the next match, or None -- ConsoleModel.search
+        semantics, verbatim."""
+        n = len(self.rows)
+        if not n:
+            return None
+        if forward:
+            first = (start_row + 1) if start_row is not None else 0
+            order = list(range(first, n))
+            if wrapscan and first > 0:
+                order += list(range(0, first))
+        else:
+            first = (start_row - 1) if start_row is not None else n - 1
+            order = list(range(first, -1, -1))
+            if wrapscan and first < n - 1:
+                order += list(range(n - 1, first, -1))
+        for i in order:
+            from_col = start_col + 1 if i == start_row else 0
+            m = rx.search(self.rows[i], from_col)
+            if m:
+                return (i, m.start())
+        return None
+
+
 class ScrollState:
     """cgdb's scroll mode: delta rows back from the bottom plus a *visible*
     cursor (scroller.cpp:186-289).

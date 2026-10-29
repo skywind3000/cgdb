@@ -94,18 +94,23 @@ python -m pytest tests/ -q                                                      
 ┌──────────▼──────────────────────────┐   ┌───────────▼──────────┐
 │ gdb --nw -q                         │   │ inferior terminal    │
 │   -ex "set pagination off"          │   │  Win: new-console 弹窗│
-│   -ex "set confirm off"             │   │  POSIX: pty          │
-│   --interpreter=mi                  │   │                      │
-│   <用户参数>                         │   │  ← 被调试程序的 I/O  │
-└──────────┬──────────────────────────┘   │    （Win: 不经过本   │
-           │ -gdb-set new-console on (Win) │    进程，见 §3.3）   │
-           │ -inferior-tty-set <pty> (POSIX)└──────────────────────┘
-           └──────────────────────────────────────┘
+│   -ex "set confirm off"             │   │  POSIX: pty + VT     │
+│   --interpreter=mi                  │   │   （pyte，§21）      │
+│   <用户参数>                         │   │                      │
+└──────────┬──────────────────────────┘   │  ← 被调试程序的 I/O  │
+           │ -gdb-set new-console on (Win) │  POSIX: 输出渲染进   │
+           │ -inferior-tty-set <pty> (POSIX)│  GDB 窗、键入透传   │
+           └────────────────────────────────└────────────────────┘
 ```
 
 **单通道 MI**，不是 C 版 Linux 的 `new-ui mi` 双通道 —— 那个在原生 Windows GDB
 上不可用（`doc/porting-feasibility.md` §3.2 有实测证据）。用户敲的 gdb 命令一律走
 `-interpreter-exec console "..."`，回复以 MI 记录形式回来再路由。
+
+传输层与 C 版 Linux 的这一差异**不影响 inferior 终端的对齐**（§21）：实测
+（gdb 15.1，Ubuntu）gdb 会把 inferior 设为 `-inferior-tty-set` 那个 pty 的前台
+进程组，所以 VINTR 字节、行规范回显、TIOCSWINSZ→SIGWINCH 全部与 C 版共享
+console pty 时的行为一致。
 
 ### 2.2 线程模型 ⚠️ 最重要的不变量
 
@@ -146,6 +151,7 @@ ConPTY → ptk Win32Input(VT 模式) → Vt100Parser → KeyPress
  → dispatch（app.py:386）→ 按焦点分发
      ├─ FOCUS_SOURCE  → source_key（app.py:437）
      ├─ FOCUS_GDB     → gdb_key（app.py:548）；普通编辑归 ptk Buffer
+     │                  inferior 运行时改为逐字节透传（§21）
      └─ FOCUS_COMMAND → cmd_buffer 的 accept_handler
 ```
 
@@ -157,11 +163,15 @@ ConPTY → ptk Win32Input(VT 模式) → Vt100Parser → KeyPress
  → invalidate() → 下一帧 _console_text（app.py:864）
 ```
 
-**C. inferior 输出**
+**C. inferior 输出（POSIX）**
 ```
-inferior 读线程 → _on_inferior_output（app.py:963）→ ConsoleModel.add_bytes
+inferior 读线程 → _on_inferior_output → vt.feed（vt.py，§21）
+ → pyte 屏幕 → 渲染时 _console_text 的 VT 分支（彩色 fragments）
+停止时：on_console 首条 ~ 或 *stopped → request_flush（pty 排空）
+ → _vt_drained → flatten 进行模型 → VT 复位
 ```
-注意：inferior 输出**不经 gdb**，直接从我们给 gdb 的那个 tty 设备读回来。
+注意：inferior 输出**不经 gdb**，直接从我们给 gdb 的那个 tty 设备读回来；
+`*stopped` 之后才把 VT 的内容落入行模型（两通道顺序见 §21 的陷阱 1）。
 
 **D. 停止事件**
 ```
@@ -263,17 +273,18 @@ C 版对应物：`lib/tgdb/tgdb.cpp` 的传输与命令队列部分。
 6. **`stop()` 之后 `_pump_loop` 要把残留请求全部置错并 `done.set()`**，
    否则等待方永久挂起。
 
-### 3.3 `cgdbpy/inferior_tty.py`（160 行）—— 被调试程序的终端
+### 3.3 `cgdbpy/inferior_tty.py` + `cgdbpy/vt.py` —— 被调试程序的终端
 
 C 版对应物：`lib/tgdb/tgdb.cpp` win 分支的 `TGDB_REQUEST_TTY` /
-`lib/util/pseudo.cpp`。
+`lib/util/pseudo.cpp`；POSIX 侧的渲染对应物是 `cgdb/vterminal.cpp` + libvterm
+（由 `vt.py` 承担，见 §21）。
 
 | 类 | 平台 | 机制 |
 |---|---|---|
-| `InferiorTty` | 抽象基类 | `start()` / `mi_command()` / `verify_command()` / `verify_ok()` / `write()` |
-| `PtyInferiorTty` | POSIX | `pty.openpty()`，`-inferior-tty-set <slave 名>`（**不加引号**） |
+| `InferiorTty` | 抽象基类 | `start()` / `mi_command()` / `verify_command()` / `verify_ok()` / `write()` / `request_flush()`；`embedded` 标志标记 inferior 终端是否在 cgdb 屏幕内（app 层用它分支，不出现 `sys.platform`） |
+| `PtyInferiorTty` | POSIX | `pty.openpty()`，`-inferior-tty-set <slave 名>`（**不加引号**）；select 读循环 + `request_flush()` 排空协议（`on_drain` 回调） |
 | `NewConsoleTty` | Windows | `-gdb-set new-console on`，inferior 弹独立控制台窗口 |
-| `create(on_output)` | 平台分发 | — |
+| `create(on_output, on_drain)` | 平台分发 | — |
 
 **不变量**
 
@@ -933,12 +944,16 @@ C 版 `sources.cpp` 管理多个 buffer 并可切换。本版 `self.src` 是单�
   历史搜索**（ptk 需要 SearchBufferControl 布局接入）、
   **gdb `set prompt` 不跟随**（`(gdb) ` 硬编码）。
 
-### 8.8b inferior 全屏程序
+### 8.8b inferior 全屏程序 —— ✅ 已实现（POSIX，2026-10-29，§21）
 
-需要终端模拟器（`pyte`）+ ConPTY，等于把 C 版故意绕开的 `libvterm` 请回来。
-**建议不做**，与 C 版 Windows 移植保持同样的限制（`win_specs.md` §11.7）。
-inferior 的输出按哑终端模型摄入（CSI/OSC 转义序列会被消费掉，颜色不渲染
-但不会显示 `[31m` 残渣；宽字符按 2 列折行）。
+~本节原来的结论是「建议不做」：当时 Windows 侧刚转向 new-console 弹窗，
+`pyte` + ConPTY 看起来是把 C 版故意绕开的 `libvterm` 请回来。~ §21 的对齐
+工作推翻了这个判断的适用范围：**POSIX 侧**inferior 的终端已升级为内嵌
+`pyte` 终端（`cgdbpy/vt.py`），全屏程序、颜色、清屏、绝对定位、alt screen
+全部在 GDB 窗内可用——这正是 C 版 Linux（0.8.0 的 vterm scroller）的行为。
+Windows 侧维持 new-console 弹窗不变（弹窗本身就是真终端，无需模拟器）；
+仅当 pyte 缺失时 POSIX 侧退回哑终端摄入（CSI/OSC 消费掉、颜色不渲染但
+无 `[31m` 残渣）。
 
 ### 8.9 `:map` 在 GDB 窗生效（imap）
 
@@ -1420,15 +1435,17 @@ vim 按键映射、`:set` 配置。
    接进本实现的三线程模型（§2.2）还得自己包一层。
 3. 自写可以做到完全 token 化 + 与 `tgdb.cpp` 的命令队列语义一一对应。
 
-### 15.5 为什么不需要终端模拟器
+### 15.5 为什么（gdb 控制台）不需要终端模拟器
 
 C 版带 `lib/vterm`（6,504 行）是因为 gdb 的 readline 会往 console pty 里写
 光标移动/清行转义序列。**MI 模式下 gdb 根本没有 readline 在跑**，
 输出是纯文本 —— 这正是 C 版 Windows 移植能用「哑终端行模型」替代 vterm 的原因
-（`win_specs.md` §8.1）。Python 版继承同一结论，`libvterm` 整块消失。
+（`win_specs.md` §8.1）。Python 版继承同一结论，gdb 控制台通道继续走哑终端
+行模型，`libvterm` 在这条路上整块消失。
 
-例外：inferior 自己的全屏输出。要支持就得请回终端模拟器（`pyte`）+ ConPTY，
-见 §8.8，**建议不做**。
+例外：inferior 自己的输出——它在 POSIX 侧**已经**请回了终端模拟器
+（`pyte`），但只挂在 inferior pty 这一条通道上（§21），gdb 控制台通道
+不经过它，§15.5 的结论对那条通道仍然成立。
 
 ## 16. TUI 选型：prompt_toolkit vs Textual
 
@@ -1637,6 +1654,110 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
   inferior 输出上屏的用例改为「输出不泄漏 + 会话恢复响应」。
 - 代价：inferior 输出不再显示在 cgdb 屏幕（在弹窗里）；退出即关窗，
   临终输出看不到（VS 同款行为）。换来：scanf/全屏/CJK 输入全部原生可用。
+
+---
+
+## 21. 决策修订：POSIX inferior 终端对齐 C 版（内嵌真终端，2026-10-29）
+
+- 状态：已实施（本节即实施记录）；§8.8b 的「建议不做」结论随之改判。
+- 背景：§20 让 Windows 侧 inferior「离开 cgdb 屏幕」（new-console 弹窗，
+  Windows 调试器惯例）。POSIX 侧的对齐方向相反——Linux 的 C 版
+  （0.8.0 = master 架构）里 inferior 的终端**就在 cgdb 屏幕内**：gdb 经
+  `pty_fork` 跑在 console pty 上（`new-ui mi` 走第二个 pty），inferior 直接
+  继承 gdb 的控制终端（实测 fd0/1/2 同一个 `/dev/pts/N`），GDB 窗本身就是
+  libvterm 终端模拟器。此前的 Python 版只有「哑终端行模型 + 整行 Enter
+  转发」，颜色被剥、全屏程序不可用、resize 链断。
+- 决策：**传输层不动**（继续 MI-over-pipes，两平台同形态），把 POSIX 侧
+  inferior pty 的渲染升级为内嵌终端模拟器（`pyte`，即 libvterm 的 Python
+  对应物，`cgdbpy/vt.py`），键入改逐字节透传，回显交还 pty 行规范，
+  resize 链修通。Windows 侧零改动——平台差异收敛在 `InferiorTty.embedded`
+  标志，`app.py` 不出现 `sys.platform` 分支（沿 §20 的模式）。
+- 可行性实测（WSL2 Ubuntu-24.04，gdb 15.1；探针脚本在 `.tmp/wsprobe/`）：
+  - gdb 会把 inferior 设为 `-inferior-tty-set` 那个 pty 的**前台进程组**
+    （TIOCGPGRP == inferior pid）→ 写 `0x03`（VINTR）进 master 即给
+    inferior 送 SIGINT → `*stopped`。C 版的字节中断路径在 MI 管道架构下
+    原样成立；
+  - slave 行规范是满 cooked（ECHO/ICANON/ISIG/ICRNL）：键入由行规范回显
+    （单份），`\r` 自动转 `\n`——**app 层的手工回显必须删除**，否则双回显
+    （旧代码的「master 无回显」注释只对退役的 Windows 管道路线成立）；
+  - `/usr/bin/cgdb` 0.8.0 的行为基线：`\033[2J` 真清 GDB 窗、
+    `\033[3;10H` 按 pane 原点精确映射、回显 `TYPE>hello` 单份、
+    resize → inferior SIGWINCH、^C 全链生效。
+- pyte 能力面（逐项实测后选定，0.8.2）：SGR 16/256/true-color、
+  bold/reverse/underscore、清屏/绝对定位、DECSTBM、DECAWM、宽字符占位格、
+  `HistoryScreen` 滚动缓冲全部可用；唯二缺口：
+  - **alt screen（`?1049`）被忽略** → `vt.py` 的 `_AltScreen` 子类补
+    （注意 pyte 的分发名是 `set_mode`/`reset_mode` + `kwargs["private"]`，
+    模式码还左移 5 位，须在移位前拦截原始值；进出 alt 还要保存/恢复
+    `history.top`，否则 alt 里滚出的行会污染主历史）；
+  - DA/DSR 查询回复（`write_process_input` 钩子）默认 noop——**C 版同样
+    没接 libvterm 的输出回调**（全树无 `vterm_output_set_callback`），
+    不回复即对齐；日后想接是 vt.py 里的一行覆写。
+- 行为对齐矩阵（对齐后 vs C 版 Linux）：
+
+  | 维度 | C 版 | Python 版 | 状态 |
+  |---|---|---|---|
+  | inferior 输出渲染 | libvterm 全保真 | pyte + 1049 子类 | ✅ |
+  | 键入/回显/ICRNL | pty 行规范 | 同 | ✅ |
+  | resize → SIGWINCH | TIOCSWINSZ | 同（修复了 relayout 无触发方的 bug） | ✅ |
+  | ^C | VINTR 字节进 pty | SIGINT→gdb | ✅ 等价（实测都报 "Program received signal SIGINT"） |
+  | inferior 停止后历史 | vterm scrollback 保色 | flatten 进行模型**丢色** | ⚠️ 已知差距（v2：行模型加属性段） |
+  | DSR/DA 回复 | 不回写 | 不回写 | ✅ 严格对齐 |
+  | ESC 到不了 inferior | 切窗键拦截（固有） | 同 | ✅ 同款限制 |
+  | gdb 提示符下行编辑 | gdb readline | ptk Buffer | 既有有意差异（§3.9/§16.1） |
+
+- 实现（逐条）：
+  - `cgdbpy/vt.py`（新，~250 行）：`InferiorScreen`（pyte 封装 + 行/片段/
+    flatten 接口）+ `_AltScreen`（1049/1047/47 补丁）；
+  - `inferior_tty.py`：`embedded` 标志；读循环改 `select`（50ms 超时）；
+    `request_flush()`/`on_drain` 排空协议（见陷阱 1）；
+  - `app.py`：`_on_inferior_output` → `vt.feed`（不再直通行模型）；
+    `_console_text` 的 VT 分支（彩色 fragments、`[delta/max]` 状态条、
+    VT 光标）；编辑行包进 `ConditionalContainer`（VT 态隐藏，光标画在
+    VT 上——焦点经 `_focus_needs_sync` 标志在渲染帧主线程切换）；
+    `gdb_key` 运行态透传用 `keys_to_bytes()`（`_send_key_to_inferior`
+    的手工回显删除）；`_buffer_owns_keys` 加 `not running_inferior`
+    （否则透传永远到不了——旧代码的字节路径正是被 Buffer 挡死成死代码）；
+    ^D 空行退出绑定加运行态条件；`send_console_command` 删整行转发分支
+    （改 MI 排队，同 C 的语义）；SIGWINCH handler + `_sync_pane_geometry`
+    惰性同步（每帧对比尺寸：console 折行、VT resize、TIOCSWINSZ，
+    即 `tgdb_resize_console` 的等价物）；
+  - 滚动模式/搜索经 `RowListView`（console.py）对两种行源复用
+    ConsoleModel 的接口语义。
+- 陷阱（每条有回归测试）：
+  1. **两通道顺序**：gdb 的停止报告 ~ 记录在 MI 流里排在 `*stopped`
+     **之前**——只挂 `*stopped` 的闸门来不及。方案：`*running` 期间的
+     第一条 `on_console`（此刻 inferior 必已停）先 `request_flush`
+     排空 pty + flatten，再放报告进 console；`*stopped` 上再兜底一次
+     （幂等）。集成/E2E 断言 inferior 内容在报告**上方**。
+  2. **双回显**：行规范回显实测存在（ECHO=1），手工回显必须删。
+  3. **pyte 的 LF 语义**：裸 `\n` 只换行不回列（VT102 正确行为）；pty 的
+     ONLCR 已把 inferior 的 `\n` 变 `\r\n`，但**直接喂 pyte 的单元测试必须
+     用 `\r\n`**（能力验证阶段在这里浪费过一小时）。
+  4. **僵尸误报**：pty harness 用 `os.kill(pid,0)` 判存活对 zombie 也成功
+     ——「:q 后不退出」曾是一整轮误判，真解是 `waitpid` 收尸
+     （posix_harness 的 `exited()`）。
+  5. **resize 无触发方**：`relayout()` 只有启动/Ctrl-L 两个调用方，
+     tty.resize 形同虚设（实测 WINCH: False 抓到）——必须挂 SIGWINCH +
+     渲染期惰性同步。
+  6. **VT 尺寸的 +1**：VT 态吃掉编辑行，pty 行数要跟着 +1，否则全屏
+     程序底部一行被裁。
+- 验收标准与测试：
+  - 单元 `test_vt.py`（21 项，跨平台）：颜色/清屏/定位/alt/宽字符/折行/
+    滚动区域/flatten 幂等/LF 语义；
+  - 集成（POSIX，真 gdb，5 项）：颜色渲染+清屏+定位、字节到达+单回显、
+    VINTR 停止、request_flush 机制、resize→SIGWINCH；
+  - E2E `tests/e2e/test_e2e_posix.py`（posix_harness.py = pyte 屏幕级
+    pty 驱动器）：**验收标准 = /usr/bin/cgdb 0.8.0 探针的断言在 Python 版
+    全部成立**（SCREEN-MODE 唯一且定位、START 清除、TYPE>hello 单份、
+    WINCH-SEEN、SIGINT、flatten 顺序、:q 干净退出 exit 0）；
+  - 探针 inferior 源码入库共享：`tests/data/terminal_probe.c`。
+  - 双平台全量：Windows 863 过 / WSL 819 过（各自只 skip 对方平台专属）。
+  - 顺带把两个「只在 Windows 跑过」的既有测试修成跨平台诚实语义：
+    `test_rc_home_dir_resolution_order`（USERPROFILE/APPDATA 链是
+    `os.name=="nt"` 分支）与 `test_inferior_tty_must_not_be_quoted` 的
+    泄漏断言（实测于 gdb 17.1 mingw；Linux 15.1 的引号形式是「静默失败
+    且不泄漏」，仍不可用）。
 
 ---
 

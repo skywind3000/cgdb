@@ -171,6 +171,12 @@ def test_rc_home_dir_resolution_order(monkeypatch, tmp_path):
     monkeypatch.setenv("CGDB_DIR", str(tmp_path / "custom"))
     assert cgdb._cgdb_home_dir() == str(tmp_path / "custom")
     monkeypatch.delenv("CGDB_DIR")
+    if sys.platform != "win32":
+        # the USERPROFILE/APPDATA fallbacks live in the os.name == "nt"
+        # branch of _cgdb_home_dir; on POSIX HOME alone decides
+        monkeypatch.setenv("HOME", str(tmp_path / "HOME"))
+        assert cgdb._cgdb_home_dir() == str(tmp_path / "HOME" / ".cgdb")
+        return
     for var in ("HOME", "USERPROFILE", "APPDATA"):
         monkeypatch.setenv(var, str(tmp_path / var))
     assert cgdb._cgdb_home_dir() == str(tmp_path / "HOME" / ".cgdb")

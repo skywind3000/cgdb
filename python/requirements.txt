@@ -7,3 +7,6 @@
 # external program (pass -d <path-to-gdb.exe> if it is not on PATH).
 prompt_toolkit>=3.0.29,<3.1   # UI: layout, keys, line editing (tested 3.0.52)
 pygments>=2.13                # source highlighting (tested 2.20.0)
+pyte>=0.8.2                   # inferior terminal emulator, POSIX pty route
+                              # (tested 0.8.2; unused on Windows, where the
+                              # inferior runs in a new-console popup)

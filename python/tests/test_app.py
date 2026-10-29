@@ -108,11 +108,16 @@ class FakeGdb:
 
 
 class FakeTty:
-    def __init__(self, on_output):
+    def __init__(self, on_output, on_drain=None):
         self.on_output = on_output
+        self.on_drain = on_drain
         self.written = []
         self.started = False
         self.closed = False
+        self.resized = []
+        # the Windows popup shape: the inferior's terminal is not inside
+        # cgdb's screen (PtyInferiorTty is the embedded=True case)
+        self.embedded = False
 
     def start(self):
         self.started = True
@@ -131,6 +136,13 @@ class FakeTty:
     def write(self, data):
         self.written.append(data)
         return True
+
+    def request_flush(self, timeout=0.5):
+        # no reader thread in the fake: the caller flattens directly
+        return True
+
+    def resize(self, rows, cols):
+        self.resized.append((rows, cols))
 
     def close(self):
         self.closed = True
@@ -217,8 +229,8 @@ def bare_app(srcfile):
         fake["gdb"] = FakeGdb(callbacks)
         return fake["gdb"]
 
-    def tty_factory(on_output):
-        fake["tty"] = FakeTty(on_output)
+    def tty_factory(on_output, on_drain=None):
+        fake["tty"] = FakeTty(on_output, on_drain)
         return fake["tty"]
 
     a = CgdbApp(config=Config(), source_path=srcfile,
@@ -1701,8 +1713,11 @@ def test_command_line_occupies_the_status_row(app):
     app.set_focus(FOCUS_COMMAND)
     assert cmd_cc.filter() and not status_cc.filter()
     assert app.app.layout.current_control is app.cmdline_control
-    # the gdb edit line never moves
-    assert kids[-1] is app.edit_window
+    # the gdb edit line never moves; while the inferior runs it is the
+    # ConditionalContainer that hides (edit_line), whose content stays
+    # put -- the edit window itself is never re-parented
+    assert kids[-1] is app.edit_line
+    assert kids[-1].content is app.edit_window
 
 
 # ---------------------------------------------------------------------------
@@ -1767,7 +1782,9 @@ def test_ctrl_w_toggles_orientation(app):
     assert left == [app.source_window, app.status_window,
                     app.cmdline_window]
     assert kids[1] is app.vsep_window
-    assert list(kids[2].children) == [app.console_window, app.edit_window]
+    # the gdb column: console above the edit line (hidden as a whole
+    # while the inferior's terminal owns the pane -- edit_line)
+    assert list(kids[2].children) == [app.console_window, app.edit_line]
 
     app.dispatch(kc.CTRL_W)
     assert app.split_orientation == WSO_HORIZONTAL
@@ -1960,16 +1977,103 @@ def test_edit_and_asr_reload_only_when_the_file_changed(app, tmp_path):
 
 
 def test_inferior_input_is_passed_through_raw(app):
-    # while the inferior runs, keys go to its tty byte-wise and are
-    # echoed without a (gdb) prompt (tgdb_send_char semantics)
+    # while the inferior runs, keys go to its tty byte-wise, exactly as C
+    # writes each key into the console pty (gdb_input -> result=1 ->
+    # tgdb_send_char): CR stays CR (the pty's ICRNL makes \n of it for the
+    # inferior), special keys travel as their terminal sequences
+    # (kui_term_get_ascii_char_sequence_from_key == KEY_TO_SEQUENCE)
     tty = app._fake["tty"]
     app.running_inferior = True
     app.focus = FOCUS_GDB
+    n_lines = len(app.console.lines)
     app.gdb_key(ord("x"))
     app.gdb_key(kc.CTRL_M)
-    assert tty.written == ["x", "\n"]
-    assert "(gdb) x" not in "".join(app.console.lines)
-    assert "x" in "".join(app.console.lines) + "".join(app.console.cur)
+    app.gdb_key(kc.UP)
+    app.gdb_key(kc.CTRL_C)
+    app.gdb_key(kc.F5)
+    assert tty.written == [b"x", b"\r", b"\x1b[A", b"\x03", b"\x1b[15~"]
+    # the echo comes back from the pty's line discipline (ECHO), never
+    # from here: echoing by hand would double it
+    assert len(app.console.lines) == n_lines
+    assert "".join(app.console.cur) == ""
+
+
+def test_inferior_vt_takes_over_the_gdb_pane(app):
+    # while the inferior runs, the GDB window IS its terminal: colours
+    # render, and the edit line is hidden (C: the whole pane is one vterm)
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.running_inferior = True
+    app.vt.feed(b"\x1b[31mRED\x1b[0m\r\nplain\r\n")
+    frags = app._console_text()
+    text = "".join(t for _, t in frags)
+    assert "RED" in text and "plain" in text
+    assert any("fg:ansired" in style for style, _ in frags)
+    assert not app.edit_line.filter()
+    app.running_inferior = False
+    assert app.edit_line.filter()
+
+
+def test_inferior_vt_clear_and_position_render(app):
+    # \033[2J clears the pane and \033[3;10H positions absolutely -- the
+    # behaviours the dumb line model could not do (the probe against
+    # /usr/bin/cgdb 0.8.0 showed exactly these)
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.running_inferior = True
+    app.vt.feed(b"START\r\n")
+    app.vt.feed(b"\x1b[2J\x1b[H\x1b[3;10HPOS\r\n")
+    text = "".join(t for _, t in app._console_text())
+    assert "START" not in text
+    rows = [t for _, t in app._console_text()]
+    # row 2 (0-based) col 9: the escape's 1-based row 3 col 10
+    lines = text.split("\n")
+    assert lines[2][9] == "P"
+
+
+def test_inferior_vt_flattens_into_the_console_on_stop(app):
+    # *stopped drains the pty and commits the VT's content to the console
+    # history before gdb's stop report is appended (visual order == C)
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.vt.feed(b"OUT-1\r\nOUT-2\r\n")
+    app._on_stopped({})
+    assert app.running_inferior is False
+    assert "OUT-1" in "".join(app.console.lines)
+    assert "OUT-2" in "".join(app.console.lines)
+    assert app.vt.extract_lines() == []     # flattened: VT is empty again
+    # the flatten is idempotent: a second stop changes nothing
+    app._on_stopped({})
+    assert "".join(app.console.lines).count("OUT-1") == 1
+
+
+def test_on_running_resets_the_vt(app):
+    # a fresh run gets a fresh screen (the last run's content already
+    # lives in the console history, so the continuity matches C's vterm)
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.vt.feed(b"OLD\r\n")
+    app._fake["gdb"].callbacks["on_running"]({})
+    assert app.running_inferior is True
+    assert app.vt.extract_lines() == []
+    assert app._focus_needs_sync is True
+
+
+def test_sync_pane_geometry_pushes_sizes(app):
+    # the pty and the VT both track the GDB pane's size (tgdb_resize_
+    # console hands the same numbers to the pty in C)
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.tty.embedded = True                # the pty shape, not the popup
+    app._tty_size = None
+    app._console_text()
+    rows, cols = app._gdb_pane_rows(), app._gdb_width()
+    assert app.vt.size == (rows, cols)
+    assert app.tty.resized[-1] == (rows, cols)
+    # and no redundant ioctl when nothing changed
+    n = len(app.tty.resized)
+    app._console_text()
+    assert len(app.tty.resized) == n
 
 
 def test_relative_breakpoint_file_still_matches(app, srcfile, monkeypatch):

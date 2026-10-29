@@ -23,6 +23,11 @@ import time
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if sys.platform != "win32":
+    # conpty.py touches ctypes.windll at import time; skip before that
+    # so a full `pytest tests/` collects cleanly on POSIX too
+    pytest.skip("ConPTY end-to-end tests are Windows only",
+                allow_module_level=True)
 from conpty import KEYS, ConPtySession          # noqa: E402
 
 pytestmark = pytest.mark.skipif(

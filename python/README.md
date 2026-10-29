@@ -10,7 +10,7 @@
 ## 运行
 
 ```bash
-# 依赖（本机已装）：prompt_toolkit + pygments
+# 依赖（本机已装）：prompt_toolkit + pygments + pyte
 pip install -r python/requirements.txt
 
 # 最简用法：和原版一样，直接跟要调试的程序（不需要 --）
@@ -76,6 +76,13 @@ python python/cgdb.py --source src/main.c -- -q prog.exe
 GDB 窗内是普通的行编辑：方向键翻历史、`Ctrl-A/E/U/K/W` 等 readline 键位都由
 prompt_toolkit 的 Buffer 提供，不需要自己实现。
 
+**inferior 运行期间**（POSIX）GDB 窗临时变成被调试程序的终端屏幕：颜色/
+清屏/全屏程序原样渲染，此时按键不再进编辑行，而是逐字节透传给被调试程序
+（特殊键按转义序列发，回车是 `\r`，由 pty 的行规范转 `\n`）；`ESC` 仍然
+是切窗键（与 C 版一致，inferior 里的程序收不到它）；`PageUp` 仍进入滚动
+模式翻它的屏幕历史。Windows 上被调试程序在自己的弹窗里跑，这期间 cgdb 侧
+按键丢弃（C 版 Windows 移植同款行为）。
+
 ### `:` 命令
 
 命令集对齐 C 版的 `commands[]` 表（`cgdb/cgdbrc.cpp:98-141`）和 NUMBER 语法
@@ -117,6 +124,7 @@ python/
     mi.py                  GDB/MI 记录解析（对应 gdbwire.c 的 8193 行）
     gdbclient.py           gdb 子进程 + token 化请求/响应 + 回调分发
     inferior_tty.py        inferior 的终端：Windows new-console 弹窗 / POSIX pty
+    vt.py                  POSIX 内嵌终端模拟器（pyte，对应 vterminal.cpp + libvterm）
     kui.py                 vim 式按键映射引擎（对应 lib/kui）
     keycodes.py            键值常量与 <...> 记法表（对应 kui_term.cpp）
     console.py             GDB 窗行模型（对应 scroller_win.cpp）
@@ -126,7 +134,7 @@ python/
     cgdbrc.py              :set 配置项（对应 cgdbrc.cpp）
     app.py                 prompt_toolkit 界面与事件循环
   tests/                   pytest 套件
-  tests/e2e/               ConPTY 端到端测试
+  tests/e2e/               端到端测试（Windows ConPTY / POSIX pty）
 ```
 
 数据流和 C 版一致（`doc/reference.md` §1.4），但传输层用的是 Windows 移植版
@@ -143,9 +151,12 @@ app.py（prompt_toolkit 渲染）
 
 inferior 的终端要单独给，否则它的 stdout 会灌进 MI 管道把记录流打乱
 （`win_specs.md` §4 E2a，C 版 M0 实测）。POSIX 交给 gdb 一个 pty
-（`-inferior-tty-set`）；Windows 走 gdb 的 `new-console on`——被调试程序
-弹出自己的控制台窗口（Visual Studio 的惯例），scanf/ANSI/Ctrl-C 由 conhost
-原生处理，cgdb 不参与其 I/O。
+（`-inferior-tty-set`），其输出由内嵌的 pyte 终端模拟器渲染进 GDB 窗
+（`vt.py`，即 C 版 vterm scroller 的对应物：颜色、清屏、全屏程序都在
+cgdb 屏幕内，键入逐字节透传、回显由 pty 行规范做，见 `python_specs.md`
+§21）；Windows 走 gdb 的 `new-console on`——被调试程序弹出自己的控制台
+窗口（Visual Studio 的惯例），scanf/ANSI/Ctrl-C 由 conhost 原生处理，
+cgdb 不参与其 I/O。
 
 ## 改代码前必知的几个坑
 
@@ -222,6 +233,15 @@ inferior 的终端要单独给，否则它的 stdout 会灌进 MI 管道把记�
     （`ReadConsoleOutputW`），VT 抓包会被 ConPTY 再序列化骗过。
     测试：`test_app.py::test_console_output_reports_the_true_width`。
 
+13. **POSIX 侧 inferior 的回显来自 pty 行规范，app 层不能再手工回显。**
+    `-inferior-tty-set` 的 pty 是满 cooked（ECHO/ICANON/ISIG/ICRNL，
+    gdb 15.1 实测），键入写进 master 会被行规范回显回来；旧代码按
+    「master 无回显」（Windows 管道时代的结论）手工回显会**双份**。
+    同源的坑：直接喂 pyte 的测试必须用 `\r\n`——裸 `\n` 只换行不回列
+    （VT102 正确行为），pty 的 ONLCR 平时把这层差异藏住了。
+    测试：`test_gdb_integration.py::test_typed_keys_reach_the_inferior_
+    with_one_echo`、`test_vt.py::test_lone_lf_keeps_the_column`。
+
 ## 测试
 
 ```bash
@@ -245,11 +265,13 @@ python -m pytest tests/e2e -q
 | `test_kui.py` | 按键映射引擎，**移植自 `testsuite/kui.base/basic.exp` 的 198 项**，并与真实 C `kui_driver` 的黄金输出逐用例交叉验证 | ~360 |
 | `test_mi.py` | MI 记录解析：文法、C 转义（含八进制 `\033`）、嵌套、畸形输入降级、分块边界 | ~70 |
 | `test_console.py` | GDB 窗行模型的字节语义，逐条对应 `win_specs.md` §8.1 | ~55 |
+| `test_vt.py` | inferior 内嵌终端：颜色/清屏/定位/alt screen/宽字符/折行/flatten（跨平台，POSIX 集成与 e2e 见下） | ~20 |
 | `test_source.py` | 源码加载/编码、高亮缓存正确性、窗口 lex 反证、断点表 | ~45 |
 | `test_cgdbrc.py` | `:set` 选项，**与 `cgdb/cgdbrc.cpp` 的选项表交叉比对** | ~55 |
 | `test_app.py` | UI 层：焦点、导航、断点、功能键、命令行、渲染，用假 gdb | ~80 |
-| `test_gdb_integration.py` | **真实 gdb**：启动、token 配对、断点/运行/单步/求值、inferior tty、退出清理 | ~25 |
-| `e2e/test_e2e.py` | **真实 cgdb.py + 真实 gdb 跑在真实 ConPTY 里**，VT 屏幕解析断言 | ~22 |
+| `test_gdb_integration.py` | **真实 gdb**：启动、token 配对、断点/运行/单步/求值、inferior tty（POSIX 侧含 VT 渲染/字节透传/VINTR/resize） | ~30 |
+| `e2e/test_e2e.py` | **真实 cgdb.py + 真实 gdb 跑在真实 ConPTY 里**，VT 屏幕解析断言（Windows） | ~22 |
+| `e2e/test_e2e_posix.py` | 同上但跑在真实 pty 里：**验收标准 = /usr/bin/cgdb 0.8.0 探针的断言**（渲染/回显/resize/^C/flatten 顺序/退出） | 2 |
 
 ### kui 的黄金参考
 
@@ -293,8 +315,8 @@ CGDBPY_MILOG=E:\path\mi.txt      # 每一行收发到的 MI 记录（带时间�
 | 行编辑 | gdb 自己的 readline | 手写（无 Tab 补全、无 Ctrl-R） | prompt_toolkit 原生（历史、词操作、kill ring） |
 | 语法高亮 | 8 个 flex 词法器 | 同左 | Pygments（语言覆盖广得多） |
 | 按键映射 | lib/kui | 同左 | `cgdbpy/kui.py`，198 项行为对齐 |
-| inferior 终端 | pty（内嵌） | new-console 弹窗（VS 惯例） | new-console 弹窗（VS 惯例） |
-| inferior 全屏程序 | 支持（pty） | 支持（弹窗是真终端） | 支持（弹窗是真终端） |
+| inferior 终端 | pty（内嵌 vterm） | new-console 弹窗（VS 惯例） | POSIX：pty 内嵌 pyte 终端 / Windows：new-console 弹窗 |
+| inferior 全屏程序 | 支持（pty） | 支持（弹窗是真终端） | 支持（POSIX 内嵌渲染 / Windows 弹窗） |
 | 启动 | ~8.5 ms | ~8.5 ms | ~260 ms |
 | 分发 | 单文件 | 6.6 MB 全静态单文件 | 需要解释器或打包 |
 
@@ -317,9 +339,12 @@ vim 键位、`/` 搜索）、**启动时自动打开调试对象的主源文件*
    C 版是 8.5ms。消不掉，只能权衡。
 2. **ESC 有约 100ms 延迟**，这是 VT 输入模式下区分 lone ESC 和转义序列的
    固有代价，C 版的 `ttimeoutlen` 默认值也是 100ms。
-3. **inferior 的输出显示在弹窗里，不进 cgdb 屏幕**。Windows 上被调试程序
+3. **Windows 上 inferior 的输出显示在弹窗里，不进 cgdb 屏幕**。被调试程序
    在自己的控制台窗口里跑（VS 惯例），scanf/全屏交互都发生在那个窗口；
-   cgdb 里能看到的只有 gdb 自己的报告。这是有意取舍，POSIX 侧仍是内嵌 pty。
+   cgdb 里能看到的只有 gdb 自己的报告。POSIX 侧相反：inferior 的终端
+   内嵌在 GDB 窗里（颜色/全屏/键入都可用，对齐 C 版 Linux），程序停止后
+   其屏幕内容落入 GDB 窗历史（颜色丢弃，属已知差距，见 `python_specs.md`
+   §21）。
 4. **GDB 窗没有 Tab 补全**。可以用
    `-interpreter-exec console "complete ..."` 实现，prompt_toolkit 的
    `Completer` 接口天生适配 —— 这是 Python 版可以超过 C 版 Windows 移植的地方，

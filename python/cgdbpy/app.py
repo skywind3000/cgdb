@@ -44,6 +44,7 @@ doc/python_specs.md (§3.9 and §16.1):
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -67,12 +68,21 @@ from . import keycodes as kc
 from . import kui
 from . import mi
 from .cgdbrc import (Config, ConfigError, WSO_HORIZONTAL, WSO_VERTICAL)
-from .console import ConsoleModel, ScrollState
+from .console import ConsoleModel, RowListView, ScrollState
 from .filedlg import LABEL, FileDialog
 from .gdbclient import GdbClient, GdbError
 from .highlight import build_style, style_for_token
 from .inferior_tty import create as create_inferior_tty
 from .source import Breakpoints, SourceFile, SourceView
+
+try:
+    from .vt import InferiorScreen
+except ImportError:
+    # pyte is only needed for the embedded inferior terminal (POSIX); a
+    # Windows install without it keeps working -- the inferior's output
+    # falls back to the dumb line model, which never happens on Windows
+    # anyway because there the terminal is a new-console popup.
+    InferiorScreen = None
 
 FOCUS_SOURCE = "source"
 FOCUS_GDB = "gdb"
@@ -270,6 +280,19 @@ class CgdbApp:
 
         # --- gdb ----------------------------------------------------------
         self.tty = None
+        # the inferior's virtual terminal (POSIX pty only; None on Windows
+        # or when pyte is unavailable -- see _vt_active)
+        self.vt = None
+        # the size last pushed into the inferior's pty (TIOCSWINSZ), so
+        # _sync_pane_geometry can skip redundant ioctls
+        self._tty_size = None
+        # set by the SIGWINCH handler, consumed by _sync_pane_geometry on
+        # the next frame (C: the signal handler calls if_layout directly)
+        self._winch_pending = False
+        # set when running_inferior flipped off a thread that may not
+        # touch the ptk layout: the next frame retargets the GDB focus
+        # (edit line <-> VT pane), which only the main thread may do
+        self._focus_needs_sync = False
         self.gdb = None
         self.gdb_path = gdb_path
         self.gdb_args = list(gdb_args)
@@ -414,6 +437,12 @@ class CgdbApp:
                 input_processors=[BeforeInput(
                     lambda: [("class:console.prompt", GDB_PROMPT)])]),
             height=1, wrap_lines=False)
+        # while the inferior runs its terminal IS the GDB pane (C: the
+        # whole pane is one vterm), so the edit line steps aside; ptk's
+        # ConditionalContainer hides it without rebuilding the tree
+        self.edit_line = ConditionalContainer(
+            self.edit_window,
+            filter=Condition(lambda: not self._vt_active()))
         self.cmdline_window = Window(self.cmdline_control, height=1,
                                      wrap_lines=False, style="class:status")
         # the `o` dialog: full screen while open (if_draw's FILE_DLG branch)
@@ -472,13 +501,13 @@ class CgdbApp:
             # SWIN_SYM_VLINE column, drawn full height by separator_display
             # (interface.cpp:412-434). Window(char=) fills the whole pane.
             self.vsep_window = Window(width=D(min=1, max=1), char="|")
-            right = HSplit([self.console_window, self.edit_window])
+            right = HSplit([self.console_window, self.edit_line])
             self.root = VSplit([self.left_col, self.vsep_window, right])
         else:
             self.left_col = None
             self.vsep_window = None
             self.root = HSplit([self.source_window, status, cmdline,
-                                self.console_window, self.edit_window])
+                                self.console_window, self.edit_line])
         return self.root
 
     def _apply_ttimeoutlen(self):
@@ -572,9 +601,11 @@ class CgdbApp:
 
         # C-d on an empty GDB edit line: readline reads EOF and gdb exits,
         # taking cgdb with it (kui_term CTRL_D -> "\004" -> tgdb_send_char).
+        # While the inferior runs the byte belongs to it instead.
         @kb.add(Keys.ControlD,
                 filter=Condition(lambda: self.focus == FOCUS_GDB
                                  and not self.scroll.active
+                                 and not self.running_inferior
                                  and not self.gdb_buffer.text))
         def _ctrl_d_exit(event):
             self._run_async("-gdb-exit")
@@ -611,10 +642,17 @@ class CgdbApp:
         prompt_toolkit own ordinary typing there is what gives us the line
         editor and the command-line history for free; intercepting those keys
         in the catch-all instead would silently swallow every character.
+
+        While the inferior runs the keys belong to its terminal, not to the
+        edit line (in C every key in GDB focus goes into the console pty, to
+        readline or the inferior -- whoever is reading). On Windows the
+        passthrough writes to a tty that is not wired, so they are dropped,
+        exactly the documented new-console behaviour.
         """
         if self.focus == FOCUS_COMMAND:
             return True
-        return self.focus == FOCUS_GDB and not self.scroll.active
+        return self.focus == FOCUS_GDB and not self.scroll.active \
+            and not self.running_inferior
 
     # =====================================================================
     # Key handling
@@ -976,12 +1014,14 @@ class CgdbApp:
     # =====================================================================
     def _console_cursor_row(self):
         """The row the terminal cursor sits on: the current output line."""
+        if self._vt_active():
+            return self.vt.cursor_row()
         h = self._console_height()
         return max(0, min(self.console.line_count() - 1, h - 1))
 
     def gdb_key(self, key):
-        h = self._console_height()
-        mx = self.console.max_delta(h)
+        h = self._gdb_view_height()
+        mx = self._gdb_view().max_delta(h)
         # a lone 'g' is pending its second 'g' (gdb_input's gg, which jumps
         # home only on the pair -- unlike the source window's prefix logic)
         g_pending = self._gdb_g
@@ -1078,27 +1118,20 @@ class CgdbApp:
         # readline editing defaults stay owned by prompt_toolkit's bindings
 
     def _send_key_to_inferior(self, key):
-        """Byte-wise passthrough while the inferior runs (POSIX pty only).
+        """Byte-wise passthrough while the inferior runs.
 
-        C writes each key into the console pty; its line discipline echoes
-        the input back. The pty master here has no echo, so printable keys
-        and edits are echoed into the console model by hand. On Windows the
-        inferior reads from its own console window and write() is a no-op,
-        so nothing is echoed either.
+        C writes each key into the console pty (gdb_input's default ->
+        result=1 -> tgdb_send_char), with special keys translated back to
+        their terminal sequences by kui_term -- that translation is
+        exactly keys_to_bytes(). The pty's line discipline echoes the
+        input back to the master (ECHO is on, probed on gdb 15.1), so
+        nothing is echoed by hand: echoing here would double it. On
+        Windows the inferior reads its own console window and write() is
+        a no-op, so the key is dropped (C does the same).
         """
         if self.tty is None:
             return
-        if key == kc.CTRL_M:
-            ch = "\n"
-        elif key == kc.CTRL_H:
-            ch = "\b"
-        elif not kc.is_special(key) and 32 <= key < 127:
-            ch = chr(key)
-        else:
-            return
-        if self.tty.write(ch):
-            self.console.add_text(ch)
-            self.invalidate()
+        self.tty.write(kc.keys_to_bytes([key]))
 
     # =====================================================================
     # File dialog (filedlg.cpp)
@@ -1434,8 +1467,8 @@ class CgdbApp:
         except re.error as e:
             self.message = "bad pattern: %s" % e
             return
-        hit = self.console.search(rx, *self._console_search_origin(),
-                                  forward=forward, wrapscan=wrapscan)
+        hit = self._gdb_view().search(rx, *self._console_search_origin(),
+                                      forward=forward, wrapscan=wrapscan)
         if hit is None:
             self.message = "pattern not found: %s" % pattern
             return
@@ -1448,11 +1481,12 @@ class CgdbApp:
     def _console_search_origin(self):
         """The (row, col) a console search starts scanning from: the scroll
         cursor's absolute position (scroller.cpp:319-329)."""
-        h = self._console_height()
+        h = self._gdb_view_height()
+        view = self._gdb_view()
         if not self.scroll.active:
-            self.scroll.enter(self.console.max_delta(h),
+            self.scroll.enter(view.max_delta(h),
                               row=self._console_cursor_row())
-        total = self.console.line_count()
+        total = view.line_count()
         row = total - self.scroll.delta - h + self.scroll.row
         return (max(0, min(row, total - 1)), self.scroll.col)
 
@@ -1461,11 +1495,12 @@ class CgdbApp:
         if self._console_search is None:
             self.message = "no previous search pattern"
             return
-        hit = self.console.search(self._console_search,
-                                  self._console_search_row,
-                                  self._console_search_col,
-                                  forward=forward,
-                                  wrapscan=bool(self.config.get("wrapscan")))
+        view = self._gdb_view()
+        hit = view.search(self._console_search,
+                          self._console_search_row,
+                          self._console_search_col,
+                          forward=forward,
+                          wrapscan=bool(self.config.get("wrapscan")))
         if hit is None:
             self.message = "pattern not found"
             return
@@ -1481,10 +1516,11 @@ class CgdbApp:
         bottom and the cursor moves onto the hit's row instead -- that is
         where the next search continues from, so the cursor must actually
         sit on it."""
-        h = self._console_height()
-        total = self.console.line_count()
+        h = self._gdb_view_height()
+        view = self._gdb_view()
+        total = view.line_count()
         if not self.scroll.active:
-            self.scroll.enter(self.console.max_delta(h),
+            self.scroll.enter(view.max_delta(h),
                               row=self._console_cursor_row())
         row = max(0, min(row, max(0, total - 1)))
         delta = total - h - row
@@ -1492,7 +1528,7 @@ class CgdbApp:
             delta = 0
             self.scroll.row = max(0, min(h - 1, row - (total - h)))
         else:
-            self.scroll.delta = min(delta, self.console.max_delta(h))
+            self.scroll.delta = min(delta, view.max_delta(h))
             self.scroll.row = 0
         self.scroll.delta = delta
         self.scroll.col = min(col, max(0, self._gdb_width() - 1))
@@ -1778,12 +1814,8 @@ class CgdbApp:
         self._apply_split()
         # keep the inferior's terminal size in step with the GDB pane
         # (tgdb_resize_console -> TIOCSWINSZ on the shared pty); the
-        # Windows pipe tty has no size, so only the pty path reacts
-        if self.tty is not None:
-            try:
-                self.tty.resize(self._console_height(), self._gdb_width())
-            except Exception:
-                pass
+        # Windows popup tty has no size, so only the pty path reacts
+        self._sync_pane_geometry(self._gdb_width())
 
     # =====================================================================
     # Split geometry (interface.cpp:560-752, 1789-1795)
@@ -1948,8 +1980,10 @@ class CgdbApp:
         # focused control -- that is what makes prompt_toolkit draw the
         # scroll cursor on it; otherwise the edit line keeps the focus (and
         # its own cursor). cgdb switches the scroller's cursor visibility,
-        # which is the same distinction expressed differently.
-        if which == FOCUS_GDB and self.scroll.active:
+        # which is the same distinction expressed differently. The inferior
+        # running is a third case with the same target: the VT pane owns
+        # the GDB window while the edit line is hidden.
+        if which == FOCUS_GDB and (self.scroll.active or self._vt_active()):
             target = self.console_window
         else:
             target = {FOCUS_SOURCE: self.source_window,
@@ -2195,13 +2229,158 @@ class CgdbApp:
         except Exception:
             return a == b
 
+    # =====================================================================
+    # The inferior's terminal (POSIX embedded pty; doc/python_specs.md §21)
+    # =====================================================================
+    def _vt_active(self):
+        """The GDB window is currently the inferior's terminal screen.
+
+        True only while the inferior runs AND its terminal is embedded
+        here (the pty route); with the Windows popup there is no VT, so
+        the window keeps the console + edit-line shape while it runs.
+        """
+        return self.vt is not None and self.running_inferior
+
+    def _gdb_pane_rows(self):
+        """Rows of the WHOLE GDB pane (console + the edit line's row).
+
+        The inferior's pty and VT are always sized to this, like C's
+        vterm: tgdb_resize_console hands the gdb pane's size to the shared
+        pty, and while the inferior runs the VT pane is exactly the pane
+        (the edit line hides, giving its row back).
+        """
+        return max(1, self._console_height() + 1)
+
+    def _gdb_view_height(self):
+        """The scroller's visible height for the current row source."""
+        if self._vt_active():
+            return self._gdb_pane_rows()
+        return self._console_height()
+
+    def _gdb_view(self):
+        """The row source behind the GDB window: the inferior's screen
+        while it runs, the console line model otherwise (in C both are
+        the one vterm; here the sources share ConsoleModel's row
+        interface so scroll mode and search work on either)."""
+        if self._vt_active():
+            return RowListView(self.vt.all_row_texts())
+        return self.console
+
+    def _vt_text(self, width):
+        """The GDB window's content while the inferior's terminal is
+        embedded: the VT screen, coloured, with the scroll-status overlay
+        on the first row while scroll mode is on."""
+        h = self._gdb_pane_rows()
+        delta = self.scroll.delta if self.scroll.active else 0
+        out = []
+        for i, ridx in enumerate(self.vt.visible_row_range(h, delta)):
+            if i:
+                out.append(("", "\n"))
+            if i == 0 and self.scroll.active:
+                # scroller.cpp:632-644: [delta/scrollback] overlays the
+                # right edge of the first row -- as plain text, like the
+                # line-model window does it
+                status = self.scroll.status(self.vt.max_delta(h))
+                cut = max(0, width - len(status))
+                text = self.vt.row_text(ridx)
+                trimmed = text[:cut]
+                out.append(("class:console",
+                            trimmed + " " * max(0, cut - len(trimmed))))
+                out.append(("class:scroll-status", status))
+            else:
+                out.extend(self.vt.row_fragments(ridx))
+        return out
+
+    def _vt_drained(self):
+        """Move the inferior's screen into the console history.
+
+        Runs on the inferior-pty reader thread (via request_flush) or
+        directly from the dispatch thread -- the same lock-free style
+        _on_inferior_output has always used. Idempotent: an empty VT
+        flattens to nothing, so the double call in _flush_inferior_vt is
+        harmless.
+        """
+        if self.vt is None:
+            return
+        lines = self.vt.flatten()
+        if lines:
+            self.console.add_text("\n".join(lines) + "\n")
+        self.invalidate()
+
+    def _flush_inferior_vt(self):
+        """Gate the *stopped transition on the pty being drained.
+
+        In C the inferior and gdb share one pty, so the inferior's last
+        output is naturally ahead of gdb's stop report in the stream.
+        Here the two arrive on different channels -- and gdb emits the
+        report's ~ records BEFORE *stopped, so this has to run at the
+        first console record after *running (see _on_console) as well as
+        on the stop itself. The wait makes the reader thread drain the
+        pty and flatten the VT BEFORE the report text is appended. If the
+        reader is already gone (inferior exited, pty at EOF) the direct
+        flatten catches whatever is left.
+        """
+        if self.vt is None or self.vt.is_blank():
+            return
+        if self.tty is not None:
+            self.tty.request_flush(0.5)
+        self._vt_drained()
+
+    def _sync_pane_geometry(self, width):
+        """Push the live terminal size into every consumer of it.
+
+        C reacts to SIGWINCH directly (if_layout); prompt_toolkit repaints
+        from its own output-size poll instead, so this runs on every frame
+        and only acts when something actually changed: the console model's
+        wrap width, the VT's rows/columns, and -- like tgdb_resize_console
+        -- the inferior pty's TIOCSWINSZ, which is what tells the inferior
+        to redraw after a resize.
+        """
+        if self._winch_pending:
+            self._winch_pending = False
+            self.relayout()
+        if width and width != self.console.width:
+            self.console.resize(width)
+        rows = self._gdb_pane_rows()
+        if self.vt is not None and self.vt.size != (rows, width):
+            try:
+                self.vt.resize(rows, width)
+            except Exception:
+                pass
+        if self.tty is not None and getattr(self.tty, "embedded", False) \
+                and self._tty_size != (rows, width):
+            self._tty_size = (rows, width)
+            try:
+                self.tty.resize(rows, width)
+            except Exception:
+                pass
+
+    def _on_winch(self, signum, frame):
+        # C relayouts straight from the signal handler (if_layout); here
+        # the handler may only flag + invalidate (prompt_toolkit's
+        # invalidate is thread-safe) and the next frame's
+        # _sync_pane_geometry does the work.
+        self._winch_pending = True
+        try:
+            self.invalidate()
+        except Exception:
+            pass
+
     def _console_text(self):
         # ConsoleModel wraps its lines to the gdb pane's width; re-sync here
         # so a terminal resize rewraps them (C: tgdb_resize_console from
         # if_layout, which is also the resize path's destination).
         live = self._gdb_width()
-        if live and live != self.console.width:
-            self.console.resize(live)
+        self._sync_pane_geometry(live)
+        # a focus flip asked for by a non-main thread lands here, where
+        # the ptk layout may safely be touched (the cursor needs the
+        # console window focused while the VT owns the pane)
+        if self._focus_needs_sync:
+            self._focus_needs_sync = False
+            if self.focus == FOCUS_GDB:
+                self.set_focus(FOCUS_GDB)
+        if self._vt_active():
+            return self._vt_text(live)
         h = self._console_height()
         delta = self.scroll.delta if self.scroll.active else 0
         # up to h rows, filled from the top like a real terminal (vterm
@@ -2225,10 +2404,26 @@ class CgdbApp:
         return out
 
     def _console_cursor_pos(self):
-        """The scroll-mode cursor, drawn on the console window while it is
-        the focused GDB control (scroller.cpp:587-593). The column is
-        clamped onto the row -- prompt_toolkit can only place a cursor on
-        a written cell."""
+        """The cursor on the console window while it is the focused GDB
+        control: the inferior's terminal cursor while the VT owns the pane
+        (scroller draws the vterm cursor at the same place), otherwise the
+        scroll-mode cursor (scroller.cpp:587-593). The column is clamped
+        onto the row -- prompt_toolkit can only place a cursor on a
+        written cell."""
+        if self._vt_active():
+            if not self.scroll.active:
+                x, y = self.vt.cursor_pos()
+                # clamped onto written cells, like the scroll cursor
+                line = self.vt.cursor_row_text()
+                return Point(x=min(x, len(line), self._gdb_width() - 1),
+                             y=min(y, self._gdb_pane_rows() - 1))
+            h = self._gdb_pane_rows()
+            rows = self._gdb_view().visible_lines(h, self.scroll.delta)
+            r = self.scroll.row
+            if not 0 <= r < len(rows):
+                return None
+            col = min(self.scroll.col, len(rows[r]))
+            return Point(x=col, y=r)
         if not self.scroll.active:
             return None
         h = self._console_height()
@@ -2345,9 +2540,11 @@ class CgdbApp:
         # Ctrl-C natively and the MI stream stays clean, PoC-verified
         # on gdb 17.1; .tmp/poc-newcon).
         try:
-            self.tty = (self._tty_factory(self._on_inferior_output)
+            self.tty = (self._tty_factory(self._on_inferior_output,
+                                          self._vt_drained)
                         if self._tty_factory else
-                        create_inferior_tty(self._on_inferior_output))
+                        create_inferior_tty(self._on_inferior_output,
+                                            self._vt_drained))
             self.tty.start()
             # The pty device path must NOT be quoted -- see
             # PtyInferiorTty.mi_command().
@@ -2360,6 +2557,16 @@ class CgdbApp:
             if not self.tty.verify_ok(shown.payload if shown else None):
                 raise GdbError("gdb did not accept the inferior terminal "
                                "setting (%r)" % (shown and shown.payload))
+            if getattr(self.tty, "embedded", False):
+                # the inferior's terminal lives inside the GDB window --
+                # give it the VT to render in (C: the scroller's vterm)
+                if InferiorScreen is None:
+                    self._on_console("cgdb: pyte missing, the inferior's "
+                                     "terminal falls back to the line "
+                                     "model\n")
+                else:
+                    self.vt = InferiorScreen(self._gdb_pane_rows(),
+                                             self._gdb_width())
         except Exception as e:
             self.tty = None
             self._on_console("cgdb: inferior terminal unavailable (%s); "
@@ -2389,6 +2596,14 @@ class CgdbApp:
     def _on_console(self, text):
         if not text:
             return
+        if self.vt is not None and self.running_inferior \
+                and not self.vt.is_blank():
+            # gdb sends the stop report's ~ records BEFORE *stopped, so
+            # the first console output after *running is the moment the
+            # inferior went down: flatten its terminal into the history
+            # first, keeping C's one-vterm visual order (the inferior's
+            # output above gdb's report)
+            self._flush_inferior_vt()
         self.console.add_bytes(text)
         self.invalidate()
 
@@ -2397,7 +2612,13 @@ class CgdbApp:
         self._on_console(text)
 
     def _on_inferior_output(self, data):
-        self.console.add_bytes(data)
+        # the inferior's terminal stream. With a VT it renders there (the
+        # C scroller's vterm); the fallback (no pyte) is the dumb line
+        # model, which at least keeps the output visible.
+        if self.vt is not None:
+            self.vt.feed(data)
+        else:
+            self.console.add_bytes(data)
         self.invalidate()
 
     def _on_log(self, text):
@@ -2407,10 +2628,24 @@ class CgdbApp:
 
     def _on_running(self, payload):
         self.running_inferior = True
+        if self.vt is not None:
+            # a fresh run gets a fresh screen: the previous run's content
+            # is already in the console history (flattened at its stop),
+            # which is the same continuity C's one-vterm gives
+            self.vt.reset_content()
+        # the VT pane takes the GDB window over; retarget the focus from
+        # the (now hidden) edit line -- but only the main thread may touch
+        # the ptk layout, so the next frame does it (_console_text)
+        self._focus_needs_sync = True
         self.invalidate()
 
     def _on_stopped(self, payload):
+        # drain the inferior's pty and flatten its screen BEFORE the stop
+        # report is appended, so the console keeps C's visual order (the
+        # inferior's output above gdb's report)
+        self._flush_inferior_vt()
         self.running_inferior = False
+        self._focus_needs_sync = True
         frame = (payload or {}).get("frame") or {}
         if isinstance(frame, list):
             frame = frame[0] if frame else {}
@@ -2499,15 +2734,11 @@ class CgdbApp:
             self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
             self.console.add_text("cgdb: gdb is not running\n")
             return
-        if self.running_inferior:
-            # POSIX: the inferior owns the pty; the input goes to it raw
-            # and is echoed without a (gdb) prompt -- the prompt belongs
-            # to gdb, which is not reading input while the inferior runs.
-            # Windows: the inferior reads its own console window, there is
-            # nothing to deliver (the line is not echoed either).
-            if self.tty is not None:
-                self.tty.write(text + "\n")
-            return
+        # While the inferior runs the command queues in the MI pipe and
+        # gdb runs it once it is back in charge -- the same queueing C's
+        # console pty gives (the typing lands, gdb reads it later). Keys
+        # typed into the GDB window never arrive here in that state: they
+        # go byte-wise to the inferior instead (_send_key_to_inferior).
         self.console.add_text("%s%s\n" % (GDB_PROMPT, text))
         threading.Thread(target=self._console_command_worker, args=(text,),
                          daemon=True).start()
@@ -2752,6 +2983,15 @@ class CgdbApp:
         self.run_rc_commands()
         if not ok:
             self.message = "gdb did not start; :q to quit"
+        # SIGWINCH drives the resize chain (C: signal -> if_layout ->
+        # tgdb_resize_console); prompt_toolkit never installs this
+        # handler, it polls the output size instead, so it is ours to
+        # take. POSIX only -- the attribute simply does not exist on
+        # Windows, which is the capability check, not a platform branch.
+        try:
+            signal.signal(signal.SIGWINCH, self._on_winch)
+        except (AttributeError, ValueError, OSError):
+            pass
         try:
             self.app.run()
         finally:

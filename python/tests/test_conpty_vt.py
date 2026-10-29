@@ -10,6 +10,13 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "e2e"))
 
+if sys.platform != "win32":
+    # conpty.py touches ctypes.windll at import time; skip before that
+    # so a full `pytest tests/` collects cleanly on POSIX too
+    import pytest
+    pytest.skip("ConPTY screen model is Windows only",
+                allow_module_level=True)
+
 from conpty import VTScreen
 
 

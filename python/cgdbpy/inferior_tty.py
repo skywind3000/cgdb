@@ -4,7 +4,12 @@ gdb must be told where the debugged program's terminal is, otherwise the
 inferior's stdout lands in the MI pipe and corrupts the record stream -- the
 C port verified this experimentally (doc/win_specs.md §4, E2a).
 
-POSIX: a pty pair; gdb gets the slave name, we read the master.
+POSIX: a pty pair; gdb gets the slave name, we read the master. The pty
+behaves exactly like the C version's shared console pty (probed on
+gdb 15.1): gdb puts the inferior in the slave's foreground process
+group, so writing VINTR (0x03) to the master delivers SIGINT to the
+inferior, and the cooked line discipline echoes typed input back to the
+master -- cgdb never echoes by hand.
 
 Windows: gdb gets `new-console on`. The inferior is not wired to cgdb at
 all: console-subsystem programs get their own visible console window
@@ -22,7 +27,16 @@ import threading
 
 
 class InferiorTty:
-    """Base interface: start() prepares the terminal for gdb."""
+    """Base interface: start() prepares the terminal for gdb.
+
+    ``embedded`` marks where the inferior's terminal lives: True when it
+    is *inside* cgdb's own screen (the POSIX pty feeding the VT in the
+    GDB window), False when the program runs in its own window and cgdb
+    is not part of its I/O at all (Windows new-console). The app branches
+    on this instead of on sys.platform.
+    """
+
+    embedded = False
 
     def start(self):
         raise NotImplementedError
@@ -43,20 +57,40 @@ class InferiorTty:
         """Deliver bytes to the inferior's stdin. Returns success."""
         raise NotImplementedError
 
+    def request_flush(self, timeout=0.5):
+        """Drain pending output once the master goes quiet.
+
+        POSIX only: the app calls this when the inferior stops, so the
+        reader thread can pull the last bytes out of the pty and hand the
+        terminal's content to the caller's ``on_drain`` *before* gdb's
+        stop report is appended to the console. Returns True when the
+        flush completed (or the reader is gone and the caller must
+        consume whatever is left itself).
+        """
+        return True
+
     def close(self):
         pass
 
 
 class PtyInferiorTty(InferiorTty):
-    def __init__(self, on_output):
+
+    embedded = True
+
+    def __init__(self, on_output, on_drain=None):
         import pty
         self._pty = pty
         self.on_output = on_output
+        # runs on the reader thread after a request_flush() drain, see
+        # request_flush()
+        self.on_drain = on_drain
         self.master = -1
         self.slave = -1
         self.name = None
         self._alive = False
         self._thread = None
+        self._flush_request = threading.Event()
+        self._flush_done = threading.Event()
 
     def start(self):
         self.master, self.slave = self._pty.openpty()
@@ -82,14 +116,58 @@ class PtyInferiorTty(InferiorTty):
         return self.name in got or got in self.name
 
     def _read_loop(self):
+        # select-based rather than a blocking read: the loop has to notice
+        # request_flush() within one timeout, and close() within one too.
+        import select
         while self._alive:
+            try:
+                ready, _, _ = select.select([self.master], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    data = os.read(self.master, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                self._emit(data)
+            elif self._flush_request.is_set():
+                # the master is quiet: pull anything left, then let the
+                # app move the terminal's content into the console
+                self._drain()
+                self._flush_request.clear()
+                if self.on_drain is not None:
+                    try:
+                        self.on_drain()
+                    except Exception:
+                        pass
+                self._flush_done.set()
+
+    def _drain(self):
+        import select
+        while True:
+            try:
+                ready, _, _ = select.select([self.master], [], [], 0)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                return
             try:
                 data = os.read(self.master, 4096)
             except OSError:
-                break
+                return
             if not data:
-                break
+                return
             self._emit(data)
+
+    def request_flush(self, timeout=0.5):
+        if not self._alive or self._thread is None \
+                or not self._thread.is_alive():
+            return True
+        self._flush_done.clear()
+        self._flush_request.set()
+        return self._flush_done.wait(timeout)
 
     def _emit(self, data):
         try:
@@ -131,8 +209,9 @@ class NewConsoleTty(InferiorTty):
     """Windows: the inferior gets its own console window (gdb
     ``new-console on``); cgdb is not part of its I/O path at all."""
 
-    def __init__(self, on_output):
+    def __init__(self, on_output, on_drain=None):
         self.on_output = on_output  # never fires: output goes to the window
+        self.on_drain = None        # nothing embedded to flatten
 
     def start(self):
         return ""
@@ -159,8 +238,8 @@ class NewConsoleTty(InferiorTty):
         pass
 
 
-def create(on_output):
+def create(on_output, on_drain=None):
     """Platform-appropriate inferior terminal."""
     if sys.platform == "win32":
-        return NewConsoleTty(on_output)
-    return PtyInferiorTty(on_output)
+        return NewConsoleTty(on_output, on_drain)
+    return PtyInferiorTty(on_output, on_drain)
