@@ -2065,6 +2065,30 @@ def test_on_running_resets_the_vt(app):
     assert app.app.layout.current_control is app.console_control
 
 
+def test_vt_cursor_row_is_padded_for_placement(app):
+    # prompt_toolkit places the hardware cursor through a map of RENDERED
+    # cells only; a blank row or a row's end has none and the cursor falls
+    # back to the screen corner (0,0). _vt_text pads the cursor's row so
+    # the cursor coordinate is always a written cell.
+    from cgdbpy.console import display_width
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.running_inferior = True
+
+    # cursor on a blank row (after "GIMME> \r\n"): row 1 gets one cell
+    app.vt.feed(b"GIMME> \r\n")
+    rows = "".join(t for _, t in app._console_text()).split("\n")
+    assert rows[1] == " "
+    assert (app._console_cursor_pos().x, app._console_cursor_pos().y) == (0, 1)
+
+    # cursor at the end of "TYPE>": the row is padded past its text
+    app.vt.reset_content()
+    app.vt.feed(b"TYPE>")
+    rows = "".join(t for _, t in app._console_text()).split("\n")
+    assert display_width(rows[0]) >= 6
+    assert (app._console_cursor_pos().x, app._console_cursor_pos().y) == (5, 0)
+
+
 def test_missing_running_record_still_shows_and_routes(app):
     # An older gdb may announce the resume only as ^running (routed to
     # on_running by gdbclient) -- or, worst case, deliver nothing the app

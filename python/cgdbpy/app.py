@@ -68,7 +68,7 @@ from . import keycodes as kc
 from . import kui
 from . import mi
 from .cgdbrc import (Config, ConfigError, WSO_HORIZONTAL, WSO_VERTICAL)
-from .console import ConsoleModel, RowListView, ScrollState
+from .console import ConsoleModel, RowListView, ScrollState, display_width
 from .filedlg import LABEL, FileDialog
 from .gdbclient import GdbClient, GdbError
 from .highlight import build_style, style_for_token
@@ -2281,12 +2281,23 @@ class CgdbApp:
         embedded: the VT screen, coloured, with the scroll-status overlay
         on the first row while scroll mode is on."""
         h = self._gdb_pane_rows()
-        delta = self.scroll.delta if self.scroll.active else 0
+        scrolling = self.scroll.active
+        delta = self.scroll.delta if scrolling else 0
+        # The row the terminal cursor sits on (only meaningful unscrolled:
+        # the cursor lives on the live screen). prompt_toolkit places the
+        # hardware cursor through a map of RENDERED cells, and a blank row
+        # or a row's end has none -- the cursor then falls back to the
+        # screen corner (0,0), which read as "the cursor is stuck in the
+        # source window". Pad that row up to the cursor's column below.
+        cursor_row = None
+        if not scrolling:
+            lines = self.vt.size[0]
+            cursor_row = self.vt.row_count() - lines + self.vt.cursor_row()
         out = []
         for i, ridx in enumerate(self.vt.visible_row_range(h, delta)):
             if i:
                 out.append(("", "\n"))
-            if i == 0 and self.scroll.active:
+            if i == 0 and scrolling:
                 # scroller.cpp:632-644: [delta/scrollback] overlays the
                 # right edge of the first row -- as plain text, like the
                 # line-model window does it
@@ -2298,7 +2309,14 @@ class CgdbApp:
                             trimmed + " " * max(0, cut - len(trimmed))))
                 out.append(("class:scroll-status", status))
             else:
-                out.extend(self.vt.row_fragments(ridx))
+                frags = self.vt.row_fragments(ridx)
+                if ridx == cursor_row:
+                    have = display_width(self.vt.row_text(ridx))
+                    need = min(self.vt.cursor_pos()[0] + 1, width)
+                    if have < need:
+                        frags = list(frags) + [("class:console",
+                                                " " * (need - have))]
+                out.extend(frags)
         return out
 
     def _vt_drained(self):
@@ -2432,9 +2450,10 @@ class CgdbApp:
         if self._vt_active():
             if not self.scroll.active:
                 x, y = self.vt.cursor_pos()
-                # clamped onto written cells, like the scroll cursor
-                line = self.vt.cursor_row_text()
-                return Point(x=min(x, len(line), self._gdb_width() - 1),
+                # prompt_toolkit can only place a cursor on a written
+                # cell: _vt_text pads the cursor's row to min(x+1, width)
+                # columns, so this clamp always lands on one
+                return Point(x=min(x, self._gdb_width() - 1),
                              y=min(y, self._gdb_pane_rows() - 1))
             h = self._gdb_pane_rows()
             rows = self._gdb_view().visible_lines(h, self.scroll.delta)

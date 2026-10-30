@@ -1758,6 +1758,15 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
      （回归：`test_result_running_record_dispatches_to_on_running`），
      且 app 侧 `_vt_active()`/键路由对「漏 `*running`」有内容回退
      （`test_missing_running_record_still_shows_and_routes`）。
+  9. **光标只能落在已渲染单元格上**（用户实测触发）：ptk 经
+     `rowcol_to_yx` 映射控件光标，而该表只记录**已写字符格**——
+     光标在空行或行尾（VT 光标在 scanf 提示符的换行后/行末）时
+     未命中，回退到屏幕 (0,0)，表现为「按 `i` 切回 GDB 面板光标却
+     卡在源码窗左上角」。修法：`_vt_text` 给光标所在行补空格至
+     光标列（空行补一格），光标坐标因此永远是已渲染格；ESC→`i`
+     的往返光标位置由 e2e 断言。另注：gdb 的 thread-db ~ 记录与
+     inferior 首批输出谁先到是两通道竞态（C 是单流无此问题），
+     晚到时渲染在提示符下方——真终端对迟到输出的同款语义。
 - 验收标准与测试：
   - 单元 `test_vt.py`（21 项，跨平台）：颜色/清屏/定位/alt/宽字符/折行/
     滚动区域/flatten 幂等/LF 语义；

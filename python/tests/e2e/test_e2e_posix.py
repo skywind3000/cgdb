@@ -75,6 +75,29 @@ def test_inferior_terminal_renders_inside_the_gdb_window(app_pty):
     ch = d.char_at(y, x)
     assert ch.fg in ("red", "800000")
 
+    # the hardware cursor rides the inferior's terminal cursor: it lands
+    # in the GDB pane at the VT's cursor -- never stranded at the screen
+    # corner (ptk maps cursors through rendered cells only, so the
+    # cursor's row is padded for it). Exactly where depends on whether
+    # gdb's thread-db records raced ahead of the inferior's output (two
+    # channels; the C version has one), so accept the VT's own position
+    # and require the ESC -> i roundtrip to return to it.
+    deadline = time.time() + 5
+    cur = (0, 0)
+    while time.time() < deadline:
+        d.pump(0.1)
+        hit = d.find("TYPE>")
+        cur = (d._screen.cursor.y, d._screen.cursor.x)
+        if hit and cur[0] >= 20 and cur != (0, 0):
+            break
+    assert hit is not None
+    assert cur[0] >= 20 and cur != (0, 0)
+    d.write("\x1b")
+    d.pump(0.5)
+    d.write("i")
+    d.pump(0.5)
+    assert (d._screen.cursor.y, d._screen.cursor.x) == cur
+
     # typed input: byte-wise passthrough, echoed exactly once by the pty
     # line discipline (never by hand -- that was the old double-echo bug)
     d.write("hello\r")
