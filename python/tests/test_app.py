@@ -2011,6 +2011,10 @@ def test_inferior_vt_takes_over_the_gdb_pane(app):
     assert any("fg:ansired" in style for style, _ in frags)
     assert not app.edit_line.filter()
     app.running_inferior = False
+    # the content keeps the pane until it is flattened -- flipping the
+    # running flag alone does not strand the inferior's last screen
+    assert not app.edit_line.filter()
+    app._vt_drained()
     assert app.edit_line.filter()
 
 
@@ -2049,14 +2053,59 @@ def test_inferior_vt_flattens_into_the_console_on_stop(app):
 
 def test_on_running_resets_the_vt(app):
     # a fresh run gets a fresh screen (the last run's content already
-    # lives in the console history, so the continuity matches C's vterm)
+    # lives in the console history, so the continuity matches C's vterm);
+    # the focus leaves the (hidden) edit line for the VT pane
     from cgdbpy.vt import InferiorScreen
     app.vt = InferiorScreen(10, 40)
+    app.focus = FOCUS_GDB
     app.vt.feed(b"OLD\r\n")
     app._fake["gdb"].callbacks["on_running"]({})
     assert app.running_inferior is True
     assert app.vt.extract_lines() == []
-    assert app._focus_needs_sync is True
+    assert app.app.layout.current_control is app.console_control
+
+
+def test_missing_running_record_still_shows_and_routes(app):
+    # An older gdb may announce the resume only as ^running (routed to
+    # on_running by gdbclient) -- or, worst case, deliver nothing the app
+    # recognizes. The VT's own content must then keep the pane and route
+    # the keys, or the program looks dead and the edit line eats typing.
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.focus = FOCUS_GDB
+    app.running_inferior = False       # no *running ever arrived
+    app.vt.feed(b"GIMME> \r\n")
+    assert app._vt_active()
+    assert not app.edit_line.filter()
+    text = "".join(t for _, t in app._console_text())
+    assert "GIMME>" in text
+    assert not app._buffer_owns_keys()
+    tty = app._fake["tty"]
+    n = len(tty.written)
+    app.gdb_key(ord("4"))
+    assert tty.written[n:] == [b"4"]
+    assert app.gdb_buffer.text == ""   # the edit line did not eat it
+
+
+def test_missing_running_report_joins_the_vt_in_order(app):
+    # with *running missed, console text still joins the VT while it owns
+    # the pane (C renders both in the one vterm), so the report shows up
+    # BELOW the inferior's output; *stopped's flatten commits the story
+    app.running_inferior = False       # no *running ever arrived
+    from cgdbpy.vt import InferiorScreen
+    app.vt = InferiorScreen(10, 40)
+    app.vt.feed(b"OUT\r\n")
+    app._on_console("Program received signal SIGINT\n")
+    lines = app.vt.extract_lines()
+    assert "OUT" in lines
+    assert "Program received signal SIGINT" in lines
+    assert lines.index("OUT") < lines.index("Program received signal SIGINT")
+    # the line model got nothing while the VT owned the pane
+    assert "OUT" not in "".join(app.console.lines)
+    # and the stop still flattens the whole story into the history
+    app._on_stopped({})
+    assert "OUT" in "".join(app.console.lines)
+    assert "Program received signal SIGINT" in "".join(app.console.lines)
 
 
 def test_sync_pane_geometry_pushes_sizes(app):

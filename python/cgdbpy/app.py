@@ -289,10 +289,6 @@ class CgdbApp:
         # set by the SIGWINCH handler, consumed by _sync_pane_geometry on
         # the next frame (C: the signal handler calls if_layout directly)
         self._winch_pending = False
-        # set when running_inferior flipped off a thread that may not
-        # touch the ptk layout: the next frame retargets the GDB focus
-        # (edit line <-> VT pane), which only the main thread may do
-        self._focus_needs_sync = False
         self.gdb = None
         self.gdb_path = gdb_path
         self.gdb_args = list(gdb_args)
@@ -605,7 +601,7 @@ class CgdbApp:
         @kb.add(Keys.ControlD,
                 filter=Condition(lambda: self.focus == FOCUS_GDB
                                  and not self.scroll.active
-                                 and not self.running_inferior
+                                 and not self._inferior_owns_keys()
                                  and not self.gdb_buffer.text))
         def _ctrl_d_exit(event):
             self._run_async("-gdb-exit")
@@ -643,16 +639,16 @@ class CgdbApp:
         editor and the command-line history for free; intercepting those keys
         in the catch-all instead would silently swallow every character.
 
-        While the inferior runs the keys belong to its terminal, not to the
-        edit line (in C every key in GDB focus goes into the console pty, to
-        readline or the inferior -- whoever is reading). On Windows the
-        passthrough writes to a tty that is not wired, so they are dropped,
-        exactly the documented new-console behaviour.
+        While the inferior's terminal owns the pane the keys belong to it,
+        not to the edit line (in C every key in GDB focus goes into the
+        console pty, to readline or the inferior -- whoever is reading).
+        On Windows the passthrough writes to a tty that is not wired, so
+        they are dropped, exactly the documented new-console behaviour.
         """
         if self.focus == FOCUS_COMMAND:
             return True
         return self.focus == FOCUS_GDB and not self.scroll.active \
-            and not self.running_inferior
+            and not self._inferior_owns_keys()
 
     # =====================================================================
     # Key handling
@@ -1090,7 +1086,7 @@ class CgdbApp:
         if key == kc.ESC:
             self.set_focus(FOCUS_SOURCE)
             return
-        if self.running_inferior:
+        if self._inferior_owns_keys():
             # POSIX: the inferior owns the pty, keys pass through
             # byte-wise, exactly as C writes each key into the console
             # pty (gdb_input's default -> result=1 -> tgdb_send_char).
@@ -2235,11 +2231,25 @@ class CgdbApp:
     def _vt_active(self):
         """The GDB window is currently the inferior's terminal screen.
 
-        True only while the inferior runs AND its terminal is embedded
-        here (the pty route); with the Windows popup there is no VT, so
-        the window keeps the console + edit-line shape while it runs.
+        True only when the inferior's terminal is embedded here (the pty
+        route): while it runs, and -- as a fallback -- while the VT holds
+        content without a *running in sight, because an older gdb may
+        announce the resume only as ^running (or, worst case, not at all)
+        and hiding the program's output then would read as a dead app.
+        Once the content is flattened the VT is blank and the window
+        returns to the console + edit-line shape. With the Windows popup
+        there is no VT at all, so nothing changes there while it runs.
         """
-        return self.vt is not None and self.running_inferior
+        if self.vt is None:
+            return False
+        return self.running_inferior or not self.vt.is_blank()
+
+    def _inferior_owns_keys(self):
+        """Keys in GDB focus belong to the inferior while its terminal
+        owns the pane (C: every key goes into the console pty). On
+        Windows, with the terminal in a popup, the same predicate reduces
+        to running_inferior and the writes are dropped there."""
+        return self.running_inferior or self._vt_active()
 
     def _gdb_pane_rows(self):
         """Rows of the WHOLE GDB pane (console + the edit line's row).
@@ -2308,17 +2318,16 @@ class CgdbApp:
         self.invalidate()
 
     def _flush_inferior_vt(self):
-        """Gate the *stopped transition on the pty being drained.
+        """Commit the inferior's screen to the console history at *stopped.
 
-        In C the inferior and gdb share one pty, so the inferior's last
-        output is naturally ahead of gdb's stop report in the stream.
-        Here the two arrive on different channels -- and gdb emits the
-        report's ~ records BEFORE *stopped, so this has to run at the
-        first console record after *running (see _on_console) as well as
-        on the stop itself. The wait makes the reader thread drain the
-        pty and flatten the VT BEFORE the report text is appended. If the
-        reader is already gone (inferior exited, pty at EOF) the direct
-        flatten catches whatever is left.
+        In C the inferior and gdb share one pty, so the stop order is
+        natural. Here the two arrive on different channels -- console
+        records that arrive while the terminal owns the pane are fed into
+        the VT (see _on_console), so by the time *stopped dispatches the
+        VT holds the whole story in order and this wait only has to make
+        the READER drain the inferior's last pty bytes before the flatten.
+        If the reader is already gone (inferior exited, pty at EOF) the
+        direct flatten catches whatever is left.
         """
         if self.vt is None or self.vt.is_blank():
             return
@@ -2366,19 +2375,29 @@ class CgdbApp:
         except Exception:
             pass
 
+    def _retarget_gdb_focus(self):
+        """Move the ptk focus off the (hidden) edit line when the VT takes
+        the GDB pane over -- and back when it gives the pane up.
+
+        Only the main thread may touch the layout, so this is scheduled
+        there; the callers run on the dispatch thread. (An earlier
+        version flipped the focus from inside _console_text, i.e. during
+        a render callback -- that worked on prompt_toolkit 3.0.53 but is
+        exactly the kind of thing that breaks across versions.)
+        """
+        if self.focus != FOCUS_GDB:
+            return
+        def _flip():
+            if self.focus == FOCUS_GDB:
+                self.set_focus(FOCUS_GDB)
+        self._call_on_ui_thread(_flip)
+
     def _console_text(self):
         # ConsoleModel wraps its lines to the gdb pane's width; re-sync here
         # so a terminal resize rewraps them (C: tgdb_resize_console from
         # if_layout, which is also the resize path's destination).
         live = self._gdb_width()
         self._sync_pane_geometry(live)
-        # a focus flip asked for by a non-main thread lands here, where
-        # the ptk layout may safely be touched (the cursor needs the
-        # console window focused while the VT owns the pane)
-        if self._focus_needs_sync:
-            self._focus_needs_sync = False
-            if self.focus == FOCUS_GDB:
-                self.set_focus(FOCUS_GDB)
         if self._vt_active():
             return self._vt_text(live)
         h = self._console_height()
@@ -2596,14 +2615,20 @@ class CgdbApp:
     def _on_console(self, text):
         if not text:
             return
-        if self.vt is not None and self.running_inferior \
-                and not self.vt.is_blank():
-            # gdb sends the stop report's ~ records BEFORE *stopped, so
-            # the first console output after *running is the moment the
-            # inferior went down: flatten its terminal into the history
-            # first, keeping C's one-vterm visual order (the inferior's
-            # output above gdb's report)
-            self._flush_inferior_vt()
+        if self._vt_active():
+            # C renders gdb's console output and the inferior's output in
+            # the ONE vterm, in stream order; here the two arrive on
+            # different channels, so while the inferior's terminal owns
+            # the pane the console text joins it in the VT. This is also
+            # what keeps the stop report below the inferior's output:
+            # gdb sends the report's ~ records BEFORE *stopped, they land
+            # in the VT, and *stopped's flatten commits the whole story to
+            # the line model in order.
+            # (gdb's ~ payloads carry bare \n; the pty would have
+            # delivered \r\n -- convert, or every line stairs.)
+            self.vt.feed(text.replace("\n", "\r\n"))
+            self.invalidate()
+            return
         self.console.add_bytes(text)
         self.invalidate()
 
@@ -2627,16 +2652,19 @@ class CgdbApp:
             self.invalidate()
 
     def _on_running(self, payload):
+        first_notice = not self.running_inferior
         self.running_inferior = True
-        if self.vt is not None:
+        if self.vt is not None and first_notice:
             # a fresh run gets a fresh screen: the previous run's content
             # is already in the console history (flattened at its stop),
-            # which is the same continuity C's one-vterm gives
+            # which is the same continuity C's one-vterm gives. Only the
+            # first notice resets -- gdb 15.1 sends BOTH ^running and
+            # *running, and a reset after raced-ahead inferior output
+            # would wipe it.
             self.vt.reset_content()
         # the VT pane takes the GDB window over; retarget the focus from
-        # the (now hidden) edit line -- but only the main thread may touch
-        # the ptk layout, so the next frame does it (_console_text)
-        self._focus_needs_sync = True
+        # the (now hidden) edit line, on the main thread
+        self._retarget_gdb_focus()
         self.invalidate()
 
     def _on_stopped(self, payload):
@@ -2645,7 +2673,7 @@ class CgdbApp:
         # inferior's output above gdb's report)
         self._flush_inferior_vt()
         self.running_inferior = False
-        self._focus_needs_sync = True
+        self._retarget_gdb_focus()
         frame = (payload or {}).get("frame") or {}
         if isinstance(frame, list):
             frame = frame[0] if frame else {}

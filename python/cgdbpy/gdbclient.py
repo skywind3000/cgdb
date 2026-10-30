@@ -381,7 +381,14 @@ class GdbClient:
             return
         if rec.kind == mi.RESULT:
             self.at_prompt = False
-            if rec.cls == "error":
+            if rec.cls == "running":
+                # the resume is normally announced by an async *running,
+                # but the ^running result record is the form some gdb
+                # versions command paths produce -- treat both as the
+                # inferior running, or the app would keep routing keys to
+                # the edit line while it runs
+                self._fire("on_running", rec.payload or {})
+            elif rec.cls == "error":
                 msg = (rec.payload or {}).get("msg", "gdb error")
                 self._fire("on_console", "gdb: %s\n" % msg)
             return

@@ -807,6 +807,21 @@ def test_gdb_exit_terminates_the_child(target):
     assert gone, "gdb pid %d survived -gdb-exit" % pid
 
 
+def test_result_running_record_dispatches_to_on_running():
+    # gdb normally announces a resume with an async *running, but the
+    # ^running result record is the form some command paths and older
+    # gdbs produce; _dispatch must route it to on_running too, or the app
+    # keeps feeding keys to the edit line while the inferior runs
+    fired = []
+    c = GdbClient(callbacks={"on_running": lambda p: fired.append(p)})
+    c._dispatch(mi.Record(mi.RESULT, cls="running", payload={}))
+    assert fired == [{}]
+    fired.clear()
+    # and the regular result classes stay silent
+    c._dispatch(mi.Record(mi.RESULT, token=1, cls="done", payload={}))
+    assert fired == []
+
+
 @needs_gdb
 def test_stop_kills_a_gdb_that_ignores_exit():
     s = Session()

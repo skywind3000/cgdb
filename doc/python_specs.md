@@ -1714,9 +1714,10 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
   - `app.py`：`_on_inferior_output` → `vt.feed`（不再直通行模型）；
     `_console_text` 的 VT 分支（彩色 fragments、`[delta/max]` 状态条、
     VT 光标）；编辑行包进 `ConditionalContainer`（VT 态隐藏，光标画在
-    VT 上——焦点经 `_focus_needs_sync` 标志在渲染帧主线程切换）；
+    VT 上——焦点经 `_call_on_ui_thread` 在主线程调度切换，不占渲染帧）；
+    VT 占屏期间 `on_console` 的文本也进 VT（陷阱 1/7 的单流方案）；
     `gdb_key` 运行态透传用 `keys_to_bytes()`（`_send_key_to_inferior`
-    的手工回显删除）；`_buffer_owns_keys` 加 `not running_inferior`
+    的手工回显删除）；`_buffer_owns_keys` 加 `not _inferior_owns_keys()`
     （否则透传永远到不了——旧代码的字节路径正是被 Buffer 挡死成死代码）；
     ^D 空行退出绑定加运行态条件；`send_console_command` 删整行转发分支
     （改 MI 排队，同 C 的语义）；SIGWINCH handler + `_sync_pane_geometry`
@@ -1726,14 +1727,16 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
     ConsoleModel 的接口语义。
 - 陷阱（每条有回归测试）：
   1. **两通道顺序**：gdb 的停止报告 ~ 记录在 MI 流里排在 `*stopped`
-     **之前**——只挂 `*stopped` 的闸门来不及。方案：`*running` 期间的
-     第一条 `on_console`（此刻 inferior 必已停）先 `request_flush`
-     排空 pty + flatten，再放报告进 console；`*stopped` 上再兜底一次
-     （幂等）。集成/E2E 断言 inferior 内容在报告**上方**。
+     **之前**。终版方案（陷阱 7 修复后的形态）：VT 占屏期间 gdb 的
+     console 记录**直接进 VT**（C 的单 vterm 流序），`*stopped` 时
+     `request_flush` 排空 pty 后整体 flatten——报告天然在 inferior
+     输出之后，无需任何「首条 console 记录」闸门。集成/E2E 断言
+     inferior 内容在报告**上方**。
   2. **双回显**：行规范回显实测存在（ECHO=1），手工回显必须删。
   3. **pyte 的 LF 语义**：裸 `\n` 只换行不回列（VT102 正确行为）；pty 的
      ONLCR 已把 inferior 的 `\n` 变 `\r\n`，但**直接喂 pyte 的单元测试必须
-     用 `\r\n`**（能力验证阶段在这里浪费过一小时）。
+     用 `\r\n`**（能力验证阶段在这里浪费过一小时）。~ 记录的载荷也是裸
+     `\n`，喂进 VT 前要 `replace("\n", "\r\n")`。
   4. **僵尸误报**：pty harness 用 `os.kill(pid,0)` 判存活对 zombie 也成功
      ——「:q 后不退出」曾是一整轮误判，真解是 `waitpid` 收尸
      （posix_harness 的 `exited()`）。
@@ -1742,6 +1745,19 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
      渲染期惰性同步。
   6. **VT 尺寸的 +1**：VT 态吃掉编辑行，pty 行数要跟着 +1，否则全屏
      程序底部一行被裁。
+  7. **运行期 ~ 记录会误触停止闸门**（首版实 bug，用户实测触发）：
+     gdb 在 `*running` **之后**、与 inferior 首批输出同时还会发
+     `~"[Thread debugging using libthread_db enabled]"` 等记录——首版的
+     「`*running` 后第一条 on_console = inferior 已停」假设把它们当成
+     停止报告，**运行中途 flatten 清空 VT**：提示符消失、编辑行闪回、
+     键入看似全部失效。修复即陷阱 1 的终版方案（console 记录进 VT、
+     闸门全删）。回归：`test_app.py::test_missing_running_report_joins_
+     the_vt_in_order` + e2e 渲染断言。
+  8. **`*running` 不能只认异步记录**：某些 gdb 版本/命令路径只发
+     `^running` 结果记录——gdbclient 把它也路由到 `on_running`
+     （回归：`test_result_running_record_dispatches_to_on_running`），
+     且 app 侧 `_vt_active()`/键路由对「漏 `*running`」有内容回退
+     （`test_missing_running_record_still_shows_and_routes`）。
 - 验收标准与测试：
   - 单元 `test_vt.py`（21 项，跨平台）：颜色/清屏/定位/alt/宽字符/折行/
     滚动区域/flatten 幂等/LF 语义；
@@ -1752,7 +1768,8 @@ gdbwire（412 行替代 5,486 行）、vterm（架构上不需要）、平台层
     全部成立**（SCREEN-MODE 唯一且定位、START 清除、TYPE>hello 单份、
     WINCH-SEEN、SIGINT、flatten 顺序、:q 干净退出 exit 0）；
   - 探针 inferior 源码入库共享：`tests/data/terminal_probe.c`。
-  - 双平台全量：Windows 863 过 / WSL 819 过（各自只 skip 对方平台专属）。
+  - 双平台全量：Windows 866 过 / WSL 822 过（各自只 skip 对方平台专属；
+    含陷阱 7 修复后的回归）。
   - 顺带把两个「只在 Windows 跑过」的既有测试修成跨平台诚实语义：
     `test_rc_home_dir_resolution_order`（USERPROFILE/APPDATA 链是
     `os.name=="nt"` 分支）与 `test_inferior_tty_must_not_be_quoted` 的
